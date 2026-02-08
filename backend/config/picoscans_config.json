@@ -51,7 +51,7 @@
   },
   "motion_settings": {
     "mode": "fixed",
-    "fixed_speed_mps": 0.1,
-    "profiling_distance_mm": 1.0
+    "fixed_speed_mps": 1.0,
+    "profiling_distance_mm": 10.0
   }
 }

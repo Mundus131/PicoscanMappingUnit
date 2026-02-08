@@ -7,13 +7,14 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Box, Radio, BarChart3, Cpu, Sliders } from 'lucide-react';
+import { Box, Radio, BarChart3, Cpu, Sliders, History } from 'lucide-react';
 import ThemeToggle from './ThemeToggle';
 
 const navItems = [
   { href: '/', label: 'Dashboard', icon: Box, description: 'Overview & stats' },
   { href: '/acquisition', label: 'Acquisition', icon: Radio, description: 'Live data capture' },
   { href: '/analytics', label: 'Analytics', icon: BarChart3, description: 'Processing insights' },
+  { href: '/history', label: 'History', icon: History, description: 'Archived measurements' },
   { href: '/calibration', label: 'System Config', icon: Sliders, description: 'Frame & device layout' },
 ];
 

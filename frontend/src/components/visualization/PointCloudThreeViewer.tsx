@@ -36,6 +36,13 @@ interface PointCloudThreeViewerProps {
     fovDeg?: number;
     rangeMm?: number;
   }[];
+  yHorizontal?: boolean;
+  annotations?: {
+    start: [number, number, number];
+    end: [number, number, number];
+    color?: number;
+    label?: string;
+  }[];
 }
 
 export interface PointCloudThreeViewerHandle {
@@ -84,6 +91,8 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       frameOriginMode = 'center',
       framePlane = 'xy',
       markers = [],
+      yHorizontal = false,
+      annotations = [],
     },
     ref
   ) {
@@ -103,6 +112,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
   const originAxesRef = useRef<THREE.Group | null>(null);
   const frameGroupRef = useRef<THREE.Group | null>(null);
   const markersGroupRef = useRef<THREE.Group | null>(null);
+  const annotationsGroupRef = useRef<THREE.Group | null>(null);
   const [isDark, setIsDark] = useState(false);
 
   useEffect(() => {
@@ -131,7 +141,12 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       camera.lookAt(0, 0, 0);
     } else {
       camera = new THREE.PerspectiveCamera(60, 1, 1, 100000);
-      camera.position.set(1200, 800, 800);
+      if (yHorizontal) {
+        camera.up.set(1, 0, 0);
+        camera.position.set(0, 0, 2000);
+      } else {
+        camera.position.set(1200, 800, 800);
+      }
     }
     cameraRef.current = camera;
 
@@ -518,7 +533,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       }
       scene.clear();
     };
-  }, [view, showGrid, gridSize, gridStep, isDark, showOriginAxes, originAxisSize, showFrame, frameSizeMm, frameOriginMode, framePlane]);
+  }, [view, showGrid, gridSize, gridStep, isDark, showOriginAxes, originAxisSize, showFrame, frameSizeMm, frameOriginMode, framePlane, yHorizontal]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -608,6 +623,77 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     });
     scene.add(group);
   }, [markers, isDark, framePlane]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    if (annotationsGroupRef.current) {
+      scene.remove(annotationsGroupRef.current);
+      annotationsGroupRef.current.clear();
+      annotationsGroupRef.current = null;
+    }
+    if (!annotations || annotations.length === 0) return;
+    const group = new THREE.Group();
+    annotationsGroupRef.current = group;
+
+    const createLabelSprite = (text: string) => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const size = 256;
+      canvas.width = size;
+      canvas.height = size;
+      if (ctx) {
+        ctx.clearRect(0, 0, size, size);
+        ctx.font = '36px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = isDark ? 'rgba(15,23,42,0.85)' : 'rgba(255,255,255,0.9)';
+        ctx.fillRect(10, 90, size - 20, 60);
+        ctx.fillStyle = isDark ? '#e2e8f0' : '#111827';
+        ctx.fillText(text, size / 2, size / 2);
+      }
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(420, 140, 1);
+      sprite.renderOrder = 11;
+      return sprite;
+    };
+
+    annotations.forEach((a) => {
+      const color = a.color ?? (isDark ? 0xf59e0b : 0xf97316);
+      const mat = new THREE.LineBasicMaterial({ color });
+      const start = new THREE.Vector3(a.start[0], a.start[1], a.start[2]);
+      const end = new THREE.Vector3(a.end[0], a.end[1], a.end[2]);
+      const geo = new THREE.BufferGeometry().setFromPoints([start, end]);
+      group.add(new THREE.Line(geo, mat));
+
+      const dir = new THREE.Vector3().subVectors(end, start);
+      const len = dir.length();
+      if (len > 1e-6) {
+        dir.normalize();
+        const arrowSize = Math.min(120, Math.max(40, len * 0.15));
+        const cone = new THREE.Mesh(
+          new THREE.ConeGeometry(arrowSize * 0.35, arrowSize, 16),
+          new THREE.MeshBasicMaterial({ color })
+        );
+        cone.position.copy(end);
+        const axis = new THREE.Vector3(0, 1, 0);
+        const quat = new THREE.Quaternion().setFromUnitVectors(axis, dir);
+        cone.quaternion.copy(quat);
+        group.add(cone);
+      }
+
+      if (a.label) {
+        const label = createLabelSprite(a.label);
+        const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+        label.position.set(mid.x, mid.y, mid.z);
+        group.add(label);
+      }
+    });
+
+    scene.add(group);
+  }, [annotations, isDark]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -757,7 +843,12 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       camera.lookAt(cx, cy, cz);
       camera.updateProjectionMatrix();
     } else {
-      camera.position.set(cx + 1200, cy + 800, cz + 800);
+      if (yHorizontal) {
+        camera.up.set(1, 0, 0);
+        camera.position.set(cx, cy, cz + 2000);
+      } else {
+        camera.position.set(cx + 1200, cy + 800, cz + 800);
+      }
       camera.lookAt(cx, cy, cz);
     }
     controls.target.set(cx, cy, cz);
@@ -779,7 +870,12 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       camera.lookAt(0, 0, 0);
       camera.updateProjectionMatrix();
     } else {
-      camera.position.set(1200, 800, 800);
+      if (yHorizontal) {
+        camera.up.set(1, 0, 0);
+        camera.position.set(0, 0, 2000);
+      } else {
+        camera.position.set(1200, 800, 800);
+      }
       camera.lookAt(0, 0, 0);
     }
     controls.target.set(0, 0, 0);

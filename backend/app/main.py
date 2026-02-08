@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import settings
 from app.api.endpoints import devices, point_cloud, acquisition, calibration
 from app.services.picoscan_receiver import PicoscanReceiverManager
+from app.services.tcp_notifier import TcpNotifier
 from app.core.device_manager import device_manager
 
 # Configure logging
@@ -35,6 +36,7 @@ app = FastAPI(
 # Initialize receiver manager in app state
 app.state.receiver_manager = None
 app.state.acquisition_session = None
+app.state.tcp_notifier = None
 
 # Add CORS middleware
 app.add_middleware(
@@ -58,6 +60,9 @@ async def startup_event():
     try:
         receiver_manager = PicoscanReceiverManager()
         app.state.receiver_manager = receiver_manager
+        notifier = TcpNotifier(port=2120)
+        notifier.start()
+        app.state.tcp_notifier = notifier
         app.state.acquisition_session = {
             "recording": False,
             "distance_mm": 0.0,
@@ -71,6 +76,9 @@ async def startup_event():
             "profiling_distance_mm": None,
             "worker_thread": None,
             "worker_stop_event": None,
+            "analysis_metrics": None,
+            "analysis_points": [],
+            "analysis_duration_ms": None,
         }
         
         # Auto-start listening for all enabled devices
@@ -94,6 +102,8 @@ async def shutdown_event():
         if app.state.receiver_manager:
             for device_id in list(app.state.receiver_manager.receivers.keys()):
                 app.state.receiver_manager.stop_listening(device_id)
+        if app.state.tcp_notifier:
+            app.state.tcp_notifier.stop()
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 

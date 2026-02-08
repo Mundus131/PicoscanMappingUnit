@@ -353,13 +353,14 @@ export default function AcquisitionPage() {
               </div>
             </div>
             <div className="mt-4 relative" style={{ height: 520 }}>
-              <PointCloudThreeViewer
-                key={viewerKey}
-                ref={viewerRef}
-                points={displayPoints}
-                view="3d"
-                mapAxes="xyz"
-                width="100%"
+                <PointCloudThreeViewer
+                  key={viewerKey}
+                  ref={viewerRef}
+                  points={displayPoints}
+                  view="3d"
+                  mapAxes="xyz"
+                  yHorizontal
+                  width="100%"
                 height="100%"
                 showGrid
                 gridSize={12000}
