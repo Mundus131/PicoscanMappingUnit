@@ -1,7 +1,7 @@
 import logging
 from fastapi import APIRouter, HTTPException, Request
 from app.core.device_manager import device_manager
-from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings
+from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings, MotionSettings
 import numpy as np
 from app.services.point_cloud_processor import PointCloudProcessor
 
@@ -217,3 +217,19 @@ async def update_frame_settings(req: FrameSettings):
     }
     device_manager._save_to_json()
     return device_manager.frame_settings
+
+
+@router.get("/motion-settings")
+async def get_motion_settings():
+    return device_manager.motion_settings
+
+
+@router.put("/motion-settings")
+async def update_motion_settings(req: MotionSettings):
+    device_manager.motion_settings = {
+        "mode": req.mode,
+        "fixed_speed_mps": req.fixed_speed_mps,
+        "profiling_distance_mm": req.profiling_distance_mm,
+    }
+    device_manager._save_to_json()
+    return device_manager.motion_settings

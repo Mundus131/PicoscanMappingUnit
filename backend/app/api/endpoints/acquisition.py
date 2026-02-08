@@ -9,6 +9,8 @@ import logging
 import json
 import time
 import asyncio
+import numpy as np
+import threading
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -17,6 +19,128 @@ router = APIRouter()
 class AcquisitionRequest(BaseModel):
     device_ids: List[str]
     num_segments: int = 1
+
+
+def _get_session(request: Request) -> dict:
+    session = getattr(request.app.state, "acquisition_session", None)
+    if session is None:
+        session = {
+            "recording": False,
+            "distance_mm": 0.0,
+            "last_update_ts": None,
+            "last_points": [],
+            "accumulated_points": [],
+            "last_profile_distance_mm": 0.0,
+            "profiles_count": 0,
+            "devices": [],
+            "speed_mps": None,
+            "profiling_distance_mm": None,
+            "worker_thread": None,
+            "worker_stop_event": None,
+        }
+        request.app.state.acquisition_session = session
+    return session
+
+
+def _update_session_once(session: dict, receiver_manager):
+    if receiver_manager is None:
+        return
+
+    # update distance based on motion settings
+    motion = device_manager.motion_settings or {}
+    mode = motion.get("mode", "fixed")
+    fixed_speed = motion.get("fixed_speed_mps", 0.0) or 0.0
+    profiling_distance_mm = motion.get("profiling_distance_mm", None)
+    if profiling_distance_mm is None:
+        profiling_distance_mm = 10.0
+
+    now = time.time()
+    last_ts = session.get("last_update_ts")
+    if last_ts is not None and mode == "fixed":
+        dt = max(0.0, now - last_ts)
+        session["distance_mm"] = float(session.get("distance_mm", 0.0) + fixed_speed * dt * 1000.0)
+    session["last_update_ts"] = now
+    session["speed_mps"] = fixed_speed if mode == "fixed" else None
+    session["profiling_distance_mm"] = profiling_distance_mm
+
+    # fetch point clouds and merge
+    try:
+        point_clouds = receiver_manager.get_point_clouds(num_segments=10)
+        point_clouds_to_merge = []
+        for device_id, points in point_clouds.items():
+            device = device_manager.get_device(device_id)
+            if not device:
+                continue
+            if points is None or len(points) == 0:
+                continue
+            point_clouds_to_merge.append((points, device.calibration))
+
+        if point_clouds_to_merge:
+            merged = PointCloudProcessor.merge_point_clouds(point_clouds_to_merge)
+            pts = merged.points
+            if getattr(merged, "intensities", None) is not None:
+                try:
+                    if len(merged.intensities) == len(merged.points):
+                        pts = np.column_stack([merged.points, merged.intensities])
+                except Exception:
+                    pts = merged.points
+            # Normalize RSSI to 0-100 if present
+            if isinstance(pts, np.ndarray) and pts.shape[1] >= 4:
+                try:
+                    rssi = pts[:, 3].astype(np.float32)
+                    rssi_min = np.nanmin(rssi)
+                    rssi_max = np.nanmax(rssi)
+                    if np.isfinite(rssi_min) and np.isfinite(rssi_max) and rssi_max > rssi_min:
+                        pts[:, 3] = (rssi - rssi_min) / (rssi_max - rssi_min) * 100.0
+                    else:
+                        pts[:, 3] = 0.0
+                except Exception:
+                    pass
+            # limit size for transport
+            max_points = 20000
+            if len(pts) > max_points:
+                idx = np.random.choice(len(pts), max_points, replace=False)
+                pts = pts[idx]
+            session["last_points"] = pts.tolist()
+
+            # Build 3D stack along Z based on traveled distance
+            if session.get("recording"):
+                last_profile_distance = float(session.get("last_profile_distance_mm", 0.0))
+                distance_mm = float(session.get("distance_mm", 0.0))
+                delta = distance_mm - last_profile_distance
+                if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
+                    profiles_to_add = int(delta // profiling_distance_mm)
+                    profile_points = np.array(pts, dtype=np.float32)
+                    accumulated = session.get("accumulated_points") or []
+                    for i in range(profiles_to_add):
+                        step_distance = last_profile_distance + profiling_distance_mm * (i + 1)
+                        if profile_points.shape[1] >= 3:
+                            # Use data Y as motion axis (matches x/z scan plane in UI)
+                            prof = profile_points.copy()
+                            prof[:, 1] = step_distance
+                        else:
+                            prof = profile_points
+                        accumulated.extend(prof.tolist())
+                    session["profiles_count"] = int(session.get("profiles_count", 0) + profiles_to_add)
+                    # Cap accumulated size to avoid memory blow-up
+                    max_accum = 200000
+                    if len(accumulated) > max_accum:
+                        keep_idx = np.random.choice(len(accumulated), max_accum, replace=False)
+                        accumulated = [accumulated[i] for i in keep_idx]
+                    session["accumulated_points"] = accumulated
+                    session["last_profile_distance_mm"] = last_profile_distance + profiling_distance_mm * profiles_to_add
+    except Exception:
+        pass
+
+
+def _run_acquisition_loop(app):
+    session = app.state.acquisition_session
+    stop_event = session.get("worker_stop_event")
+    receiver_manager = app.state.receiver_manager
+    while stop_event and not stop_event.is_set():
+        if session.get("recording"):
+            _update_session_once(session, receiver_manager)
+        time.sleep(0.05)
 
 
 def _extract_segments(result):
@@ -60,6 +184,81 @@ async def start_listening(request: Request):
     except Exception as e:
         logger.error(f"Error starting: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/trigger/start")
+async def start_trigger(request: Request):
+    """Start acquisition session (profile recording)."""
+    session = _get_session(request)
+    # Ensure worker thread is running
+    if session.get("worker_thread") is None or not session["worker_thread"].is_alive():
+        stop_event = threading.Event()
+        session["worker_stop_event"] = stop_event
+        worker = threading.Thread(target=_run_acquisition_loop, args=(request.app,), daemon=True)
+        session["worker_thread"] = worker
+        worker.start()
+
+    session["recording"] = True
+    session["distance_mm"] = 0.0
+    session["last_update_ts"] = time.time()
+    session["accumulated_points"] = []
+    session["last_profile_distance_mm"] = 0.0
+    session["profiles_count"] = 0
+    session["devices"] = [d.device_id for d in device_manager.get_all_devices() if d.enabled]
+    _update_session_once(session, request.app.state.receiver_manager)
+    return {
+        "recording": True,
+        "devices": session["devices"],
+        "distance_mm": session["distance_mm"],
+    }
+
+
+@router.post("/trigger/stop")
+async def stop_trigger(request: Request):
+    """Stop acquisition session."""
+    session = _get_session(request)
+    session["recording"] = False
+    stop_event = session.get("worker_stop_event")
+    if stop_event:
+        stop_event.set()
+    return {"recording": False, "distance_mm": session.get("distance_mm", 0.0)}
+
+
+@router.get("/trigger/status")
+async def trigger_status(request: Request):
+    session = _get_session(request)
+    return {
+        "recording": session.get("recording", False),
+        "distance_mm": session.get("distance_mm", 0.0),
+        "speed_mps": session.get("speed_mps"),
+        "profiling_distance_mm": session.get("profiling_distance_mm"),
+        "profiles_count": session.get("profiles_count", 0),
+        "points_count": len(session.get("last_points") or []),
+        "last_update_ts": session.get("last_update_ts"),
+    }
+
+
+@router.get("/trigger/latest-cloud")
+async def trigger_latest_cloud(request: Request, max_points: int = 40000):
+    session = _get_session(request)
+    if not session.get("recording") and session.get("accumulated_points"):
+        points = session.get("accumulated_points") or []
+    else:
+        points = session.get("last_points") or []
+    total_points = len(points)
+    if max_points is not None and max_points > 0 and total_points > max_points:
+        step = max(1, total_points // max_points)
+        points = points[::step]
+        if len(points) > max_points:
+            points = points[:max_points]
+    return {
+        "points": points,
+        "points_count": len(points),
+        "total_points": total_points,
+        "distance_mm": session.get("distance_mm", 0.0),
+        "profiles_count": session.get("profiles_count", 0),
+        "recording": session.get("recording", False),
+    }
 
 
 @router.post("/stop-listening")

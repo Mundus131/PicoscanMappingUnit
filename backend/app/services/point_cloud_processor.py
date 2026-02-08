@@ -151,7 +151,8 @@ class PointCloudProcessor:
             
             # Handle intensities if available
             if points.shape[1] > 3:
-                merged_intensities.append(points[:, 3])
+                intensities = points[:, 3].astype(np.float32)
+                merged_intensities.append(intensities)
         
         merged = np.vstack(merged_points)
         intensities = np.concatenate(merged_intensities) if merged_intensities else None

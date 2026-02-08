@@ -19,6 +19,23 @@ interface PointCloudThreeViewerProps {
   showGrid?: boolean;
   gridSize?: number;
   gridStep?: number;
+  colorScaleMode?: 'auto' | 'rssi100' | 'rssi255';
+  onHoverPoint?: (point: number[] | null) => void;
+  showOriginAxes?: boolean;
+  originAxisSize?: number;
+  showFrame?: boolean;
+  frameSizeMm?: { width: number; height: number } | null;
+  frameOriginMode?: 'center' | 'bottom-left' | 'front-left';
+  framePlane?: 'xy' | 'xz';
+  markers?: {
+    position: [number, number, number];
+    color?: number;
+    size?: number;
+    label?: string;
+    yawDeg?: number;
+    fovDeg?: number;
+    rangeMm?: number;
+  }[];
 }
 
 export interface PointCloudThreeViewerHandle {
@@ -58,6 +75,15 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       showGrid = true,
       gridSize = 5000,
       gridStep = 500,
+      colorScaleMode = 'auto',
+      onHoverPoint,
+      showOriginAxes = false,
+      originAxisSize = 1000,
+      showFrame = false,
+      frameSizeMm = null,
+      frameOriginMode = 'center',
+      framePlane = 'xy',
+      markers = [],
     },
     ref
   ) {
@@ -67,10 +93,16 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
   const cameraRef = useRef<THREE.PerspectiveCamera | THREE.OrthographicCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const pointsRef = useRef<THREE.Points | null>(null);
+  const raycasterRef = useRef<THREE.Raycaster | null>(null);
+  const mouseRef = useRef<THREE.Vector2>(new THREE.Vector2());
+  const lastHoverIndexRef = useRef<number | null>(null);
   const animationRef = useRef<number | null>(null);
   const centerRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
   const circleTextureRef = useRef<THREE.Texture | null>(null);
   const gridGroupRef = useRef<THREE.Group | null>(null);
+  const originAxesRef = useRef<THREE.Group | null>(null);
+  const frameGroupRef = useRef<THREE.Group | null>(null);
+  const markersGroupRef = useRef<THREE.Group | null>(null);
   const [isDark, setIsDark] = useState(false);
 
   useEffect(() => {
@@ -293,6 +325,92 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       scene.add(gridGroup);
     }
 
+    if (showOriginAxes) {
+      const axesGroup = new THREE.Group();
+      originAxesRef.current = axesGroup;
+      const xMat = new THREE.LineBasicMaterial({ color: 0xef4444 });
+      const yMat = new THREE.LineBasicMaterial({ color: 0x22c55e });
+      const zMat = new THREE.LineBasicMaterial({ color: 0x3b82f6 });
+      const size = originAxisSize;
+      axesGroup.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(size, 0, 0)]),
+        xMat
+      ));
+      axesGroup.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, size, 0)]),
+        yMat
+      ));
+      axesGroup.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, size)]),
+        zMat
+      ));
+      scene.add(axesGroup);
+    }
+
+    if (showFrame && frameSizeMm) {
+      const group = new THREE.Group();
+      frameGroupRef.current = group;
+
+      const mat = new THREE.LineBasicMaterial({ color: isDark ? 0x94a3b8 : 0x64748b });
+      const plane = framePlane === 'xz' ? 'xz' : 'xy';
+      const toVec = (a: number, b: number) => (plane === 'xz'
+        ? new THREE.Vector3(a, 0, b)
+        : new THREE.Vector3(a, b, 0));
+      const halfW = frameSizeMm.width / 2;
+      const halfH = frameSizeMm.height / 2;
+      const minX = frameOriginMode === 'center' ? -halfW : 0;
+      const maxX = frameOriginMode === 'center' ? halfW : frameSizeMm.width;
+      const minY = frameOriginMode === 'center' ? -halfH : 0;
+      const maxY = frameOriginMode === 'center' ? halfH : frameSizeMm.height;
+
+      const pts = [
+        toVec(minX, minY),
+        toVec(maxX, minY),
+        toVec(maxX, maxY),
+        toVec(minX, maxY),
+        toVec(minX, minY),
+      ];
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      group.add(new THREE.Line(geo, mat));
+
+      const createLabelSprite = (text: string) => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const size = 256;
+        canvas.width = size;
+        canvas.height = size;
+        if (ctx) {
+          ctx.clearRect(0, 0, size, size);
+          ctx.font = '36px Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = isDark ? 'rgba(15,23,42,0.85)' : 'rgba(255,255,255,0.9)';
+          ctx.fillRect(10, 90, size - 20, 60);
+          ctx.fillStyle = isDark ? '#e2e8f0' : '#111827';
+          ctx.fillText(text, size / 2, size / 2);
+        }
+        const texture = new THREE.CanvasTexture(canvas);
+        const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+        const sprite = new THREE.Sprite(material);
+        sprite.scale.set(400, 120, 1);
+        return sprite;
+      };
+
+      const widthLabel = createLabelSprite(`${(frameSizeMm.width / 1000).toFixed(2)} m`);
+      widthLabel.position.copy(
+        toVec((minX + maxX) / 2, maxY + frameSizeMm.height * 0.05)
+      );
+      group.add(widthLabel);
+
+      const heightLabel = createLabelSprite(`${(frameSizeMm.height / 1000).toFixed(2)} m`);
+      heightLabel.position.copy(
+        toVec(maxX + frameSizeMm.width * 0.05, (minY + maxY) / 2)
+      );
+      group.add(heightLabel);
+
+      scene.add(group);
+    }
+
     const resize = () => {
       const rect = container.getBoundingClientRect();
       const w = rect.width || 1;
@@ -333,9 +451,66 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     };
     animate();
 
+    raycasterRef.current = new THREE.Raycaster();
+    raycasterRef.current.params.Points = { threshold: 8 };
+
+    const handlePick = (event: MouseEvent, clearOnMiss: boolean) => {
+      if (!onHoverPoint || !pointsRef.current) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      mouseRef.current.set(x, y);
+      const raycaster = raycasterRef.current;
+      if (!raycaster || !cameraRef.current) return;
+      raycaster.setFromCamera(mouseRef.current, cameraRef.current);
+      try {
+        const cam = cameraRef.current;
+        const target = controlsRef.current?.target;
+        if (cam && target) {
+          const dist = cam.position.distanceTo(target);
+          raycaster.params.Points = { threshold: Math.max(6, Math.min(50, dist * 0.01)) };
+        }
+      } catch {
+        // ignore
+      }
+      const intersects = raycaster.intersectObject(pointsRef.current, false);
+      if (intersects.length > 0) {
+        const idx = intersects[0].index ?? null;
+        if (idx !== null && idx !== lastHoverIndexRef.current) {
+          lastHoverIndexRef.current = idx;
+          const p = points[idx];
+          onHoverPoint(p);
+        }
+      } else if (clearOnMiss && lastHoverIndexRef.current !== null) {
+        lastHoverIndexRef.current = null;
+        onHoverPoint(null);
+      }
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      handlePick(event, true);
+    };
+
+    const handleClick = (event: MouseEvent) => {
+      handlePick(event, false);
+    };
+
+    const handleMouseLeave = () => {
+      if (!onHoverPoint) return;
+      lastHoverIndexRef.current = null;
+      onHoverPoint(null);
+    };
+
+    renderer.domElement.addEventListener('mousemove', handleMouseMove);
+    renderer.domElement.addEventListener('click', handleClick);
+    renderer.domElement.addEventListener('mouseleave', handleMouseLeave);
+
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
       window.removeEventListener('resize', onResize);
+      renderer.domElement.removeEventListener('mousemove', handleMouseMove);
+      renderer.domElement.removeEventListener('click', handleClick);
+      renderer.domElement.removeEventListener('mouseleave', handleMouseLeave);
       controls.dispose();
       renderer.dispose();
       if (renderer.domElement.parentElement) {
@@ -343,7 +518,96 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       }
       scene.clear();
     };
-  }, [view, showGrid, gridSize, gridStep, isDark]);
+  }, [view, showGrid, gridSize, gridStep, isDark, showOriginAxes, originAxisSize, showFrame, frameSizeMm, frameOriginMode, framePlane]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    if (markersGroupRef.current) {
+      scene.remove(markersGroupRef.current);
+      markersGroupRef.current.clear();
+      markersGroupRef.current = null;
+    }
+    if (!markers || markers.length === 0) return;
+    const group = new THREE.Group();
+    markersGroupRef.current = group;
+    const createLabelSprite = (text: string) => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const size = 256;
+      canvas.width = size;
+      canvas.height = size;
+      if (ctx) {
+        ctx.clearRect(0, 0, size, size);
+        ctx.font = '36px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = isDark ? 'rgba(15,23,42,0.85)' : 'rgba(255,255,255,0.9)';
+        ctx.fillRect(10, 90, size - 20, 60);
+        ctx.fillStyle = isDark ? '#e2e8f0' : '#111827';
+        ctx.fillText(text, size / 2, size / 2);
+      }
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(420, 140, 1);
+      sprite.renderOrder = 10;
+      return sprite;
+    };
+    markers.forEach((m) => {
+      const color = m.color ?? (isDark ? 0x60a5fa : 0x2563eb);
+      const size = m.size ?? 40;
+      const geom = new THREE.SphereGeometry(size, 12, 12);
+      const mat = new THREE.MeshBasicMaterial({ color });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.set(m.position[0], m.position[1], m.position[2]);
+      group.add(mesh);
+
+      if (m.label) {
+        const label = createLabelSprite(m.label);
+        if (framePlane === 'xz') {
+          label.position.set(m.position[0], m.position[1] + 120, m.position[2]);
+        } else {
+          label.position.set(m.position[0], m.position[1], m.position[2] + 120);
+        }
+        group.add(label);
+      }
+
+      if (m.fovDeg && m.fovDeg > 0 && m.rangeMm && m.rangeMm > 0) {
+        const half = (m.fovDeg / 2) * (Math.PI / 180);
+        const shape = new THREE.Shape();
+        shape.moveTo(0, 0);
+        shape.lineTo(m.rangeMm * Math.cos(-half), m.rangeMm * Math.sin(-half));
+        shape.absarc(0, 0, m.rangeMm, -half, half, false);
+        shape.lineTo(0, 0);
+        const geo = new THREE.ShapeGeometry(shape, 32);
+        const yawRad = ((m.yawDeg ?? 0) * Math.PI) / 180;
+        if (framePlane === 'xz') {
+          geo.rotateX(Math.PI / 2);
+          geo.rotateY(yawRad);
+        } else {
+          geo.rotateZ(yawRad);
+        }
+        const matSector = new THREE.MeshBasicMaterial({
+          color: 0xea580c,
+          transparent: true,
+          opacity: 0.35,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        const sector = new THREE.Mesh(geo, matSector);
+        sector.rotation.set(0, 0, 0);
+        const epsilon = 1;
+        if (framePlane === 'xz') {
+          sector.position.set(m.position[0], m.position[1] + epsilon, m.position[2]);
+        } else {
+          sector.position.set(m.position[0], m.position[1], m.position[2] + epsilon);
+        }
+        group.add(sector);
+      }
+    });
+    scene.add(group);
+  }, [markers, isDark, framePlane]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -397,7 +661,16 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       positions[i * 3 + 2] = pz;
 
       const rssi = p.length >= 4 ? p[3] : z;
-      const t = (rssi - rssiMin) / denom;
+      let t = 0.0;
+      if (colorScaleMode === 'rssi100' && p.length >= 4) {
+        const clamped = Math.max(0, Math.min(100, rssi));
+        t = clamped / 100.0;
+      } else if (colorScaleMode === 'rssi255' && p.length >= 4) {
+        const clamped = Math.max(0, Math.min(255, rssi));
+        t = clamped / 255.0;
+      } else {
+        t = (rssi - rssiMin) / denom;
+      }
       const color = new THREE.Color();
       color.setHSL((1.0 - t) * 0.7, 1.0, 0.5);
       colors[i * 3 + 0] = color.r;
@@ -414,9 +687,9 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     }
 
     const material = new THREE.PointsMaterial({
-      size: 8,
+      size: view === '3d' ? 6 : 14,
       vertexColors: true,
-      sizeAttenuation: true,
+      sizeAttenuation: view !== '3d',
       map: circleTextureRef.current ?? undefined,
       transparent: true,
       alphaTest: 0.5,
@@ -425,7 +698,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     const pts = new THREE.Points(geometry, material);
     pointsRef.current = pts;
     scene.add(pts);
-  }, [points, mapAxes]);
+  }, [points, mapAxes, isDark]);
 
   const fitToPoints = () => {
     const camera = cameraRef.current;

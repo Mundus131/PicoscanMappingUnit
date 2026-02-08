@@ -75,3 +75,8 @@ class FrameSettings(BaseModel):
     width_m: float
     height_m: float
     origin_mode: str
+
+class MotionSettings(BaseModel):
+    mode: str  # "fixed" or "encoder"
+    fixed_speed_mps: float | None = None
+    profiling_distance_mm: float | None = None

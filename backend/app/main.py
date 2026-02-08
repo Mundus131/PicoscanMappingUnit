@@ -34,6 +34,7 @@ app = FastAPI(
 
 # Initialize receiver manager in app state
 app.state.receiver_manager = None
+app.state.acquisition_session = None
 
 # Add CORS middleware
 app.add_middleware(
@@ -57,6 +58,20 @@ async def startup_event():
     try:
         receiver_manager = PicoscanReceiverManager()
         app.state.receiver_manager = receiver_manager
+        app.state.acquisition_session = {
+            "recording": False,
+            "distance_mm": 0.0,
+            "last_update_ts": None,
+            "last_points": [],
+            "accumulated_points": [],
+            "last_profile_distance_mm": 0.0,
+            "profiles_count": 0,
+            "devices": [],
+            "speed_mps": None,
+            "profiling_distance_mm": None,
+            "worker_thread": None,
+            "worker_stop_event": None,
+        }
         
         # Auto-start listening for all enabled devices
         enabled_devices = [d for d in device_manager.get_all_devices() if d.enabled]

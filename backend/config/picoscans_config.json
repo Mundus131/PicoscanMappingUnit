@@ -9,27 +9,27 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          -1000.0,
+          1000.0,
           0.0,
           1000.0
         ],
         "rotation_deg": [
           0.0,
-          0.0,
+          135.0,
           0.0
         ],
         "scale": 1.0
       },
-      "frame_corner": "top-left",
+      "frame_corner": "top-right",
       "frame_position": [
-        -1.0,
+        1.0,
         1.0,
         0.0
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        0.0
+        135.0
       ],
       "segments_per_scan": null,
       "acquisition_mode": "continuous",
@@ -45,8 +45,13 @@
     "missing_data_method": "kriging"
   },
   "frame_settings": {
-    "width_m": 2.0,
-    "height_m": 2.0,
-    "origin_mode": "top_right"
+    "width_m": 1.0,
+    "height_m": 1.0,
+    "origin_mode": "bottom-left"
+  },
+  "motion_settings": {
+    "mode": "fixed",
+    "fixed_speed_mps": 0.1,
+    "profiling_distance_mm": 1.0
   }
 }

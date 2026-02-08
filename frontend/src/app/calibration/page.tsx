@@ -41,7 +41,17 @@ export default function CalibrationPage() {
   const [frameSaving, setFrameSaving] = useState(false);
   const [frameDirty, setFrameDirty] = useState(false);
   const [frameSavedAt, setFrameSavedAt] = useState<number | null>(null);
+  const [motionMode, setMotionMode] = useState<'fixed' | 'encoder'>('fixed');
+  const [fixedSpeed, setFixedSpeed] = useState(0.5);
+  const [profilingDistance, setProfilingDistance] = useState(10);
+  const [motionSaving, setMotionSaving] = useState(false);
+  const [motionSavedAt, setMotionSavedAt] = useState<number | null>(null);
   const [pingMap, setPingMap] = useState<Record<string, boolean | null>>({});
+
+  const frameSizeMm = React.useMemo(() => ({
+    width: frameWidth * 1000,
+    height: frameHeight * 1000,
+  }), [frameWidth, frameHeight]);
 
   // Device management (moved from Settings)
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -110,9 +120,19 @@ export default function CalibrationPage() {
     }
   };
 
-  const getCornerRotation = () => {
-    // Mount angle is handled physically; default to no rotation.
-    return [0, 0, 0];
+  const getCornerRotation = (corner: string) => {
+    switch (corner) {
+      case 'top-left':
+        return [0, 0, 45];
+      case 'top-right':
+        return [0, 0, 135];
+      case 'bottom-left':
+        return [0, 0, -45];
+      case 'bottom-right':
+        return [0, 0, -135];
+      default:
+        return [0, 0, 0];
+    }
   };
 
   const layoutRef = useRef({ w: frameWidth, h: frameHeight, origin: originMode, ready: false });
@@ -135,7 +155,7 @@ export default function CalibrationPage() {
         const corner = d.frame_corner as string;
         const prevPos = getCornerPosition(corner, prev.origin, prev.w, prev.h);
         const currPos = getCornerPosition(corner, curr.origin, curr.w, curr.h);
-        const currRot = getCornerRotation();
+        const currRot = getCornerRotation(corner);
         const p = d.frame_position || prevPos;
         const dx = Math.abs((p?.[0] ?? 0) - prevPos[0]);
         const dy = Math.abs((p?.[1] ?? 0) - prevPos[1]);
@@ -204,6 +224,23 @@ export default function CalibrationPage() {
     }
   };
 
+  const loadMotionSettings = async () => {
+    try {
+      const res = await api.get('/calibration/motion-settings');
+      if (res.data) {
+        setMotionMode(res.data.mode === 'encoder' ? 'encoder' : 'fixed');
+        if (typeof res.data.fixed_speed_mps === 'number') {
+          setFixedSpeed(res.data.fixed_speed_mps);
+        }
+        if (typeof res.data.profiling_distance_mm === 'number') {
+          setProfilingDistance(res.data.profiling_distance_mm);
+        }
+      }
+    } catch (error) {
+      // ignore
+    }
+  };
+
   async function handleSaveFrameSettings() {
     setFrameSaving(true);
     try {
@@ -219,9 +256,24 @@ export default function CalibrationPage() {
     }
   }
 
+  async function handleSaveMotionSettings() {
+    setMotionSaving(true);
+    try {
+      await api.put('/calibration/motion-settings', {
+        mode: motionMode,
+        fixed_speed_mps: motionMode === 'fixed' ? fixedSpeed : null,
+        profiling_distance_mm: profilingDistance,
+      });
+      setMotionSavedAt(Date.now());
+    } finally {
+      setMotionSaving(false);
+    }
+  }
+
   useEffect(() => {
     loadDevices();
     loadFrameSettings();
+    loadMotionSettings();
   }, []);
 
   useEffect(() => {
@@ -266,18 +318,7 @@ export default function CalibrationPage() {
     return () => clearInterval(interval);
   }, [previewActive, selectedIds]);
 
-  const previewFitRef = useRef(false);
-
-  useEffect(() => {
-    if (!previewActive) {
-      previewFitRef.current = false;
-      return;
-    }
-    if (!previewFitRef.current && previewPoints.length > 0) {
-      previewRef.current?.fitToPoints();
-      previewFitRef.current = true;
-    }
-  }, [previewActive, previewPoints.length]);
+  // Disable auto reset/fit for live preview (manual control only)
 
   const handleOpenModal = (device?: Device) => {
     if (device) {
@@ -404,7 +445,8 @@ export default function CalibrationPage() {
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
-          <div className="card">
+          <div className="space-y-6">
+            <div className="card">
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold text-slate-900">Frame Layout</h2>
               <div className="text-xs text-gray-500">Gantry with corner-mounted LiDARs</div>
@@ -512,15 +554,9 @@ export default function CalibrationPage() {
                         const pos = manualOverride
                           ? (device.frame_position || calPos || getCornerPosition(corner, originMode))
                           : getCornerPosition(corner, originMode);
-                        const rot = (device.frame_rotation_deg || calRot || getCornerRotation());
+                        const rot = (device.frame_rotation_deg || calRot || getCornerRotation(corner));
                         const p = worldToSvg(pos[0], pos[1]);
-                        const centerWorld = originMode === 'center' ? [0, 0] : [frameWidth / 2, frameHeight / 2];
-                        const dx = centerWorld[0] - pos[0];
-                        const dy = centerWorld[1] - pos[1];
-                        const baseYaw = Math.atan2(dy, dx) * (180 / Math.PI);
-                        const yawDeg = baseYaw + (rot?.[2] ?? 0);
-                        // SVG Y axis is down, so invert rotation
-                        const yawAdj = -yawDeg;
+                        const yawAdj = rot?.[2] ?? 0;
                         const center = 180;
                         const radius = 160;
                         const fovDeg = 90;
@@ -562,6 +598,64 @@ export default function CalibrationPage() {
               </div>
             </div>
           </div>
+
+          <div className="card">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-semibold text-slate-900">Motion Mode</h2>
+                <p className="text-xs text-gray-500 mt-1">Fixed speed or encoder-driven operation</p>
+              </div>
+              <button className="btn-secondary" onClick={handleSaveMotionSettings} disabled={motionSaving}>
+                {motionSaving ? 'Saving...' : 'Save Motion Settings'}
+              </button>
+            </div>
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs text-gray-600">Mode</label>
+                <select
+                  className="input mt-1"
+                  value={motionMode}
+                  onChange={(e) => setMotionMode(e.target.value as 'fixed' | 'encoder')}
+                >
+                  <option value="fixed">Fixed speed</option>
+                  <option value="encoder">Encoder</option>
+                </select>
+              </div>
+              {motionMode === 'fixed' ? (
+                <div>
+                  <label className="text-xs text-gray-600">Fixed speed (m/s)</label>
+                  <input
+                    className="input mt-1"
+                    type="number"
+                    step="0.01"
+                    value={fixedSpeed}
+                    onChange={(e) => setFixedSpeed(parseFloat(e.target.value))}
+                  />
+                </div>
+              ) : (
+                <div className="flex items-end text-xs text-gray-500">
+                  Encoder active — speed handled by encoder.
+                </div>
+              )}
+              <div>
+                <label className="text-xs text-gray-600">Profiling distance (mm)</label>
+                <input
+                  className="input mt-1"
+                  type="number"
+                  step="1"
+                  value={profilingDistance}
+                  onChange={(e) => setProfilingDistance(parseFloat(e.target.value))}
+                />
+              </div>
+            </div>
+            {motionSavedAt && (
+              <div className="mt-2 text-xs text-gray-500 text-right">
+                Saved {new Date(motionSavedAt).toLocaleTimeString()}
+              </div>
+            )}
+          </div>
+
+        </div>
 
           <div className="card">
             <div className="flex items-center justify-between">
@@ -682,6 +776,11 @@ export default function CalibrationPage() {
                 view="2d"
                 width="100%"
                 height="100%"
+                showOriginAxes
+                originAxisSize={1000}
+                showFrame
+                frameSizeMm={frameSizeMm}
+                frameOriginMode={originMode as any}
               />
             </div>
             <div className="mt-2 text-xs text-gray-500">Live preview uses X/Z plane for 2D view.</div>
@@ -744,7 +843,7 @@ export default function CalibrationPage() {
                     onChange={(e) => {
                       const nextCorner = e.target.value;
                       const nextPos = getCornerPosition(nextCorner, originMode);
-                      const nextRot = getCornerRotation();
+                      const nextRot = getCornerRotation(nextCorner);
                       setFormData({
                         ...formData,
                         frame_corner: nextCorner,
@@ -768,7 +867,7 @@ export default function CalibrationPage() {
                     type="button"
                     onClick={() => {
                       const nextPos = getCornerPosition(formData.frame_corner, originMode);
-                      const nextRot = getCornerRotation();
+                      const nextRot = getCornerRotation(formData.frame_corner);
                       setFormData({ ...formData, frame_position: nextPos, frame_rotation_deg: nextRot });
                       setPositionDirty(false);
                       setRotationDirty(false);

@@ -59,6 +59,7 @@ class DeviceManager:
         self.devices: Dict[str, PicoscanDevice] = {}
         self.point_cloud_settings = {}
         self.frame_settings = {}
+        self.motion_settings = {}
         self.load_configuration()
     
     def load_configuration(self):
@@ -75,6 +76,7 @@ class DeviceManager:
             
             self.point_cloud_settings = config.get("point_cloud_settings", {})
             self.frame_settings = config.get("frame_settings", {})
+            self.motion_settings = config.get("motion_settings", {})
             # Ensure sensible default for segments_per_scan
             if "segments_per_scan" not in self.point_cloud_settings:
                 self.point_cloud_settings["segments_per_scan"] = 10
@@ -84,6 +86,12 @@ class DeviceManager:
                 self.frame_settings["height_m"] = 1.2
             if "origin_mode" not in self.frame_settings:
                 self.frame_settings["origin_mode"] = "center"
+            if "mode" not in self.motion_settings:
+                self.motion_settings["mode"] = "fixed"
+            if "fixed_speed_mps" not in self.motion_settings:
+                self.motion_settings["fixed_speed_mps"] = 0.5
+            if "profiling_distance_mm" not in self.motion_settings:
+                self.motion_settings["profiling_distance_mm"] = 10.0
         except FileNotFoundError:
             logger.warning(f"Configuration file not found: {config_path}")
         except Exception as e:
@@ -97,6 +105,7 @@ class DeviceManager:
                 "devices": [device.to_dict() for device in self.devices.values()],
                 "point_cloud_settings": self.point_cloud_settings,
                 "frame_settings": self.frame_settings,
+                "motion_settings": self.motion_settings,
             }
             
             with open(config_path, 'w') as f:
