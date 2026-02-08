@@ -662,56 +662,59 @@ export default function CalibrationPage() {
               <h2 className="text-xl font-semibold text-slate-900">Devices</h2>
               <span className="text-xs text-gray-500">{devices.length} devices</span>
             </div>
-            <div className="mt-4">
-              {devices.length === 0 ? (
-                <div className="text-sm text-gray-500">No devices configured yet.</div>
-              ) : (
-                <div className="table-container">
-                  <div className="table-header grid grid-cols-7 gap-2 text-xs font-semibold text-gray-600">
-                    <div>Name</div>
-                    <div>IP</div>
-                    <div>Port</div>
-                    <div>Corner</div>
-                    <div>Ping</div>
-                    <div>Status</div>
-                    <div>Actions</div>
-                  </div>
-                  {devices.map((device) => (
-                    <div key={device.device_id} className="table-row grid grid-cols-7 gap-2 items-center">
-                      <div className="font-medium text-slate-900">{device.name || device.device_id}</div>
-                      <div className="font-mono text-xs text-gray-700">{device.ip_address}</div>
-                      <div className="font-mono text-xs text-gray-700">{device.port}</div>
-                      <div className="text-xs text-gray-600">{device.frame_corner || '-'}</div>
-                      <div>
-                        {pingMap[device.device_id] === undefined ? (
-                          <span className="badge badge-info">checking</span>
-                        ) : pingMap[device.device_id] ? (
-                          <span className="badge badge-success">reachable</span>
-                        ) : (
-                          <span className="badge badge-danger">no ping</span>
-                        )}
-                      </div>
-                      <div>
-                        <span className={`badge ${device.connection_status === 'connected' ? 'badge-success' : 'badge-warning'}`}>
-                          {device.connection_status || 'unknown'}
-                        </span>
-                      </div>
-                      <div className="flex gap-2">
-                        <button className="btn-secondary px-2 py-2" onClick={() => openDetails(device)} aria-label="View">
-                          <Eye size={14} />
-                        </button>
-                        <button className="btn-secondary px-2 py-2" onClick={() => handleOpenModal(device)} aria-label="Edit">
-                          <Edit size={14} />
-                        </button>
-                        <button className="btn-danger px-2 py-2" onClick={() => handleDeleteDevice(device.device_id)} aria-label="Delete">
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
+              <div className="mt-4">
+                {devices.length === 0 ? (
+                  <div className="text-sm text-gray-500">No devices configured yet.</div>
+                ) : (
+                  <div className="table-container">
+                    <div
+                      className="table-header text-xs font-semibold text-gray-600"
+                      style={{ display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.7fr 0.9fr 0.9fr 0.7fr', columnGap: '0.5rem', alignItems: 'center' }}
+                    >
+                      <div>Name</div>
+                      <div>IP</div>
+                      <div>Port</div>
+                      <div>Corner</div>
+                      <div>Ping</div>
+                      <div className="text-right">Actions</div>
                     </div>
-                  ))}
-                </div>
-              )}
-            </div>
+                    {devices.map((device) => {
+                      const ping = pingMap[device.device_id];
+                      return (
+                        <div
+                          key={device.device_id}
+                          className="table-row"
+                          style={{ display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.7fr 0.9fr 0.9fr 0.7fr', columnGap: '0.5rem', alignItems: 'center' }}
+                        >
+                          <div className="min-w-0">
+                            <div className="font-medium text-slate-900 truncate">{device.name || device.device_id}</div>
+                            <div className="text-xs text-gray-500 truncate">{device.device_id}</div>
+                          </div>
+                          <div className="font-mono text-xs text-gray-700 truncate">{device.ip_address}</div>
+                          <div className="font-mono text-xs text-gray-700">{device.port}</div>
+                          <div className="text-xs text-gray-600 truncate">{device.frame_corner || '-'}</div>
+                          <div className="flex items-center gap-2 text-xs text-gray-600">
+                            <span
+                              className={`h-2.5 w-2.5 rounded-full ${
+                                ping === undefined ? 'bg-amber-400' : ping ? 'bg-emerald-400' : 'bg-rose-400'
+                              }`}
+                            />
+                            {ping === undefined ? 'checking' : ping ? 'reachable' : 'no ping'}
+                          </div>
+                          <div className="flex gap-2 justify-end">
+                            <button className="btn-secondary px-2 py-2" onClick={() => handleOpenModal(device)} aria-label="Edit">
+                              <Edit size={14} />
+                            </button>
+                            <button className="btn-danger px-2 py-2" onClick={() => handleDeleteDevice(device.device_id)} aria-label="Delete">
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
             <div className="mt-4">
               <label className="text-xs text-gray-600">Select devices for preview</label>
