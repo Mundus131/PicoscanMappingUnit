@@ -1,0 +1,52 @@
+{
+  "devices": [
+    {
+      "device_id": "picoscan_1",
+      "name": "Picoscan123",
+      "ip_address": "192.168.0.1",
+      "port": 2115,
+      "enabled": true,
+      "connection_status": "disconnected",
+      "calibration": {
+        "translation": [
+          -1000.0,
+          0.0,
+          1000.0
+        ],
+        "rotation_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": 1.0
+      },
+      "frame_corner": "top-left",
+      "frame_position": [
+        -1.0,
+        1.0,
+        0.0
+      ],
+      "frame_rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "segments_per_scan": null,
+      "acquisition_mode": "continuous",
+      "encoder_enabled": false,
+      "speed_profile": "fixed"
+    }
+  ],
+  "point_cloud_settings": {
+    "segments_per_scan": 10,
+    "voxel_size": 5.0,
+    "max_points": 1000000,
+    "interpolate_missing_data": true,
+    "missing_data_method": "kriging"
+  },
+  "frame_settings": {
+    "width_m": 2.0,
+    "height_m": 2.0,
+    "origin_mode": "top_right"
+  }
+}
