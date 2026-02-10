@@ -20,6 +20,7 @@ interface PointCloudThreeViewerProps {
   gridSize?: number;
   gridStep?: number;
   colorScaleMode?: 'auto' | 'rssi100' | 'rssi255';
+  colorMode?: 'rssi' | 'x' | 'y' | 'z';
   onHoverPoint?: (point: number[] | null) => void;
   showOriginAxes?: boolean;
   originAxisSize?: number;
@@ -44,6 +45,7 @@ interface PointCloudThreeViewerProps {
     label?: string;
   }[];
   showAxisWidget?: boolean;
+  showFloor?: boolean;
 }
 
 export interface PointCloudThreeViewerHandle {
@@ -84,6 +86,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       gridSize = 5000,
       gridStep = 500,
       colorScaleMode = 'auto',
+      colorMode = 'rssi',
       onHoverPoint,
       showOriginAxes = false,
       originAxisSize = 1000,
@@ -95,6 +98,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       yHorizontal = false,
       annotations = [],
       showAxisWidget = true,
+      showFloor = true,
     },
     ref
   ) {
@@ -359,6 +363,72 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
 
       scene.add(gridGroup);
     }
+    let gridXZRef: THREE.GridHelper | null = null;
+    let gridYZRef: THREE.GridHelper | null = null;
+    if (showGrid && view === '3d') {
+      const gridGroup = new THREE.Group();
+      gridGroup.renderOrder = 1;
+      gridGroupRef.current = gridGroup;
+
+      const size = gridSize;
+      const divisions = Math.max(2, Math.round(size / gridStep));
+      const makeGrid = (colorMajor: number, colorMinor: number) => {
+        const g = new THREE.GridHelper(size, divisions, colorMajor, colorMinor);
+        g.material.opacity = isDark ? 0.3 : 0.4;
+        g.material.transparent = true;
+        return g;
+      };
+      const gridXZ = makeGrid(isDark ? 0x334155 : 0xcbd5f5, isDark ? 0x1f2937 : 0xe5e7eb);
+      const gridXY = makeGrid(isDark ? 0x334155 : 0xcbd5f5, isDark ? 0x1f2937 : 0xe5e7eb);
+      const gridYZ = makeGrid(isDark ? 0x334155 : 0xcbd5f5, isDark ? 0x1f2937 : 0xe5e7eb);
+      gridXZ.rotation.set(0, 0, 0);
+      gridXZ.position.set(0, -1, 0);
+      gridXY.rotation.set(Math.PI / 2, 0, 0);
+      gridYZ.rotation.set(0, 0, Math.PI / 2);
+      gridXZRef = gridXZ;
+      gridYZRef = gridYZ;
+      gridGroup.add(gridXZ, gridXY, gridYZ);
+
+      const createTextSprite = (text: string, color = '#94a3b8') => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const size = 256;
+        canvas.width = size;
+        canvas.height = size;
+        if (ctx) {
+          ctx.clearRect(0, 0, size, size);
+          ctx.font = '36px Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = isDark ? 'rgba(15,23,42,0.8)' : 'rgba(255,255,255,0.85)';
+          ctx.fillRect(10, 90, size - 20, 60);
+          ctx.fillStyle = color;
+          ctx.fillText(text, size / 2, size / 2);
+        }
+        const texture = new THREE.CanvasTexture(canvas);
+        const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+        const sprite = new THREE.Sprite(material);
+        sprite.scale.set(420, 140, 1);
+        sprite.renderOrder = 2;
+        return sprite;
+      };
+
+      const step = gridStep;
+      for (let x = -size / 2; x <= size / 2; x += step) {
+        if (x === 0) continue;
+        const label = createTextSprite((x / 1000).toFixed(1), isDark ? '#94a3b8' : '#6b7280');
+        label.position.set(x, 0, -size / 2);
+        gridGroup.add(label);
+      }
+      for (let z = -size / 2; z <= size / 2; z += step) {
+        if (z === 0) continue;
+        const label = createTextSprite((z / 1000).toFixed(1), isDark ? '#94a3b8' : '#6b7280');
+        label.position.set(-size / 2, 0, z);
+        gridGroup.add(label);
+      }
+
+      scene.add(gridGroup);
+    }
 
     if (showOriginAxes) {
       const axesGroup = new THREE.Group();
@@ -380,6 +450,49 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
         zMat
       ));
       scene.add(axesGroup);
+    }
+
+    if (view === '3d' && showFloor) {
+      const floorSize = gridSize * 2.0;
+      const floorGeo = new THREE.PlaneGeometry(floorSize, floorSize, 1, 1);
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        const tile = 32;
+        for (let y = 0; y < 256; y += tile) {
+          for (let x = 0; x < 256; x += tile) {
+            const even = ((x / tile) + (y / tile)) % 2 === 0;
+            if (isDark) {
+              ctx.fillStyle = even ? '#0f172a' : '#111827';
+            } else {
+              ctx.fillStyle = even ? '#e5e7eb' : '#f1f5f9';
+            }
+            ctx.fillRect(x, y, tile, tile);
+          }
+        }
+      }
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(8, 8);
+      const floorMat = new THREE.MeshBasicMaterial({
+        map: tex,
+        color: 0xffffff,
+        transparent: true,
+        opacity: 1,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const floor = new THREE.Mesh(floorGeo, floorMat);
+      floor.rotation.y = Math.PI / 2;
+      floor.position.set(0.2, 0, 0);
+      floor.renderOrder = 3;
+      scene.add(floor);
+      // Hide grid on the floor plane
+      if (gridXZRef) gridXZRef.visible = false;
+      if (gridYZRef) gridYZRef.visible = false;
     }
 
     if (showFrame && frameSizeMm) {
@@ -484,8 +597,8 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       if (showAxisWidget && view === '3d' && axisWidgetRef.current && cameraRef.current) {
         const cam = cameraRef.current;
         const q = cam.quaternion.clone().invert();
-        const scale = 42;
-        const center = 60;
+        const scale = 34;
+        const center = 44;
         const axes = {
           x: new THREE.Vector3(1, 0, 0).applyQuaternion(q),
           y: new THREE.Vector3(0, 1, 0).applyQuaternion(q),
@@ -586,7 +699,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       }
       scene.clear();
     };
-  }, [view, showGrid, gridSize, gridStep, isDark, showOriginAxes, originAxisSize, showFrame, frameSizeMm, frameOriginMode, framePlane, yHorizontal]);
+  }, [view, showGrid, gridSize, gridStep, isDark, showOriginAxes, originAxisSize, showFrame, frameSizeMm, frameOriginMode, framePlane, yHorizontal, showFloor]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -770,15 +883,24 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     const positions = new Float32Array(count * 3);
     const colors = new Float32Array(count * 3);
 
-    // RSSI scaling
+    // Value scaling for colors
     let rssiMin = Infinity;
     let rssiMax = -Infinity;
+    let axisMin = Infinity;
+    let axisMax = -Infinity;
     for (let i = 0; i < count; i += 1) {
-      const rssi = points[i].length >= 4 ? points[i][3] : points[i][2];
+      const p = points[i];
+      const rssi = p.length >= 4 ? p[3] : p[2];
       if (rssi < rssiMin) rssiMin = rssi;
       if (rssi > rssiMax) rssiMax = rssi;
+      if (colorMode !== 'rssi') {
+        const v = colorMode === 'x' ? p[0] : colorMode === 'y' ? p[1] : p[2];
+        if (v < axisMin) axisMin = v;
+        if (v > axisMax) axisMax = v;
+      }
     }
     const denom = rssiMax - rssiMin || 1;
+    const axisDenom = axisMax - axisMin || 1;
 
     for (let i = 0; i < count; i += 1) {
       const p = points[i];
@@ -801,14 +923,19 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
 
       const rssi = p.length >= 4 ? p[3] : z;
       let t = 0.0;
-      if (colorScaleMode === 'rssi100' && p.length >= 4) {
-        const clamped = Math.max(0, Math.min(100, rssi));
-        t = clamped / 100.0;
-      } else if (colorScaleMode === 'rssi255' && p.length >= 4) {
-        const clamped = Math.max(0, Math.min(255, rssi));
-        t = clamped / 255.0;
+      if (colorMode === 'rssi') {
+        if (colorScaleMode === 'rssi100' && p.length >= 4) {
+          const clamped = Math.max(0, Math.min(100, rssi));
+          t = clamped / 100.0;
+        } else if (colorScaleMode === 'rssi255' && p.length >= 4) {
+          const clamped = Math.max(0, Math.min(255, rssi));
+          t = clamped / 255.0;
+        } else {
+          t = (rssi - rssiMin) / denom;
+        }
       } else {
-        t = (rssi - rssiMin) / denom;
+        const v = colorMode === 'x' ? p[0] : colorMode === 'y' ? p[1] : p[2];
+        t = (v - axisMin) / axisDenom;
       }
       const color = new THREE.Color();
       color.setHSL((1.0 - t) * 0.7, 1.0, 0.5);
@@ -837,7 +964,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     const pts = new THREE.Points(geometry, material);
     pointsRef.current = pts;
     scene.add(pts);
-  }, [points, mapAxes, isDark]);
+  }, [points, mapAxes, isDark, colorMode, colorScaleMode]);
 
   const fitToPoints = () => {
     const camera = cameraRef.current;

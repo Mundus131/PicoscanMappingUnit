@@ -80,3 +80,25 @@ class MotionSettings(BaseModel):
     mode: str  # "fixed" or "encoder"
     fixed_speed_mps: float | None = None
     profiling_distance_mm: float | None = None
+    encoder_wheel_mode: str | None = None  # "diameter" or "circumference"
+    encoder_wheel_value_mm: float | None = None
+    encoder_rps: float | None = None
+
+class TdcSettings(BaseModel):
+    enabled: bool
+    ip_address: str
+    port: int
+    login: str
+    password: str
+    realm: str | None = None
+    trigger_input: str
+    poll_interval_ms: int
+    token_refresh_interval_s: float | None = None
+    grpc_timeout_s: float | None = None
+    encoder_port: str | None = None  # "1".."4"
+    start_delay_mode: str | None = None  # "time" or "distance"
+    start_delay_ms: float | None = None
+    start_delay_mm: float | None = None
+    stop_delay_mode: str | None = None  # "time" or "distance"
+    stop_delay_ms: float | None = None
+    stop_delay_mm: float | None = None

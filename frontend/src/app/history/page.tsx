@@ -23,6 +23,8 @@ export default function HistoryPage() {
   const [showOriginal, setShowOriginal] = useState(true);
   const [showAugmented, setShowAugmented] = useState(true);
   const [colorBySource, setColorBySource] = useState(true);
+  const [colorMode, setColorMode] = useState<'rssi' | 'x' | 'y' | 'z'>('rssi');
+  const [showFloor, setShowFloor] = useState(true);
   const [viewerKey, setViewerKey] = useState(0);
   const viewerRef = useRef<PointCloudThreeViewerHandle | null>(null);
   const fitOnceRef = useRef(false);
@@ -62,6 +64,10 @@ export default function HistoryPage() {
       }, 150);
     }
   }, [details, viewerKey]);
+
+  useEffect(() => {
+    setViewerKey((v) => v + 1);
+  }, [showFloor]);
 
   const displayPoints = useMemo(() => {
     const originals = showOriginal ? (details?.original_points || []) : [];
@@ -166,10 +172,36 @@ export default function HistoryPage() {
                   gridSize={12000}
                   gridStep={1000}
                   colorScaleMode={colorBySource ? 'rssi100' : 'auto'}
+                  colorMode={colorMode}
                   onHoverPoint={setHoverPoint}
                   showOriginAxes
                   originAxisSize={1000}
+                  showFloor={showFloor}
                 />
+                <div className="absolute top-4 left-4 flex items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white">
+                  <span className="text-gray-200">Color</span>
+                  <select
+                    className="bg-transparent text-white text-xs outline-none"
+                    style={{ backgroundColor: 'rgba(15,23,42,0.9)' }}
+                    value={colorMode}
+                    onChange={(e) => setColorMode(e.target.value as typeof colorMode)}
+                  >
+                    <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="rssi">RSSI</option>
+                    <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="x">X</option>
+                    <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="y">Y</option>
+                    <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="z">Z</option>
+                  </select>
+                </div>
+                <div className="absolute top-4 right-4 flex items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={showFloor}
+                      onChange={(e) => setShowFloor(e.target.checked)}
+                    />
+                    Floor
+                  </label>
+                </div>
                 {hoverPoint && (
                   <div className="absolute bottom-4 right-4 rounded-md bg-black/70 px-3 py-2 text-xs text-white">
                     <div className="font-semibold mb-1">Point data</div>

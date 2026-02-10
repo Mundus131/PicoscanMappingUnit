@@ -1,7 +1,7 @@
 import logging
 from fastapi import APIRouter, HTTPException, Request
 from app.core.device_manager import device_manager
-from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings, MotionSettings
+from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings, MotionSettings, TdcSettings
 import numpy as np
 from app.services.point_cloud_processor import PointCloudProcessor
 
@@ -230,6 +230,39 @@ async def update_motion_settings(req: MotionSettings):
         "mode": req.mode,
         "fixed_speed_mps": req.fixed_speed_mps,
         "profiling_distance_mm": req.profiling_distance_mm,
+        "encoder_wheel_mode": req.encoder_wheel_mode or "diameter",
+        "encoder_wheel_value_mm": req.encoder_wheel_value_mm or 0.0,
+        "encoder_rps": req.encoder_rps or 0.0,
     }
     device_manager._save_to_json()
     return device_manager.motion_settings
+
+
+@router.get("/tdc-settings")
+async def get_tdc_settings():
+    return device_manager.tdc_settings
+
+
+@router.put("/tdc-settings")
+async def update_tdc_settings(req: TdcSettings):
+    device_manager.tdc_settings = {
+        "enabled": req.enabled,
+        "ip_address": req.ip_address,
+        "port": req.port,
+        "login": req.login,
+        "password": req.password,
+        "realm": req.realm or "admin",
+        "trigger_input": req.trigger_input,
+        "poll_interval_ms": req.poll_interval_ms,
+        "token_refresh_interval_s": req.token_refresh_interval_s or 300,
+        "grpc_timeout_s": req.grpc_timeout_s or 5.0,
+        "encoder_port": req.encoder_port or "1",
+        "start_delay_mode": req.start_delay_mode or "time",
+        "start_delay_ms": req.start_delay_ms or 0.0,
+        "start_delay_mm": req.start_delay_mm or 0.0,
+        "stop_delay_mode": req.stop_delay_mode or "time",
+        "stop_delay_ms": req.stop_delay_ms or 0.0,
+        "stop_delay_mm": req.stop_delay_mm or 0.0,
+    }
+    device_manager._save_to_json()
+    return device_manager.tdc_settings

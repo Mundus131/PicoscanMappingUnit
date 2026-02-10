@@ -52,6 +52,28 @@
   "motion_settings": {
     "mode": "fixed",
     "fixed_speed_mps": 0.5,
-    "profiling_distance_mm": 10.0
+    "profiling_distance_mm": 10.0,
+    "encoder_wheel_mode": "diameter",
+    "encoder_wheel_value_mm": 100.0,
+    "encoder_rps": 0.0
+  },
+  "tdc_settings": {
+    "enabled": false,
+    "ip_address": "192.168.0.100",
+    "port": 8081,
+    "login": "admin",
+    "password": "Welcome1!",
+    "realm": "admin",
+    "trigger_input": "DI1",
+    "poll_interval_ms": 200,
+    "token_refresh_interval_s": 300,
+    "grpc_timeout_s": 5.0,
+    "encoder_port": "1",
+    "start_delay_mode": "time",
+    "start_delay_ms": 0.0,
+    "start_delay_mm": 0.0,
+    "stop_delay_mode": "time",
+    "stop_delay_ms": 0.0,
+    "stop_delay_mm": 0.0
   }
 }

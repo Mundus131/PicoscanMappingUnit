@@ -9,9 +9,10 @@ import asyncio
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import settings
-from app.api.endpoints import devices, point_cloud, acquisition, calibration
+from app.api.endpoints import devices, point_cloud, acquisition, calibration, tdc, system
 from app.services.picoscan_receiver import PicoscanReceiverManager
 from app.services.tcp_notifier import TcpNotifier
+from app.services.tdc_trigger_monitor import TdcTriggerMonitor
 from app.core.device_manager import device_manager
 
 # Configure logging
@@ -37,6 +38,9 @@ app = FastAPI(
 app.state.receiver_manager = None
 app.state.acquisition_session = None
 app.state.tcp_notifier = None
+app.state.tdc_monitor = None
+app.state.tdc_input_state = None
+app.state.tdc_input_ts = None
 
 # Add CORS middleware
 app.add_middleware(
@@ -52,6 +56,8 @@ app.include_router(devices.router, prefix="/api/v1/devices", tags=["Devices"])
 app.include_router(point_cloud.router, prefix="/api/v1/point-cloud", tags=["Point Cloud"])
 app.include_router(acquisition.router, prefix="/api/v1/acquisition", tags=["Real Data Acquisition"])
 app.include_router(calibration.router, prefix="/api/v1/calibration", tags=["Calibration"])
+app.include_router(tdc.router, prefix="/api/v1/tdc", tags=["TDC"])
+app.include_router(system.router, prefix="/api/v1/system", tags=["System"])
 
 
 @app.on_event("startup")
@@ -63,6 +69,9 @@ async def startup_event():
         notifier = TcpNotifier(port=2120)
         notifier.start()
         app.state.tcp_notifier = notifier
+        tdc_monitor = TdcTriggerMonitor(app)
+        tdc_monitor.start()
+        app.state.tdc_monitor = tdc_monitor
         app.state.acquisition_session = {
             "recording": False,
             "distance_mm": 0.0,
@@ -104,6 +113,8 @@ async def shutdown_event():
                 app.state.receiver_manager.stop_listening(device_id)
         if app.state.tcp_notifier:
             app.state.tcp_notifier.stop()
+        if app.state.tdc_monitor:
+            app.state.tdc_monitor.stop()
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 

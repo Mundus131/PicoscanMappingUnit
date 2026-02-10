@@ -23,8 +23,8 @@ class AcquisitionRequest(BaseModel):
     num_segments: int = 1
 
 
-def _get_session(request: Request) -> dict:
-    session = getattr(request.app.state, "acquisition_session", None)
+def _get_session_from_app(app) -> dict:
+    session = getattr(app.state, "acquisition_session", None)
     if session is None:
         session = {
             "recording": False,
@@ -42,9 +42,15 @@ def _get_session(request: Request) -> dict:
             "analysis_metrics": None,
             "analysis_points": [],
             "analysis_duration_ms": None,
+            "start_delay_mm_remaining": 0.0,
+            "trigger_source": "manual",
         }
-        request.app.state.acquisition_session = session
+        app.state.acquisition_session = session
     return session
+
+
+def _get_session(request: Request) -> dict:
+    return _get_session_from_app(request.app)
 
 
 def _update_session_once(session: dict, receiver_manager):
@@ -55,17 +61,41 @@ def _update_session_once(session: dict, receiver_manager):
     motion = device_manager.motion_settings or {}
     mode = motion.get("mode", "fixed")
     fixed_speed = motion.get("fixed_speed_mps", 0.0) or 0.0
+    encoder_rps = motion.get("encoder_rps", 0.0) or 0.0
+    encoder_mode = motion.get("encoder_wheel_mode", "diameter") or "diameter"
+    encoder_value_mm = motion.get("encoder_wheel_value_mm", 0.0) or 0.0
     profiling_distance_mm = motion.get("profiling_distance_mm", None)
     if profiling_distance_mm is None:
         profiling_distance_mm = 10.0
 
     now = time.time()
     last_ts = session.get("last_update_ts")
-    if last_ts is not None and mode == "fixed":
+    if last_ts is not None:
         dt = max(0.0, now - last_ts)
-        session["distance_mm"] = float(session.get("distance_mm", 0.0) + fixed_speed * dt * 1000.0)
+        if mode == "fixed":
+            session["distance_mm"] = float(session.get("distance_mm", 0.0) + fixed_speed * dt * 1000.0)
+        elif mode == "encoder":
+            if encoder_value_mm > 0 and encoder_rps > 0:
+                if encoder_mode == "circumference":
+                    circ_m = encoder_value_mm / 1000.0
+                else:
+                    circ_m = (encoder_value_mm * np.pi) / 1000.0
+                speed_mps = encoder_rps * circ_m
+                session["distance_mm"] = float(session.get("distance_mm", 0.0) + speed_mps * dt * 1000.0)
     session["last_update_ts"] = now
-    session["speed_mps"] = fixed_speed if mode == "fixed" else None
+    if mode == "fixed":
+        session["speed_mps"] = fixed_speed
+    elif mode == "encoder":
+        if encoder_value_mm > 0 and encoder_rps > 0:
+            if encoder_mode == "circumference":
+                circ_m = encoder_value_mm / 1000.0
+            else:
+                circ_m = (encoder_value_mm * np.pi) / 1000.0
+            session["speed_mps"] = encoder_rps * circ_m
+        else:
+            session["speed_mps"] = None
+    else:
+        session["speed_mps"] = None
     session["profiling_distance_mm"] = profiling_distance_mm
 
     # fetch point clouds and merge
@@ -113,6 +143,13 @@ def _update_session_once(session: dict, receiver_manager):
                 last_profile_distance = float(session.get("last_profile_distance_mm", 0.0))
                 distance_mm = float(session.get("distance_mm", 0.0))
                 delta = distance_mm - last_profile_distance
+                # apply distance-based start delay by skipping accumulation
+                delay_remaining = float(session.get("start_delay_mm_remaining", 0.0))
+                if delay_remaining > 0:
+                    if delta > 0:
+                        remaining = max(0.0, delay_remaining - delta)
+                        session["start_delay_mm_remaining"] = remaining
+                    return
                 if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
                     profiles_to_add = int(delta // profiling_distance_mm)
                     profile_points = np.array(pts, dtype=np.float32)
@@ -146,6 +183,115 @@ def _run_acquisition_loop(app):
         if session.get("recording"):
             _update_session_once(session, receiver_manager)
         time.sleep(0.05)
+
+
+def start_trigger_session(app):
+    """Start acquisition session (profile recording) for internal calls."""
+    session = _get_session_from_app(app)
+    if session.get("recording"):
+        return session
+
+    if session.get("worker_thread") is None or not session["worker_thread"].is_alive():
+        stop_event = threading.Event()
+        session["worker_stop_event"] = stop_event
+        worker = threading.Thread(target=_run_acquisition_loop, args=(app,), daemon=True)
+        session["worker_thread"] = worker
+        worker.start()
+
+    session["recording"] = True
+    session["distance_mm"] = 0.0
+    session["last_update_ts"] = time.time()
+    session["accumulated_points"] = []
+    session["last_profile_distance_mm"] = 0.0
+    session["profiles_count"] = 0
+    session["start_delay_mm_remaining"] = 0.0
+    session["devices"] = [d.device_id for d in device_manager.get_all_devices() if d.enabled]
+    _update_session_once(session, app.state.receiver_manager)
+    return session
+
+
+def _run_analysis_for_session(session: dict, app):
+    try:
+        t0 = time.time()
+        points = session.get("accumulated_points") or []
+        profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
+        if points:
+            y_vals = [p[1] for p in points if len(p) >= 2]
+            y_min = min(y_vals) if y_vals else None
+            y_max = max(y_vals) if y_vals else None
+            metrics = compute_log_metrics(
+                points,
+                profiling_distance_mm=profiling_distance_mm,
+                window_profiles=10,
+                min_points=50,
+                y_min=y_min,
+                y_max=y_max,
+            )
+            session["analysis_metrics"] = metrics
+            session["analysis_points"] = build_augmented_cloud(
+                metrics,
+                points_per_circle=180,
+                rssi_value=80.0,
+                profiling_distance_mm=profiling_distance_mm,
+                y_min=y_min,
+                y_max=y_max,
+            )
+            session["analysis_duration_ms"] = int((time.time() - t0) * 1000)
+            try:
+                notifier = app.state.tcp_notifier
+            except Exception:
+                notifier = None
+            if notifier:
+                slices = metrics.get("slices") or []
+                if slices:
+                    first = slices[0]
+                    last = slices[-1]
+                    length_mm = (metrics.get("y_max_mm") - metrics.get("y_min_mm")) if metrics.get("y_min_mm") is not None else metrics.get("total_length_mm")
+                    values = [
+                        metrics.get("volume_m3"),
+                        length_mm,
+                        first.get("diameter_mm"),
+                        last.get("diameter_mm"),
+                        metrics.get("diameter_mm", {}).get("avg"),
+                        metrics.get("diameter_mm", {}).get("min"),
+                        metrics.get("diameter_mm", {}).get("max"),
+                    ]
+                    msg = "\x02" + ";".join(f"{v:.2f}" if isinstance(v, (int, float)) else "" for v in values) + "\x03"
+                    notifier.broadcast(msg)
+            try:
+                save_measurement({
+                    "metrics": metrics,
+                    "original_points": points,
+                    "augmented_points": session["analysis_points"],
+                    "profiling_distance_mm": profiling_distance_mm,
+                    "profiles_count": session.get("profiles_count", 0),
+                    "distance_mm": session.get("distance_mm", 0.0),
+                    "devices": session.get("devices", []),
+                    "analysis_duration_ms": session.get("analysis_duration_ms"),
+                })
+            except Exception:
+                pass
+        else:
+            session["analysis_metrics"] = None
+            session["analysis_points"] = []
+            session["analysis_duration_ms"] = None
+    except Exception:
+        session["analysis_metrics"] = None
+        session["analysis_points"] = []
+        session["analysis_duration_ms"] = None
+
+
+def stop_trigger_session(app):
+    """Stop acquisition session for internal calls."""
+    session = _get_session_from_app(app)
+    if not session.get("recording"):
+        return session
+    session["recording"] = False
+    stop_event = session.get("worker_stop_event")
+    if stop_event:
+        stop_event.set()
+    _run_analysis_for_session(session, app)
+    return session
 
 
 def _extract_segments(result):
@@ -194,25 +340,10 @@ async def start_listening(request: Request):
 @router.post("/trigger/start")
 async def start_trigger(request: Request):
     """Start acquisition session (profile recording)."""
-    session = _get_session(request)
-    # Ensure worker thread is running
-    if session.get("worker_thread") is None or not session["worker_thread"].is_alive():
-        stop_event = threading.Event()
-        session["worker_stop_event"] = stop_event
-        worker = threading.Thread(target=_run_acquisition_loop, args=(request.app,), daemon=True)
-        session["worker_thread"] = worker
-        worker.start()
-
-    session["recording"] = True
-    session["distance_mm"] = 0.0
-    session["last_update_ts"] = time.time()
-    session["accumulated_points"] = []
-    session["last_profile_distance_mm"] = 0.0
-    session["profiles_count"] = 0
-    session["devices"] = [d.device_id for d in device_manager.get_all_devices() if d.enabled]
-    _update_session_once(session, request.app.state.receiver_manager)
+    session = start_trigger_session(request.app)
+    session["trigger_source"] = "manual"
     return {
-        "recording": True,
+        "recording": session.get("recording", False),
         "devices": session["devices"],
         "distance_mm": session["distance_mm"],
     }
@@ -221,80 +352,8 @@ async def start_trigger(request: Request):
 @router.post("/trigger/stop")
 async def stop_trigger(request: Request):
     """Stop acquisition session."""
-    session = _get_session(request)
-    session["recording"] = False
-    stop_event = session.get("worker_stop_event")
-    if stop_event:
-        stop_event.set()
-    # Run analysis automatically on accumulated points
-    try:
-        t0 = time.time()
-        points = session.get("accumulated_points") or []
-        profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
-        if points:
-            y_vals = [p[1] for p in points if len(p) >= 2]
-            y_min = min(y_vals) if y_vals else None
-            y_max = max(y_vals) if y_vals else None
-            metrics = compute_log_metrics(
-                points,
-                profiling_distance_mm=profiling_distance_mm,
-                window_profiles=10,
-                min_points=50,
-                y_min=y_min,
-                y_max=y_max,
-            )
-            session["analysis_metrics"] = metrics
-            session["analysis_points"] = build_augmented_cloud(
-                metrics,
-                points_per_circle=180,
-                rssi_value=80.0,
-                profiling_distance_mm=profiling_distance_mm,
-                y_min=y_min,
-                y_max=y_max,
-            )
-            session["analysis_duration_ms"] = int((time.time() - t0) * 1000)
-            try:
-                notifier = request.app.state.tcp_notifier
-            except Exception:
-                notifier = None
-            if notifier:
-                slices = metrics.get("slices") or []
-                if slices:
-                    first = slices[0]
-                    last = slices[-1]
-                    length_mm = (metrics.get("y_max_mm") - metrics.get("y_min_mm")) if metrics.get("y_min_mm") is not None else metrics.get("total_length_mm")
-                    values = [
-                        metrics.get("volume_m3"),
-                        length_mm,
-                        first.get("diameter_mm"),
-                        last.get("diameter_mm"),
-                        metrics.get("diameter_mm", {}).get("avg"),
-                        metrics.get("diameter_mm", {}).get("min"),
-                        metrics.get("diameter_mm", {}).get("max"),
-                    ]
-                    msg = "\x02" + ";".join(f"{v:.2f}" if isinstance(v, (int, float)) else "" for v in values) + "\x03"
-                    notifier.broadcast(msg)
-            try:
-                save_measurement({
-                    "metrics": metrics,
-                    "original_points": points,
-                    "augmented_points": session["analysis_points"],
-                    "profiling_distance_mm": profiling_distance_mm,
-                    "profiles_count": session.get("profiles_count", 0),
-                    "distance_mm": session.get("distance_mm", 0.0),
-                    "devices": session.get("devices", []),
-                    "analysis_duration_ms": session.get("analysis_duration_ms"),
-                })
-            except Exception:
-                pass
-        else:
-            session["analysis_metrics"] = None
-            session["analysis_points"] = []
-            session["analysis_duration_ms"] = None
-    except Exception:
-        session["analysis_metrics"] = None
-        session["analysis_points"] = []
-        session["analysis_duration_ms"] = None
+    session = stop_trigger_session(request.app)
+    session["trigger_source"] = "manual"
     return {"recording": False, "distance_mm": session.get("distance_mm", 0.0)}
 
 
@@ -341,6 +400,13 @@ async def history_item(meas_id: str):
 @router.get("/trigger/status")
 async def trigger_status(request: Request):
     session = _get_session(request)
+    tdc_state = getattr(request.app.state, "tdc_input_state", None)
+    if tdc_state == 2:
+        tdc_label = "HIGH"
+    elif tdc_state == 1:
+        tdc_label = "LOW"
+    else:
+        tdc_label = "UNKNOWN"
     return {
         "recording": session.get("recording", False),
         "distance_mm": session.get("distance_mm", 0.0),
@@ -349,7 +415,38 @@ async def trigger_status(request: Request):
         "profiles_count": session.get("profiles_count", 0),
         "points_count": len(session.get("last_points") or []),
         "last_update_ts": session.get("last_update_ts"),
+        "tdc_input_state": tdc_label,
+        "trigger_source": session.get("trigger_source", "manual"),
     }
+
+
+@router.get("/trigger/status/stream")
+async def trigger_status_stream(request: Request):
+    async def event_generator():
+        while True:
+            session = _get_session(request)
+            tdc_state = getattr(request.app.state, "tdc_input_state", None)
+            if tdc_state == 2:
+                tdc_label = "HIGH"
+            elif tdc_state == 1:
+                tdc_label = "LOW"
+            else:
+                tdc_label = "UNKNOWN"
+            payload = {
+                "recording": session.get("recording", False),
+                "distance_mm": session.get("distance_mm", 0.0),
+                "speed_mps": session.get("speed_mps"),
+                "profiling_distance_mm": session.get("profiling_distance_mm"),
+                "profiles_count": session.get("profiles_count", 0),
+                "points_count": len(session.get("last_points") or []),
+                "last_update_ts": session.get("last_update_ts"),
+                "tdc_input_state": tdc_label,
+                "trigger_source": session.get("trigger_source", "manual"),
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.get("/trigger/latest-cloud")
@@ -373,6 +470,33 @@ async def trigger_latest_cloud(request: Request, max_points: int = 40000):
         "profiles_count": session.get("profiles_count", 0),
         "recording": session.get("recording", False),
     }
+
+
+@router.get("/trigger/latest-cloud/stream")
+async def trigger_latest_cloud_stream(request: Request, max_points: int = 30000):
+    async def event_generator():
+        while True:
+            session = _get_session(request)
+            if not session.get("recording") and session.get("accumulated_points"):
+                points = session.get("accumulated_points") or []
+            else:
+                points = session.get("last_points") or []
+            total_points = len(points)
+            if max_points is not None and max_points > 0 and total_points > max_points:
+                step = max(1, total_points // max_points)
+                points = points[::step]
+                if len(points) > max_points:
+                    points = points[:max_points]
+            payload = {
+                "points": points,
+                "points_count": len(points),
+                "total_points": total_points,
+                "recording": session.get("recording", False),
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.post("/stop-listening")

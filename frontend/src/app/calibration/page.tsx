@@ -44,9 +44,29 @@ export default function CalibrationPage() {
   const [motionMode, setMotionMode] = useState<'fixed' | 'encoder'>('fixed');
   const [fixedSpeed, setFixedSpeed] = useState(0.5);
   const [profilingDistance, setProfilingDistance] = useState(10);
+  const [encoderWheelMode, setEncoderWheelMode] = useState<'diameter' | 'circumference'>('diameter');
+  const [encoderWheelValue, setEncoderWheelValue] = useState(100);
+  const [encoderRps, setEncoderRps] = useState(0);
   const [motionSaving, setMotionSaving] = useState(false);
   const [motionSavedAt, setMotionSavedAt] = useState<number | null>(null);
   const [pingMap, setPingMap] = useState<Record<string, boolean | null>>({});
+  const [tdcEnabled, setTdcEnabled] = useState(false);
+  const [tdcIp, setTdcIp] = useState('192.168.0.100');
+  const [tdcPort, setTdcPort] = useState(8081);
+  const [tdcLogin, setTdcLogin] = useState('admin');
+  const [tdcPassword, setTdcPassword] = useState('Welcome1!');
+  const [tdcTriggerInput, setTdcTriggerInput] = useState('DI1');
+  const [tdcPollInterval, setTdcPollInterval] = useState(200);
+  const [tdcEncoderPort, setTdcEncoderPort] = useState<'1' | '2' | '3' | '4'>('1');
+  const [tdcStartDelayMode, setTdcStartDelayMode] = useState<'time' | 'distance'>('time');
+  const [tdcStartDelayMs, setTdcStartDelayMs] = useState(0);
+  const [tdcStartDelayMm, setTdcStartDelayMm] = useState(0);
+  const [tdcStopDelayMode, setTdcStopDelayMode] = useState<'time' | 'distance'>('time');
+  const [tdcStopDelayMs, setTdcStopDelayMs] = useState(0);
+  const [tdcStopDelayMm, setTdcStopDelayMm] = useState(0);
+  const [tdcStatus, setTdcStatus] = useState<any>(null);
+  const [tdcSaving, setTdcSaving] = useState(false);
+  const [tdcSavedAt, setTdcSavedAt] = useState<number | null>(null);
 
   const frameSizeMm = React.useMemo(() => ({
     width: frameWidth * 1000,
@@ -235,9 +255,53 @@ export default function CalibrationPage() {
         if (typeof res.data.profiling_distance_mm === 'number') {
           setProfilingDistance(res.data.profiling_distance_mm);
         }
+        if (res.data.encoder_wheel_mode === 'circumference') {
+          setEncoderWheelMode('circumference');
+        } else {
+          setEncoderWheelMode('diameter');
+        }
+        if (typeof res.data.encoder_wheel_value_mm === 'number') {
+          setEncoderWheelValue(res.data.encoder_wheel_value_mm);
+        }
+        if (typeof res.data.encoder_rps === 'number') {
+          setEncoderRps(res.data.encoder_rps);
+        }
       }
     } catch (error) {
       // ignore
+    }
+  };
+
+  const loadTdcSettings = async () => {
+    try {
+      const res = await api.get('/calibration/tdc-settings');
+      if (res.data) {
+        setTdcEnabled(!!res.data.enabled);
+        setTdcIp(res.data.ip_address ?? '192.168.0.100');
+        setTdcPort(Number(res.data.port ?? 8081));
+        setTdcLogin(res.data.login ?? 'admin');
+        setTdcPassword(res.data.password ?? 'Welcome1!');
+        setTdcTriggerInput(res.data.trigger_input ?? 'DI1');
+        setTdcPollInterval(Number(res.data.poll_interval_ms ?? 200));
+        setTdcEncoderPort((res.data.encoder_port ?? '1') as '1' | '2' | '3' | '4');
+        setTdcStartDelayMode(res.data.start_delay_mode === 'distance' ? 'distance' : 'time');
+        setTdcStartDelayMs(Number(res.data.start_delay_ms ?? 0));
+        setTdcStartDelayMm(Number(res.data.start_delay_mm ?? 0));
+        setTdcStopDelayMode(res.data.stop_delay_mode === 'distance' ? 'distance' : 'time');
+        setTdcStopDelayMs(Number(res.data.stop_delay_ms ?? 0));
+        setTdcStopDelayMm(Number(res.data.stop_delay_mm ?? 0));
+      }
+    } catch (error) {
+      // ignore
+    }
+  };
+
+  const loadTdcStatus = async () => {
+    try {
+      const res = await api.get('/tdc/status');
+      setTdcStatus(res.data || null);
+    } catch {
+      setTdcStatus(null);
     }
   };
 
@@ -263,6 +327,9 @@ export default function CalibrationPage() {
         mode: motionMode,
         fixed_speed_mps: motionMode === 'fixed' ? fixedSpeed : null,
         profiling_distance_mm: profilingDistance,
+        encoder_wheel_mode: encoderWheelMode,
+        encoder_wheel_value_mm: encoderWheelValue,
+        encoder_rps: encoderRps,
       });
       setMotionSavedAt(Date.now());
     } finally {
@@ -270,10 +337,37 @@ export default function CalibrationPage() {
     }
   }
 
+  async function handleSaveTdcSettings() {
+    setTdcSaving(true);
+    try {
+      await api.put('/calibration/tdc-settings', {
+        enabled: tdcEnabled,
+        ip_address: tdcIp,
+        port: tdcPort,
+        login: tdcLogin,
+        password: tdcPassword,
+        trigger_input: tdcTriggerInput,
+        poll_interval_ms: tdcPollInterval,
+        encoder_port: tdcEncoderPort,
+        start_delay_mode: tdcStartDelayMode,
+        start_delay_ms: tdcStartDelayMs,
+        start_delay_mm: tdcStartDelayMm,
+        stop_delay_mode: tdcStopDelayMode,
+        stop_delay_ms: tdcStopDelayMs,
+        stop_delay_mm: tdcStopDelayMm,
+      });
+      setTdcSavedAt(Date.now());
+    } finally {
+      setTdcSaving(false);
+    }
+  }
+
   useEffect(() => {
     loadDevices();
     loadFrameSettings();
     loadMotionSettings();
+    loadTdcSettings();
+    loadTdcStatus();
   }, []);
 
   useEffect(() => {
@@ -283,6 +377,13 @@ export default function CalibrationPage() {
     const interval = setInterval(() => refreshPing(ids), 3000);
     return () => clearInterval(interval);
   }, [devices]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadTdcStatus();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (!frameDirty) return;
@@ -438,10 +539,25 @@ export default function CalibrationPage() {
             <h1 className="text-3xl font-bold text-slate-900">System Configurator</h1>
             <p className="text-sm text-gray-500 mt-1">Universal acquisition layout for multi-device systems</p>
           </div>
-          <button className="btn-primary" onClick={() => handleOpenModal()}>
-            <Plus size={16} />
-            Add Device
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              className="btn-secondary"
+              onClick={async () => {
+                if (!confirm('Restart backend now?')) return;
+                try {
+                  await api.post('/system/restart');
+                } catch {
+                  // ignore
+                }
+              }}
+            >
+              Restart Backend
+            </button>
+            <button className="btn-primary" onClick={() => handleOpenModal()}>
+              <Plus size={16} />
+              Add Device
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
@@ -647,10 +763,248 @@ export default function CalibrationPage() {
                   onChange={(e) => setProfilingDistance(parseFloat(e.target.value))}
                 />
               </div>
+              {motionMode === 'encoder' && (
+                <>
+                  <div>
+                    <label className="text-xs text-gray-600">Measuring wheel</label>
+                    <select
+                      className="input mt-1"
+                      value={encoderWheelMode}
+                      onChange={(e) => setEncoderWheelMode(e.target.value as 'diameter' | 'circumference')}
+                    >
+                      <option value="diameter">Diameter (mm)</option>
+                      <option value="circumference">Circumference (mm)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600">
+                      {encoderWheelMode === 'diameter' ? 'Wheel diameter (mm)' : 'Wheel circumference (mm)'}
+                    </label>
+                    <input
+                      className="input mt-1"
+                      type="number"
+                      step="1"
+                      value={encoderWheelValue}
+                      onChange={(e) => setEncoderWheelValue(parseFloat(e.target.value))}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600">Encoder rotations per second (rps)</label>
+                    <input
+                      className="input mt-1"
+                      type="number"
+                      step="0.01"
+                      value={encoderRps}
+                      onChange={(e) => setEncoderRps(parseFloat(e.target.value))}
+                    />
+                  </div>
+                  <div className="flex items-end text-xs text-gray-500">
+                    Speed: {encoderRps > 0 && encoderWheelValue > 0
+                      ? (
+                        (() => {
+                          const circ = encoderWheelMode === 'circumference'
+                            ? encoderWheelValue / 1000
+                            : (encoderWheelValue * Math.PI) / 1000;
+                          return (encoderRps * circ).toFixed(3);
+                        })()
+                      )
+                      : '0.000'} m/s
+                  </div>
+                </>
+              )}
             </div>
             {motionSavedAt && (
               <div className="mt-2 text-xs text-gray-500 text-right">
                 Saved {new Date(motionSavedAt).toLocaleTimeString()}
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-semibold text-slate-900">Digital Trigger (TDC)</h2>
+                <p className="text-xs text-gray-500 mt-1">Start/stop acquisition based on digital input edges</p>
+              </div>
+              <button className="btn-secondary" onClick={handleSaveTdcSettings} disabled={tdcSaving}>
+                {tdcSaving ? 'Saving...' : 'Save TDC Settings'}
+              </button>
+            </div>
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="flex items-center gap-2">
+                <input
+                  id="tdc-enabled"
+                  type="checkbox"
+                  checked={tdcEnabled}
+                  onChange={(e) => setTdcEnabled(e.target.checked)}
+                />
+                <label htmlFor="tdc-enabled" className="text-sm text-gray-700">Enable digital trigger</label>
+              </div>
+              <div />
+              <div>
+                <label className="text-xs text-gray-600">TDC IP address</label>
+                <input
+                  className="input mt-1"
+                  value={tdcIp}
+                  onChange={(e) => setTdcIp(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">gRPC port</label>
+                <input
+                  className="input mt-1"
+                  type="number"
+                  value={tdcPort}
+                  onChange={(e) => setTdcPort(parseInt(e.target.value))}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Login</label>
+                <input
+                  className="input mt-1"
+                  value={tdcLogin}
+                  onChange={(e) => setTdcLogin(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Password</label>
+                <input
+                  className="input mt-1"
+                  type="password"
+                  value={tdcPassword}
+                  onChange={(e) => setTdcPassword(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Trigger input name</label>
+                <select
+                  className="input mt-1"
+                  value={tdcTriggerInput}
+                  onChange={(e) => setTdcTriggerInput(e.target.value)}
+                >
+                  <option value="DI_A">DI_A</option>
+                  <option value="DI_B">DI_B</option>
+                  <option value="DI_C">DI_C</option>
+                  <option value="DI_D">DI_D</option>
+                  <option value="DIO_A">DIO_A</option>
+                  <option value="DIO_B">DIO_B</option>
+                  <option value="DIO_C">DIO_C</option>
+                  <option value="DIO_D">DIO_D</option>
+                  <option value="DI1">DI1</option>
+                  <option value="DI2">DI2</option>
+                  <option value="DI3">DI3</option>
+                  <option value="DI4">DI4</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Poll interval (ms)</label>
+                <input
+                  className="input mt-1"
+                  type="number"
+                  step="10"
+                  value={tdcPollInterval}
+                  onChange={(e) => setTdcPollInterval(parseInt(e.target.value))}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Encoder port</label>
+                <select
+                  className="input mt-1"
+                  value={tdcEncoderPort}
+                  onChange={(e) => setTdcEncoderPort(e.target.value as '1' | '2' | '3' | '4')}
+                >
+                  <option value="1">Port 1</option>
+                  <option value="2">Port 2</option>
+                  <option value="3">Port 3</option>
+                  <option value="4">Port 4</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Start delay mode</label>
+                <select
+                  className="input mt-1"
+                  value={tdcStartDelayMode}
+                  onChange={(e) => setTdcStartDelayMode(e.target.value as 'time' | 'distance')}
+                >
+                  <option value="time">Time</option>
+                  <option value="distance">Distance</option>
+                </select>
+              </div>
+              {tdcStartDelayMode === 'time' ? (
+                <div>
+                  <label className="text-xs text-gray-600">Start delay (ms)</label>
+                  <input
+                    className="input mt-1"
+                    type="number"
+                    step="10"
+                    value={tdcStartDelayMs}
+                    onChange={(e) => setTdcStartDelayMs(parseFloat(e.target.value))}
+                  />
+                </div>
+              ) : (
+                <div>
+                  <label className="text-xs text-gray-600">Start delay (mm)</label>
+                  <input
+                    className="input mt-1"
+                    type="number"
+                    step="1"
+                    value={tdcStartDelayMm}
+                    onChange={(e) => setTdcStartDelayMm(parseFloat(e.target.value))}
+                  />
+                </div>
+              )}
+              <div>
+                <label className="text-xs text-gray-600">Stop delay mode</label>
+                <select
+                  className="input mt-1"
+                  value={tdcStopDelayMode}
+                  onChange={(e) => setTdcStopDelayMode(e.target.value as 'time' | 'distance')}
+                >
+                  <option value="time">Time</option>
+                  <option value="distance">Distance</option>
+                </select>
+              </div>
+              {tdcStopDelayMode === 'time' ? (
+                <div>
+                  <label className="text-xs text-gray-600">Stop delay (ms)</label>
+                  <input
+                    className="input mt-1"
+                    type="number"
+                    step="10"
+                    value={tdcStopDelayMs}
+                    onChange={(e) => setTdcStopDelayMs(parseFloat(e.target.value))}
+                  />
+                </div>
+              ) : (
+                <div>
+                  <label className="text-xs text-gray-600">Stop delay (mm)</label>
+                  <input
+                    className="input mt-1"
+                    type="number"
+                    step="1"
+                    value={tdcStopDelayMm}
+                    onChange={(e) => setTdcStopDelayMm(parseFloat(e.target.value))}
+                  />
+                </div>
+              )}
+            </div>
+            {tdcSavedAt && (
+              <div className="mt-2 text-xs text-gray-500 text-right">
+                Saved {new Date(tdcSavedAt).toLocaleTimeString()}
+              </div>
+            )}
+            {tdcStatus && (
+              <div className="mt-4 rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 p-3 text-xs text-gray-600">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold text-gray-700 dark:text-gray-300">TDC Status</div>
+                  <div className="text-[11px] text-gray-500">poll: {tdcStatus.poll_interval_ms ?? '-'} ms</div>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div>grpc: {tdcStatus.grpc_available ? 'ok' : 'missing'}</div>
+                  <div>token: {tdcStatus.token?.has_token ? 'ok' : 'no token'}</div>
+                  <div>input: {tdcStatus.input_state === 2 ? 'HIGH' : tdcStatus.input_state === 1 ? 'LOW' : 'UNKNOWN'}</div>
+                  <div>encoder port: {tdcStatus.encoder_port || '-'}</div>
+                </div>
               </div>
             )}
           </div>

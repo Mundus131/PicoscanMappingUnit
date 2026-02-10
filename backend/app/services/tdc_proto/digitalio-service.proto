@@ -1,0 +1,102 @@
+/**
+ * DigitalIO Service.
+ *
+ * Service that enables a control of the Digital IO features of device
+ */
+syntax = "proto3";
+
+package hal.digitalio;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "./protos;protos";
+
+enum IOType {
+  INPUT = 0;
+  OUTPUT = 1;
+  BIDIRECTIONAL = 2;
+}
+
+enum IODirection {
+  IN = 0;
+  OUT = 1;
+}
+
+enum IOState {
+  ERROR = 0;
+  LOW = 1;
+  HIGH = 2;
+}
+
+message IODevice {
+  string name = 1;
+  IOType type = 2;
+  IODirection direction = 3;
+}
+
+/**
+ * Represents the ListDevices response data.
+ */
+message DigitalIOListDeviceResponse {
+  repeated IODevice devices = 1;
+}
+
+/**
+ * Represents the SetDirection request data.
+ */
+message DigitalIOSetDirectionRequest {
+  string name = 1;
+  IODirection direction = 2;
+}
+
+/**
+ * Represents the Read request data.
+ */
+message DigitalIOReadRequest {
+  string name = 1;
+}
+
+/**
+ * Represents the Read response data.
+ */
+message DigitalIOReadResponse {
+  IOState state = 1;
+}
+
+/**
+ * Represents the Write request data.
+ */
+message DigitalIOWriteRequest {
+  string name = 1;
+  IOState state = 2;
+}
+
+/**
+ * Represents the Attach response data.
+ */
+message DigitalIOAttachResponse {
+  string name = 1;
+  IOState state = 2;
+  int32 error = 3;
+  string timestamp = 4;
+}
+
+/**
+ * Service exposing DigitalIO functions.
+ */
+service DigitalIO {
+  /// Used to retrieve all available digital IO devices.
+  rpc ListDevices(google.protobuf.Empty) returns (DigitalIOListDeviceResponse) {}
+
+  /// Used to set pin direction value of a particular gpio pin.
+  rpc SetDirection(DigitalIOSetDirectionRequest) returns (google.protobuf.Empty) {}
+
+  /// Used to read value of a particular gpio pin.
+  rpc Read(DigitalIOReadRequest) returns (DigitalIOReadResponse) {}
+
+  /// Used to write value of a particular gpio pin.
+  rpc Write(DigitalIOWriteRequest) returns (google.protobuf.Empty) {}
+
+  /// Used to stream input events form device.
+  rpc Attach(google.protobuf.Empty) returns (stream DigitalIOAttachResponse) {}
+}

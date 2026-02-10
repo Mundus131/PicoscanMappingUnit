@@ -60,6 +60,7 @@ class DeviceManager:
         self.point_cloud_settings = {}
         self.frame_settings = {}
         self.motion_settings = {}
+        self.tdc_settings = {}
         self.load_configuration()
     
     def load_configuration(self):
@@ -77,6 +78,7 @@ class DeviceManager:
             self.point_cloud_settings = config.get("point_cloud_settings", {})
             self.frame_settings = config.get("frame_settings", {})
             self.motion_settings = config.get("motion_settings", {})
+            self.tdc_settings = config.get("tdc_settings", {})
             # Ensure sensible default for segments_per_scan
             if "segments_per_scan" not in self.point_cloud_settings:
                 self.point_cloud_settings["segments_per_scan"] = 10
@@ -92,6 +94,47 @@ class DeviceManager:
                 self.motion_settings["fixed_speed_mps"] = 0.5
             if "profiling_distance_mm" not in self.motion_settings:
                 self.motion_settings["profiling_distance_mm"] = 10.0
+            if "encoder_wheel_mode" not in self.motion_settings:
+                self.motion_settings["encoder_wheel_mode"] = "diameter"
+            if "encoder_wheel_value_mm" not in self.motion_settings:
+                self.motion_settings["encoder_wheel_value_mm"] = 100.0
+            if "encoder_rps" not in self.motion_settings:
+                self.motion_settings["encoder_rps"] = 0.0
+            # TDC defaults
+            if "enabled" not in self.tdc_settings:
+                self.tdc_settings["enabled"] = False
+            if "ip_address" not in self.tdc_settings:
+                self.tdc_settings["ip_address"] = "192.168.0.100"
+            if "port" not in self.tdc_settings:
+                self.tdc_settings["port"] = 8081
+            if "login" not in self.tdc_settings:
+                self.tdc_settings["login"] = "admin"
+            if "password" not in self.tdc_settings:
+                self.tdc_settings["password"] = "Welcome1!"
+            if "realm" not in self.tdc_settings:
+                self.tdc_settings["realm"] = "admin"
+            if "trigger_input" not in self.tdc_settings:
+                self.tdc_settings["trigger_input"] = "DI1"
+            if "poll_interval_ms" not in self.tdc_settings:
+                self.tdc_settings["poll_interval_ms"] = 200
+            if "token_refresh_interval_s" not in self.tdc_settings:
+                self.tdc_settings["token_refresh_interval_s"] = 300
+            if "grpc_timeout_s" not in self.tdc_settings:
+                self.tdc_settings["grpc_timeout_s"] = 5.0
+            if "encoder_port" not in self.tdc_settings:
+                self.tdc_settings["encoder_port"] = "1"
+            if "start_delay_mode" not in self.tdc_settings:
+                self.tdc_settings["start_delay_mode"] = "time"
+            if "start_delay_ms" not in self.tdc_settings:
+                self.tdc_settings["start_delay_ms"] = 0.0
+            if "start_delay_mm" not in self.tdc_settings:
+                self.tdc_settings["start_delay_mm"] = 0.0
+            if "stop_delay_mode" not in self.tdc_settings:
+                self.tdc_settings["stop_delay_mode"] = "time"
+            if "stop_delay_ms" not in self.tdc_settings:
+                self.tdc_settings["stop_delay_ms"] = 0.0
+            if "stop_delay_mm" not in self.tdc_settings:
+                self.tdc_settings["stop_delay_mm"] = 0.0
         except FileNotFoundError:
             logger.warning(f"Configuration file not found: {config_path}")
         except Exception as e:
@@ -106,6 +149,7 @@ class DeviceManager:
                 "point_cloud_settings": self.point_cloud_settings,
                 "frame_settings": self.frame_settings,
                 "motion_settings": self.motion_settings,
+                "tdc_settings": self.tdc_settings,
             }
             
             with open(config_path, 'w') as f:

@@ -14,6 +14,8 @@ interface TriggerStatus {
   profiles_count?: number;
   points_count: number;
   last_update_ts: number | null;
+  tdc_input_state?: string;
+  trigger_source?: string;
 }
 
 export default function AcquisitionPage() {
@@ -34,10 +36,13 @@ export default function AcquisitionPage() {
   const [showFrame, setShowFrame] = useState(true);
   const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null);
   const [frameOriginMode, setFrameOriginMode] = useState<string>('center');
+  const [showFloor, setShowFloor] = useState(true);
+  const [colorMode, setColorMode] = useState<'rssi' | 'x' | 'y' | 'z'>('rssi');
   const [showDevicesOnFrame, setShowDevicesOnFrame] = useState(false);
   const [devices, setDevices] = useState<any[]>([]);
   const viewerRef = useRef<PointCloudThreeViewerHandle | null>(null);
   const fitOnceRef = useRef(false);
+  const statusStreamRef = useRef<EventSource | null>(null);
 
   const fetchStatus = async () => {
     const res = await api.get('/acquisition/trigger/status');
@@ -87,14 +92,40 @@ export default function AcquisitionPage() {
     fetchLatest();
     fetchFrameSettings();
     fetchDevices();
+    const urlBase = (api.defaults.baseURL || '').replace(/\/+$/, '');
+    const streamUrl = `${urlBase}/acquisition/trigger/status/stream`;
+    try {
+      const es = new EventSource(streamUrl);
+      statusStreamRef.current = es;
+      es.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          setStatus(data);
+        } catch {
+          // ignore
+        }
+      };
+      es.onerror = () => {
+        es.close();
+        statusStreamRef.current = null;
+      };
+    } catch {
+      // ignore
+    }
     const interval = setInterval(() => {
       fetchStatus();
       if (showDevicesOnFrame) {
         fetchDevices();
       }
     }, 3000);
-    return () => clearInterval(interval);
-  }, [showDevicesOnFrame]);
+    return () => {
+      if (statusStreamRef.current) {
+        statusStreamRef.current.close();
+        statusStreamRef.current = null;
+      }
+      clearInterval(interval);
+    };
+  }, [showDevicesOnFrame, fullCloud]);
 
   useEffect(() => {
     if (points.length > 0 && !fitOnceRef.current) {
@@ -105,6 +136,10 @@ export default function AcquisitionPage() {
       }, 150);
     }
   }, [points, viewerKey]);
+
+  useEffect(() => {
+    setViewerKey((v) => v + 1);
+  }, [showFloor]);
 
   const handleStart = async () => {
     setLoading(true);
@@ -353,19 +388,20 @@ export default function AcquisitionPage() {
               </div>
             </div>
             <div className="mt-4 relative" style={{ height: 760 }}>
-                <PointCloudThreeViewer
-                  key={viewerKey}
-                  ref={viewerRef}
-                  points={displayPoints}
-                  view="3d"
-                  mapAxes="xyz"
-                  yHorizontal
-                  width="100%"
+              <PointCloudThreeViewer
+                key={viewerKey}
+                ref={viewerRef}
+                points={displayPoints}
+                view="3d"
+                mapAxes="xyz"
+                yHorizontal
+                width="100%"
                 height="100%"
                 showGrid
                 gridSize={12000}
-                gridStep={1000}
+                gridStep={500}
                 colorScaleMode={rssiStats ? 'rssi100' : 'auto'}
+                colorMode={colorMode}
                 onHoverPoint={handleHover}
                 showOriginAxes
                 originAxisSize={1000}
@@ -374,7 +410,32 @@ export default function AcquisitionPage() {
                 frameOriginMode={frameOriginMode}
                 framePlane="xz"
                 markers={deviceMarkers}
+                showFloor={showFloor}
               />
+              <div className="absolute top-4 left-4 flex items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white">
+                <span className="text-gray-200">Color</span>
+                <select
+                  className="bg-transparent text-white text-xs outline-none"
+                  style={{ backgroundColor: 'rgba(15,23,42,0.9)' }}
+                  value={colorMode}
+                  onChange={(e) => setColorMode(e.target.value as typeof colorMode)}
+                >
+                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="rssi">RSSI</option>
+                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="x">X</option>
+                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="y">Y</option>
+                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="z">Z</option>
+                </select>
+              </div>
+              <div className="absolute top-4 right-4 flex items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={showFloor}
+                    onChange={(e) => setShowFloor(e.target.checked)}
+                  />
+                  Floor
+                </label>
+              </div>
               {hoverPoint && (
                 <div className="absolute bottom-4 right-4 rounded-md bg-black/70 px-3 py-2 text-xs text-white">
                   <div className="font-semibold mb-1">Point data</div>
@@ -414,7 +475,7 @@ export default function AcquisitionPage() {
               <div className="mt-2 text-xs text-gray-500">
                 axes: frame plane X/Z, points mapAxes xzy
               </div>
-            <div className="mt-4 grid grid-cols-2 gap-4">
+              <div className="mt-4 grid grid-cols-2 gap-4">
                 <div>
                   <p className="text-xs text-gray-500">Recording</p>
                   <p className="text-2xl font-semibold text-slate-900">{status.recording ? 'ON' : 'OFF'}</p>
@@ -422,6 +483,25 @@ export default function AcquisitionPage() {
                 <div>
                   <p className="text-xs text-gray-500">Speed</p>
                   <p className="text-2xl font-semibold text-slate-900">{speedLabel}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500">Trigger input</p>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`h-2.5 w-2.5 rounded-full ${
+                        status.tdc_input_state === 'HIGH'
+                          ? 'bg-emerald-400'
+                          : status.tdc_input_state === 'LOW'
+                            ? 'bg-rose-400'
+                            : 'bg-gray-400'
+                      }`}
+                    />
+                    <p className="text-2xl font-semibold text-slate-900">{status.tdc_input_state || 'UNKNOWN'}</p>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500">Trigger source</p>
+                  <p className="text-2xl font-semibold text-slate-900">{status.trigger_source || 'manual'}</p>
                 </div>
                 <div>
                   <p className="text-xs text-gray-500">Distance</p>
