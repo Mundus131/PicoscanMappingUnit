@@ -43,6 +43,7 @@ interface PointCloudThreeViewerProps {
     color?: number;
     label?: string;
   }[];
+  showAxisWidget?: boolean;
 }
 
 export interface PointCloudThreeViewerHandle {
@@ -93,6 +94,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       markers = [],
       yHorizontal = false,
       annotations = [],
+      showAxisWidget = true,
     },
     ref
   ) {
@@ -107,12 +109,20 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
   const lastHoverIndexRef = useRef<number | null>(null);
   const animationRef = useRef<number | null>(null);
   const centerRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
+  const defaultCameraPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
+  const defaultCameraUpRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 1, 0));
+  const defaultTargetRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
+  const axisViewRef = useRef<{ axis: 'x' | 'y' | 'z' | null; sign: 1 | -1 }>({ axis: null, sign: 1 });
   const circleTextureRef = useRef<THREE.Texture | null>(null);
   const gridGroupRef = useRef<THREE.Group | null>(null);
   const originAxesRef = useRef<THREE.Group | null>(null);
   const frameGroupRef = useRef<THREE.Group | null>(null);
   const markersGroupRef = useRef<THREE.Group | null>(null);
   const annotationsGroupRef = useRef<THREE.Group | null>(null);
+  const axisWidgetRef = useRef<SVGSVGElement | null>(null);
+  const axisLineRefs = useRef<Record<string, SVGLineElement | null>>({ x: null, y: null, z: null });
+  const axisLabelRefs = useRef<Record<string, SVGTextElement | null>>({ x: null, y: null, z: null });
+  const axisHitRefs = useRef<Record<string, SVGCircleElement | null>>({ x: null, y: null, z: null });
   const [isDark, setIsDark] = useState(false);
 
   useEffect(() => {
@@ -149,6 +159,9 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       }
     }
     cameraRef.current = camera;
+    defaultCameraPosRef.current.copy(camera.position);
+    defaultCameraUpRef.current.copy(camera.up);
+    defaultTargetRef.current.set(0, 0, 0);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(window.devicePixelRatio);
@@ -160,6 +173,13 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     controls.dampingFactor = 0.1;
     controls.rotateSpeed = 0.5;
     controls.zoomSpeed = 0.8;
+    controls.panSpeed = 0.9;
+    controls.screenSpacePanning = true;
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN,
+    };
     if (view === '2d') {
       controls.enableRotate = false;
       controls.enablePan = true;
@@ -461,6 +481,39 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
           cam.position.y = centerRef.current.y;
         }
       }
+      if (showAxisWidget && view === '3d' && axisWidgetRef.current && cameraRef.current) {
+        const cam = cameraRef.current;
+        const q = cam.quaternion.clone().invert();
+        const scale = 42;
+        const center = 60;
+        const axes = {
+          x: new THREE.Vector3(1, 0, 0).applyQuaternion(q),
+          y: new THREE.Vector3(0, 1, 0).applyQuaternion(q),
+          z: new THREE.Vector3(0, 0, 1).applyQuaternion(q),
+        };
+          (['x', 'y', 'z'] as const).forEach((k) => {
+            const v = axes[k];
+            const x = center + v.x * scale;
+            const y = center - v.y * scale;
+            const line = axisLineRefs.current[k];
+            if (line) {
+              line.setAttribute('x1', String(center));
+              line.setAttribute('y1', String(center));
+              line.setAttribute('x2', String(x));
+              line.setAttribute('y2', String(y));
+            }
+            const label = axisLabelRefs.current[k];
+            if (label) {
+              label.setAttribute('x', String(center + v.x * (scale + 8)));
+              label.setAttribute('y', String(center - v.y * (scale + 8)));
+            }
+            const hit = axisHitRefs.current[k];
+            if (hit) {
+              hit.setAttribute('cx', String(x));
+              hit.setAttribute('cy', String(y));
+            }
+          });
+        }
       renderer.render(scene, camera);
       animationRef.current = requestAnimationFrame(animate);
     };
@@ -866,25 +919,106 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       camera.right = size;
       camera.top = size;
       camera.bottom = -size;
-      camera.position.set(0, 0, 2000);
-      camera.lookAt(0, 0, 0);
+      camera.position.copy(defaultCameraPosRef.current);
+      camera.up.copy(defaultCameraUpRef.current);
+      camera.lookAt(defaultTargetRef.current);
       camera.updateProjectionMatrix();
     } else {
-      if (yHorizontal) {
-        camera.up.set(1, 0, 0);
-        camera.position.set(0, 0, 2000);
-      } else {
-        camera.position.set(1200, 800, 800);
-      }
-      camera.lookAt(0, 0, 0);
+      camera.position.copy(defaultCameraPosRef.current);
+      camera.up.copy(defaultCameraUpRef.current);
+      camera.lookAt(defaultTargetRef.current);
     }
-    controls.target.set(0, 0, 0);
+    controls.target.copy(defaultTargetRef.current);
     controls.update();
   };
 
   useImperativeHandle(ref, () => ({ resetView, fitToPoints }), [points, mapAxes]);
 
-  return <div ref={containerRef} style={{ width, height }} />;
+  const setViewAxis = (axis: 'x' | 'y' | 'z') => {
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    if (!camera || !controls) return;
+    const target = controls.target.clone();
+    const dist = camera.position.distanceTo(target) || 2000;
+    let dir = new THREE.Vector3(0, 0, 1);
+    if (axis === 'x') dir = new THREE.Vector3(1, 0, 0);
+    if (axis === 'y') dir = new THREE.Vector3(0, 1, 0);
+    if (axis === 'z') dir = new THREE.Vector3(0, 0, 1);
+    const prev = axisViewRef.current;
+    const nextSign = (prev.axis === axis) ? (prev.sign === 1 ? -1 : 1) : 1;
+    axisViewRef.current = { axis, sign: nextSign };
+    camera.position.copy(target.clone().add(dir.multiplyScalar(dist * nextSign)));
+    if (yHorizontal) {
+      camera.up.set(1, 0, 0);
+    } else {
+      camera.up.set(0, 1, 0);
+    }
+    camera.lookAt(target);
+    controls.target.copy(target);
+    controls.update();
+  };
+
+  return (
+    <div style={{ width, height, position: 'relative' }}>
+      <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+      {showAxisWidget && view === '3d' && (
+        <div
+          style={{
+            position: 'absolute',
+            left: 12,
+            bottom: 12,
+            width: 160,
+            height: 180,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+            padding: 4,
+            background: 'transparent',
+          }}
+        >
+          <div style={{ position: 'relative', width: 120, height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <svg ref={axisWidgetRef} width={120} height={120} style={{ display: 'block' }}>
+              <defs>
+                <marker id="arrow-x" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto" markerUnits="strokeWidth">
+                  <path d="M0,0 L8,4 L0,8 Z" fill="#ef4444" />
+                </marker>
+                <marker id="arrow-y" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto" markerUnits="strokeWidth">
+                  <path d="M0,0 L8,4 L0,8 Z" fill="#22c55e" />
+                </marker>
+                <marker id="arrow-z" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto" markerUnits="strokeWidth">
+                  <path d="M0,0 L8,4 L0,8 Z" fill="#3b82f6" />
+                </marker>
+              </defs>
+              <g onClick={() => setViewAxis('x')} style={{ cursor: 'pointer' }}>
+                <line ref={(el) => { axisLineRefs.current.x = el; }} stroke="#ef4444" strokeWidth="2.5" markerEnd="url(#arrow-x)" />
+              </g>
+              <g onClick={() => setViewAxis('y')} style={{ cursor: 'pointer' }}>
+                <line ref={(el) => { axisLineRefs.current.y = el; }} stroke="#22c55e" strokeWidth="2.5" markerEnd="url(#arrow-y)" />
+              </g>
+              <g onClick={() => setViewAxis('z')} style={{ cursor: 'pointer' }}>
+                <line ref={(el) => { axisLineRefs.current.z = el; }} stroke="#3b82f6" strokeWidth="2.5" markerEnd="url(#arrow-z)" />
+              </g>
+              <g onClick={() => setViewAxis('x')} style={{ cursor: 'pointer' }}>
+                <circle ref={(el) => { axisHitRefs.current.x = el; }} cx={0} cy={0} r={14} fill="transparent" />
+              </g>
+              <g onClick={() => setViewAxis('y')} style={{ cursor: 'pointer' }}>
+                <circle ref={(el) => { axisHitRefs.current.y = el; }} cx={0} cy={0} r={14} fill="transparent" />
+              </g>
+              <g onClick={() => setViewAxis('z')} style={{ cursor: 'pointer' }}>
+                <circle ref={(el) => { axisHitRefs.current.z = el; }} cx={0} cy={0} r={14} fill="transparent" />
+              </g>
+              <text ref={(el) => { axisLabelRefs.current.x = el; }} fontSize="11" fill="#ef4444" onClick={() => setViewAxis('x')} style={{ cursor: 'pointer' }}>X</text>
+              <text ref={(el) => { axisLabelRefs.current.y = el; }} fontSize="11" fill="#22c55e" onClick={() => setViewAxis('y')} style={{ cursor: 'pointer' }}>Y</text>
+              <text ref={(el) => { axisLabelRefs.current.z = el; }} fontSize="11" fill="#3b82f6" onClick={() => setViewAxis('z')} style={{ cursor: 'pointer' }}>Z</text>
+            </svg>
+          </div>
+          <button className="btn-secondary px-2 py-1" onClick={resetView} title="Reset view">⌂</button>
+        </div>
+      )}
+    </div>
+  );
 });
 
 export default PointCloudThreeViewer;

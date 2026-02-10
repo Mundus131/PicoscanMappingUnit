@@ -89,7 +89,7 @@ export default function HistoryPage() {
           </button>
         </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[0.55fr_1.45fr] gap-6">
+        <div className="grid grid-cols-1 xl:grid-cols-[0.5fr_1.5fr] gap-6">
           <div className="card">
             <h2 className="text-xl font-semibold text-slate-900">Measurements</h2>
             <div className="mt-3 space-y-2 max-h-[520px] overflow-auto">
@@ -152,7 +152,7 @@ export default function HistoryPage() {
                   </label>
                 </div>
               </div>
-              <div className="mt-4 relative" style={{ height: 520 }}>
+              <div className="mt-4 relative" style={{ height: 760 }}>
                 <PointCloudThreeViewer
                   key={viewerKey}
                   ref={viewerRef}

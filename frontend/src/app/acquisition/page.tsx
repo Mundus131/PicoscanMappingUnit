@@ -327,7 +327,7 @@ export default function AcquisitionPage() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
+        <div className="grid grid-cols-1 xl:grid-cols-[1.35fr_0.65fr] gap-6">
           <div className="card">
             <div className="flex items-center justify-between">
               <div>
@@ -352,7 +352,7 @@ export default function AcquisitionPage() {
                 </button>
               </div>
             </div>
-            <div className="mt-4 relative" style={{ height: 520 }}>
+            <div className="mt-4 relative" style={{ height: 760 }}>
                 <PointCloudThreeViewer
                   key={viewerKey}
                   ref={viewerRef}
@@ -383,19 +383,6 @@ export default function AcquisitionPage() {
                   <div>z: {hoverPoint[2]?.toFixed(2)}</div>
                   <div>rssi: {hoverPoint.length >= 4 ? hoverPoint[3]?.toFixed(1) : 'n/a'}</div>
                   <div className="text-[10px] text-gray-300 mt-1">Hover or click a point</div>
-                </div>
-              )}
-              {rssiStats && (
-                <div className="absolute bottom-4 left-4 rounded-lg bg-black/50 px-3 py-2 text-xs text-white">
-                  <div className="mb-1">RSSI (0-100)</div>
-                  <div className="h-2 w-40 rounded-full" style={{ background: 'linear-gradient(90deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff)' }} />
-                  <div className="mt-1 flex justify-between text-[10px] text-gray-200">
-                    <span>0</span>
-                    <span>100</span>
-                  </div>
-                  <div className="mt-1 text-[10px] text-gray-200">
-                    range: {rssiStats.min.toFixed(1)} - {rssiStats.max.toFixed(1)}
-                  </div>
                 </div>
               )}
             </div>
