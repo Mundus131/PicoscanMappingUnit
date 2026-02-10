@@ -51,3 +51,10 @@ Results are saved to `analysis_results.json`.
 - Configure devices in the System Configurator.
 - Frame settings are saved in backend config.
 - Auto-calibration uses ICP (Open3D).
+
+## Changelog (latest)
+- Added TDC digital trigger support (token auth + DigitalIO).
+- System Configurator: TDC settings, trigger input, delays, encoder port.
+- Motion: encoder wheel settings + derived speed.
+- Acquisition: live status via SSE (recording, speed, trigger state/source).
+- Added backend restart endpoint and UI action.
