@@ -31,6 +31,7 @@ interface AcquisitionLiveStatus {
 }
 
 type TriggerInputName = 'DI_A' | 'DI_B' | 'DI_C' | 'DI_D' | 'DIO_A' | 'DIO_B' | 'DIO_C' | 'DIO_D';
+type AnalysisApp = 'log' | 'conveyor_object';
 
 const TRIGGER_INPUT_OPTIONS: TriggerInputName[] = ['DI_A', 'DI_B', 'DI_C', 'DI_D', 'DIO_A', 'DIO_B', 'DIO_C', 'DIO_D'];
 
@@ -65,6 +66,15 @@ export default function CalibrationPage() {
   const [encoderRps, setEncoderRps] = useState(0);
   const [motionSaving, setMotionSaving] = useState(false);
   const [motionSavedAt, setMotionSavedAt] = useState<number | null>(null);
+  const [analysisApp, setAnalysisApp] = useState<AnalysisApp>('log');
+  const [logWindowProfiles, setLogWindowProfiles] = useState(10);
+  const [logMinPoints, setLogMinPoints] = useState(50);
+  const [convPlaneQuantile, setConvPlaneQuantile] = useState(0.35);
+  const [convPlaneInlierMm, setConvPlaneInlierMm] = useState(8);
+  const [convObjectMinHeightMm, setConvObjectMinHeightMm] = useState(8);
+  const [convObjectMaxPoints, setConvObjectMaxPoints] = useState(60000);
+  const [analysisSaving, setAnalysisSaving] = useState(false);
+  const [analysisSavedAt, setAnalysisSavedAt] = useState<number | null>(null);
   const [pingMap, setPingMap] = useState<Record<string, boolean | null>>({});
   const [tdcEnabled, setTdcEnabled] = useState(false);
   const [tdcIp, setTdcIp] = useState('192.168.0.100');
@@ -323,6 +333,23 @@ export default function CalibrationPage() {
     }
   };
 
+  const loadAnalysisSettings = async () => {
+    try {
+      const res = await api.get('/calibration/analysis-settings');
+      if (res.data) {
+        setAnalysisApp(res.data.active_app === 'conveyor_object' ? 'conveyor_object' : 'log');
+        if (typeof res.data.log_window_profiles === 'number') setLogWindowProfiles(res.data.log_window_profiles);
+        if (typeof res.data.log_min_points === 'number') setLogMinPoints(res.data.log_min_points);
+        if (typeof res.data.conveyor_plane_quantile === 'number') setConvPlaneQuantile(res.data.conveyor_plane_quantile);
+        if (typeof res.data.conveyor_plane_inlier_mm === 'number') setConvPlaneInlierMm(res.data.conveyor_plane_inlier_mm);
+        if (typeof res.data.conveyor_object_min_height_mm === 'number') setConvObjectMinHeightMm(res.data.conveyor_object_min_height_mm);
+        if (typeof res.data.conveyor_object_max_points === 'number') setConvObjectMaxPoints(res.data.conveyor_object_max_points);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const loadAcquisitionLiveStatus = async () => {
     try {
       const res = await api.get('/acquisition/trigger/status');
@@ -373,6 +400,24 @@ export default function CalibrationPage() {
     }
   }
 
+  async function handleSaveAnalysisSettings() {
+    setAnalysisSaving(true);
+    try {
+      await api.put('/calibration/analysis-settings', {
+        active_app: analysisApp,
+        log_window_profiles: logWindowProfiles,
+        log_min_points: logMinPoints,
+        conveyor_plane_quantile: convPlaneQuantile,
+        conveyor_plane_inlier_mm: convPlaneInlierMm,
+        conveyor_object_min_height_mm: convObjectMinHeightMm,
+        conveyor_object_max_points: convObjectMaxPoints,
+      });
+      setAnalysisSavedAt(Date.now());
+    } finally {
+      setAnalysisSaving(false);
+    }
+  }
+
   async function handleSaveTdcSettings() {
     setTdcSaving(true);
     try {
@@ -402,6 +447,7 @@ export default function CalibrationPage() {
     loadDevices();
     loadFrameSettings();
     loadMotionSettings();
+    loadAnalysisSettings();
     loadTdcSettings();
     loadTdcStatus();
     loadAcquisitionLiveStatus();
@@ -846,6 +892,63 @@ export default function CalibrationPage() {
             {motionSavedAt && (
               <div className="mt-2 text-xs text-gray-500 text-right">
                 Saved {new Date(motionSavedAt).toLocaleTimeString()}
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-semibold text-slate-900">Analysis App</h2>
+                <p className="text-xs text-gray-500 mt-1">Select active post-acquisition analysis pipeline</p>
+              </div>
+              <button className="btn-secondary" onClick={handleSaveAnalysisSettings} disabled={analysisSaving}>
+                {analysisSaving ? 'Saving...' : 'Save Analysis Settings'}
+              </button>
+            </div>
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs text-gray-600">Active application</label>
+                <select className="input mt-1" value={analysisApp} onChange={(e) => setAnalysisApp(e.target.value as AnalysisApp)}>
+                  <option value="log">Log measurement</option>
+                  <option value="conveyor_object">Conveyor object measurement</option>
+                </select>
+              </div>
+              {analysisApp === 'log' ? (
+                <>
+                  <div>
+                    <label className="text-xs text-gray-600">Window profiles</label>
+                    <input className="input mt-1" type="number" min={1} value={logWindowProfiles} onChange={(e) => setLogWindowProfiles(parseInt(e.target.value || '1'))} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600">Min points</label>
+                    <input className="input mt-1" type="number" min={10} value={logMinPoints} onChange={(e) => setLogMinPoints(parseInt(e.target.value || '10'))} />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    <label className="text-xs text-gray-600">Plane seed quantile</label>
+                    <input className="input mt-1" type="number" step="0.01" min={0.05} max={0.8} value={convPlaneQuantile} onChange={(e) => setConvPlaneQuantile(parseFloat(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600">Plane inlier threshold (mm)</label>
+                    <input className="input mt-1" type="number" step="0.5" min={1} value={convPlaneInlierMm} onChange={(e) => setConvPlaneInlierMm(parseFloat(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600">Object min height over plane (mm)</label>
+                    <input className="input mt-1" type="number" step="0.5" min={1} value={convObjectMinHeightMm} onChange={(e) => setConvObjectMinHeightMm(parseFloat(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600">Max object points</label>
+                    <input className="input mt-1" type="number" step="1000" min={1000} value={convObjectMaxPoints} onChange={(e) => setConvObjectMaxPoints(parseInt(e.target.value || '1000'))} />
+                  </div>
+                </>
+              )}
+            </div>
+            {analysisSavedAt && (
+              <div className="mt-2 text-xs text-gray-500 text-right">
+                Saved {new Date(analysisSavedAt).toLocaleTimeString()}
               </div>
             )}
           </div>

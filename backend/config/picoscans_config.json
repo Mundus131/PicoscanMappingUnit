@@ -57,6 +57,19 @@
     "encoder_wheel_value_mm": 200.0,
     "encoder_rps": 0.0
   },
+  "analysis_settings": {
+    "active_app": "conveyor_object",
+    "log_window_profiles": 10,
+    "log_min_points": 50,
+    "conveyor_plane_quantile": 0.4,
+    "conveyor_plane_inlier_mm": 2.0,
+    "conveyor_object_min_height_mm": 8.0,
+    "conveyor_object_max_points": 60000,
+    "conveyor_denoise_enabled": true,
+    "conveyor_denoise_cell_mm": 20.0,
+    "conveyor_denoise_min_points_per_cell": 5,
+    "conveyor_keep_largest_component": true
+  },
   "tdc_settings": {
     "enabled": true,
     "ip_address": "192.168.0.100",
@@ -74,6 +87,6 @@
     "start_delay_mm": 0.0,
     "stop_delay_mode": "distance",
     "stop_delay_ms": 0.0,
-    "stop_delay_mm": 100.0
+    "stop_delay_mm": 200.0
   }
 }

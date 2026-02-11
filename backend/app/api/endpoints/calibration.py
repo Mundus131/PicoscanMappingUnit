@@ -1,7 +1,7 @@
 import logging
 from fastapi import APIRouter, HTTPException, Request
 from app.core.device_manager import device_manager
-from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings, MotionSettings, TdcSettings
+from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings, MotionSettings, AnalysisSettings, TdcSettings
 import numpy as np
 from app.services.point_cloud_processor import PointCloudProcessor
 
@@ -241,6 +241,66 @@ async def update_motion_settings(req: MotionSettings):
 @router.get("/tdc-settings")
 async def get_tdc_settings():
     return device_manager.tdc_settings
+
+
+@router.get("/analysis-settings")
+async def get_analysis_settings():
+    return device_manager.analysis_settings
+
+
+@router.put("/analysis-settings")
+async def update_analysis_settings(req: AnalysisSettings):
+    current = dict(device_manager.analysis_settings or {})
+    active_app = (req.active_app or "log").strip()
+    if active_app not in {"log", "conveyor_object"}:
+        active_app = "log"
+    device_manager.analysis_settings = {
+        "active_app": active_app,
+        "log_window_profiles": int(req.log_window_profiles if req.log_window_profiles is not None else current.get("log_window_profiles", 10)),
+        "log_min_points": int(req.log_min_points if req.log_min_points is not None else current.get("log_min_points", 50)),
+        "conveyor_plane_quantile": float(
+            req.conveyor_plane_quantile
+            if req.conveyor_plane_quantile is not None
+            else current.get("conveyor_plane_quantile", 0.35)
+        ),
+        "conveyor_plane_inlier_mm": float(
+            req.conveyor_plane_inlier_mm
+            if req.conveyor_plane_inlier_mm is not None
+            else current.get("conveyor_plane_inlier_mm", 8.0)
+        ),
+        "conveyor_object_min_height_mm": float(
+            req.conveyor_object_min_height_mm
+            if req.conveyor_object_min_height_mm is not None
+            else current.get("conveyor_object_min_height_mm", 8.0)
+        ),
+        "conveyor_object_max_points": int(
+            req.conveyor_object_max_points
+            if req.conveyor_object_max_points is not None
+            else current.get("conveyor_object_max_points", 60000)
+        ),
+        "conveyor_denoise_enabled": bool(
+            req.conveyor_denoise_enabled
+            if req.conveyor_denoise_enabled is not None
+            else current.get("conveyor_denoise_enabled", True)
+        ),
+        "conveyor_denoise_cell_mm": float(
+            req.conveyor_denoise_cell_mm
+            if req.conveyor_denoise_cell_mm is not None
+            else current.get("conveyor_denoise_cell_mm", 8.0)
+        ),
+        "conveyor_denoise_min_points_per_cell": int(
+            req.conveyor_denoise_min_points_per_cell
+            if req.conveyor_denoise_min_points_per_cell is not None
+            else current.get("conveyor_denoise_min_points_per_cell", 3)
+        ),
+        "conveyor_keep_largest_component": bool(
+            req.conveyor_keep_largest_component
+            if req.conveyor_keep_largest_component is not None
+            else current.get("conveyor_keep_largest_component", True)
+        ),
+    }
+    device_manager._save_to_json()
+    return device_manager.analysis_settings
 
 
 @router.put("/tdc-settings")

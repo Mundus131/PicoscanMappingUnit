@@ -84,6 +84,19 @@ class MotionSettings(BaseModel):
     encoder_wheel_value_mm: float | None = None
     encoder_rps: float | None = None
 
+class AnalysisSettings(BaseModel):
+    active_app: str  # "log" | "conveyor_object"
+    log_window_profiles: int | None = None
+    log_min_points: int | None = None
+    conveyor_plane_quantile: float | None = None
+    conveyor_plane_inlier_mm: float | None = None
+    conveyor_object_min_height_mm: float | None = None
+    conveyor_object_max_points: int | None = None
+    conveyor_denoise_enabled: bool | None = None
+    conveyor_denoise_cell_mm: float | None = None
+    conveyor_denoise_min_points_per_cell: int | None = None
+    conveyor_keep_largest_component: bool | None = None
+
 class TdcSettings(BaseModel):
     enabled: bool
     ip_address: str

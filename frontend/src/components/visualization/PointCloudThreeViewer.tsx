@@ -43,6 +43,7 @@ interface PointCloudThreeViewerProps {
     end: [number, number, number];
     color?: number;
     label?: string;
+    noArrow?: boolean;
   }[];
   showAxisWidget?: boolean;
   showFloor?: boolean;
@@ -836,7 +837,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
 
       const dir = new THREE.Vector3().subVectors(end, start);
       const len = dir.length();
-      if (len > 1e-6) {
+      if (len > 1e-6 && !a.noArrow) {
         dir.normalize();
         const arrowSize = Math.min(120, Math.max(40, len * 0.15));
         const cone = new THREE.Mesh(

@@ -4,6 +4,7 @@ from typing import List, Generator
 from pydantic import BaseModel
 from app.core.device_manager import device_manager
 from app.analysis.log_measurement import compute_log_metrics, build_augmented_cloud
+from app.analysis.conveyor_measurement import compute_conveyor_object_metrics, build_conveyor_augmented_cloud
 from app.analysis.history_store import save_measurement, list_measurements, get_measurement
 from app.services.picoscan_receiver import PicoscanReceiver, PicoscanReceiverManager
 from app.services.point_cloud_processor import PointCloudProcessor
@@ -324,33 +325,59 @@ def _run_analysis_for_session(session: dict, app):
         t0 = time.time()
         points = session.get("accumulated_points") or []
         profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
+        analysis_cfg = device_manager.analysis_settings or {}
+        analysis_app = str(analysis_cfg.get("active_app", "log") or "log")
+        session["analysis_app"] = analysis_app
         if points:
-            y_vals = [p[1] for p in points if len(p) >= 2]
-            y_min = min(y_vals) if y_vals else None
-            y_max = max(y_vals) if y_vals else None
-            metrics = compute_log_metrics(
-                points,
-                profiling_distance_mm=profiling_distance_mm,
-                window_profiles=10,
-                min_points=50,
-                y_min=y_min,
-                y_max=y_max,
-            )
-            session["analysis_metrics"] = metrics
-            session["analysis_points"] = build_augmented_cloud(
-                metrics,
-                points_per_circle=180,
-                rssi_value=80.0,
-                profiling_distance_mm=profiling_distance_mm,
-                y_min=y_min,
-                y_max=y_max,
-            )
+            metrics_for_save = None
+            if analysis_app == "conveyor_object":
+                metrics = compute_conveyor_object_metrics(
+                    points,
+                    plane_quantile=float(analysis_cfg.get("conveyor_plane_quantile", 0.35) or 0.35),
+                    plane_inlier_mm=float(analysis_cfg.get("conveyor_plane_inlier_mm", 8.0) or 8.0),
+                    object_min_height_mm=float(analysis_cfg.get("conveyor_object_min_height_mm", 8.0) or 8.0),
+                    denoise_enabled=bool(analysis_cfg.get("conveyor_denoise_enabled", True)),
+                    denoise_cell_mm=float(analysis_cfg.get("conveyor_denoise_cell_mm", 8.0) or 8.0),
+                    denoise_min_points_per_cell=int(analysis_cfg.get("conveyor_denoise_min_points_per_cell", 3) or 3),
+                    keep_largest_component=bool(analysis_cfg.get("conveyor_keep_largest_component", True)),
+                )
+                # Remove internal arrays from persisted/public metrics
+                public_metrics = {k: v for k, v in metrics.items() if k != "_internal"}
+                session["analysis_metrics"] = public_metrics
+                metrics_for_save = public_metrics
+                session["analysis_points"] = build_conveyor_augmented_cloud(
+                    points,
+                    metrics,
+                    max_points=int(analysis_cfg.get("conveyor_object_max_points", 60000) or 60000),
+                )
+            else:
+                y_vals = [p[1] for p in points if len(p) >= 2]
+                y_min = min(y_vals) if y_vals else None
+                y_max = max(y_vals) if y_vals else None
+                metrics = compute_log_metrics(
+                    points,
+                    profiling_distance_mm=profiling_distance_mm,
+                    window_profiles=int(analysis_cfg.get("log_window_profiles", 10) or 10),
+                    min_points=int(analysis_cfg.get("log_min_points", 50) or 50),
+                    y_min=y_min,
+                    y_max=y_max,
+                )
+                session["analysis_metrics"] = metrics
+                metrics_for_save = metrics
+                session["analysis_points"] = build_augmented_cloud(
+                    metrics,
+                    points_per_circle=180,
+                    rssi_value=80.0,
+                    profiling_distance_mm=profiling_distance_mm,
+                    y_min=y_min,
+                    y_max=y_max,
+                )
             session["analysis_duration_ms"] = int((time.time() - t0) * 1000)
             try:
                 notifier = app.state.tcp_notifier
             except Exception:
                 notifier = None
-            if notifier:
+            if notifier and analysis_app == "log":
                 slices = metrics.get("slices") or []
                 if slices:
                     first = slices[0]
@@ -369,7 +396,8 @@ def _run_analysis_for_session(session: dict, app):
                     notifier.broadcast(msg)
             try:
                 save_measurement({
-                    "metrics": metrics,
+                    "analysis_app": analysis_app,
+                    "metrics": metrics_for_save or session.get("analysis_metrics"),
                     "original_points": points,
                     "augmented_points": session["analysis_points"],
                     "profiling_distance_mm": profiling_distance_mm,
@@ -471,6 +499,21 @@ async def stop_trigger(request: Request):
 async def analytics_results(request: Request):
     session = _get_session(request)
     return {
+        "analysis_app": session.get("analysis_app", (device_manager.analysis_settings or {}).get("active_app", "log")),
+        "metrics": session.get("analysis_metrics"),
+        "has_points": bool(session.get("analysis_points")),
+        "analysis_duration_ms": session.get("analysis_duration_ms"),
+    }
+
+
+@router.post("/analytics/recompute")
+async def analytics_recompute(request: Request):
+    session = _get_session(request)
+    if bool(session.get("recording", False)):
+        raise HTTPException(status_code=400, detail="Stop acquisition before recompute")
+    _run_analysis_for_session(session, request.app)
+    return {
+        "analysis_app": session.get("analysis_app", (device_manager.analysis_settings or {}).get("active_app", "log")),
         "metrics": session.get("analysis_metrics"),
         "has_points": bool(session.get("analysis_points")),
         "analysis_duration_ms": session.get("analysis_duration_ms"),

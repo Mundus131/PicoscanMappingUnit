@@ -60,6 +60,7 @@ class DeviceManager:
         self.point_cloud_settings = {}
         self.frame_settings = {}
         self.motion_settings = {}
+        self.analysis_settings = {}
         self.tdc_settings = {}
         self.load_configuration()
     
@@ -78,6 +79,7 @@ class DeviceManager:
             self.point_cloud_settings = config.get("point_cloud_settings", {})
             self.frame_settings = config.get("frame_settings", {})
             self.motion_settings = config.get("motion_settings", {})
+            self.analysis_settings = config.get("analysis_settings", {})
             self.tdc_settings = config.get("tdc_settings", {})
             # Ensure sensible default for segments_per_scan
             if "segments_per_scan" not in self.point_cloud_settings:
@@ -100,6 +102,29 @@ class DeviceManager:
                 self.motion_settings["encoder_wheel_value_mm"] = 100.0
             if "encoder_rps" not in self.motion_settings:
                 self.motion_settings["encoder_rps"] = 0.0
+            # Analysis defaults
+            if "active_app" not in self.analysis_settings:
+                self.analysis_settings["active_app"] = "log"
+            if "log_window_profiles" not in self.analysis_settings:
+                self.analysis_settings["log_window_profiles"] = 10
+            if "log_min_points" not in self.analysis_settings:
+                self.analysis_settings["log_min_points"] = 50
+            if "conveyor_plane_quantile" not in self.analysis_settings:
+                self.analysis_settings["conveyor_plane_quantile"] = 0.35
+            if "conveyor_plane_inlier_mm" not in self.analysis_settings:
+                self.analysis_settings["conveyor_plane_inlier_mm"] = 8.0
+            if "conveyor_object_min_height_mm" not in self.analysis_settings:
+                self.analysis_settings["conveyor_object_min_height_mm"] = 8.0
+            if "conveyor_object_max_points" not in self.analysis_settings:
+                self.analysis_settings["conveyor_object_max_points"] = 60000
+            if "conveyor_denoise_enabled" not in self.analysis_settings:
+                self.analysis_settings["conveyor_denoise_enabled"] = True
+            if "conveyor_denoise_cell_mm" not in self.analysis_settings:
+                self.analysis_settings["conveyor_denoise_cell_mm"] = 8.0
+            if "conveyor_denoise_min_points_per_cell" not in self.analysis_settings:
+                self.analysis_settings["conveyor_denoise_min_points_per_cell"] = 3
+            if "conveyor_keep_largest_component" not in self.analysis_settings:
+                self.analysis_settings["conveyor_keep_largest_component"] = True
             # TDC defaults
             if "enabled" not in self.tdc_settings:
                 self.tdc_settings["enabled"] = False
@@ -149,6 +174,7 @@ class DeviceManager:
                 "point_cloud_settings": self.point_cloud_settings,
                 "frame_settings": self.frame_settings,
                 "motion_settings": self.motion_settings,
+                "analysis_settings": self.analysis_settings,
                 "tdc_settings": self.tdc_settings,
             }
             
