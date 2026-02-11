@@ -7,6 +7,7 @@ from app.analysis.log_measurement import compute_log_metrics, build_augmented_cl
 from app.analysis.history_store import save_measurement, list_measurements, get_measurement
 from app.services.picoscan_receiver import PicoscanReceiver, PicoscanReceiverManager
 from app.services.point_cloud_processor import PointCloudProcessor
+from app.services import tdc_rest
 import logging
 import json
 import time
@@ -46,6 +47,12 @@ def _get_session_from_app(app) -> dict:
             "trigger_source": "manual",
         }
         app.state.acquisition_session = session
+    # Ensure keys exist also for sessions initialized in app startup
+    session.setdefault("encoder_thread", None)
+    session.setdefault("encoder_stop_event", None)
+    session.setdefault("encoder_rpm", None)
+    session.setdefault("encoder_speed_mps", None)
+    session.setdefault("encoder_last_data", None)
     return session
 
 
@@ -53,9 +60,116 @@ def _get_session(request: Request) -> dict:
     return _get_session_from_app(request.app)
 
 
+def _calc_speed_from_encoder_rpm(rpm: float, motion: dict) -> float | None:
+    encoder_mode = motion.get("encoder_wheel_mode", "diameter") or "diameter"
+    encoder_value_mm = float(motion.get("encoder_wheel_value_mm", 0.0) or 0.0)
+    if encoder_value_mm <= 0:
+        return None
+    if encoder_mode == "circumference":
+        circ_m = encoder_value_mm / 1000.0
+    else:
+        circ_m = (encoder_value_mm * np.pi) / 1000.0
+    # TDC velocity is RPM (rotations per minute)
+    rps = abs(float(rpm)) / 60.0
+    return rps * circ_m
+
+
+def _extract_encoder_rpm(payload: dict) -> float | None:
+    try:
+        raw = (
+            payload.get("data", {})
+            .get("getData", {})
+            .get("iolink", {})
+            .get("value", {})
+            .get("Velocity", {})
+            .get("value")
+        )
+        if raw is None:
+            return None
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _run_encoder_loop(session: dict):
+    stop_event = session.get("encoder_stop_event")
+    while stop_event and not stop_event.is_set():
+        motion = device_manager.motion_settings or {}
+        if (motion.get("mode", "fixed") or "fixed") != "encoder":
+            session["encoder_rpm"] = None
+            session["encoder_speed_mps"] = None
+            time.sleep(0.2)
+            continue
+
+        tdc_cfg = device_manager.tdc_settings or {}
+        poll_interval_ms = max(50, int(tdc_cfg.get("poll_interval_ms", 200) or 200))
+        if not bool(tdc_cfg.get("enabled", False)):
+            session["encoder_rpm"] = None
+            session["encoder_speed_mps"] = None
+            time.sleep(poll_interval_ms / 1000.0)
+            continue
+
+        try:
+            payload = tdc_rest.fetch_encoder_process_data(data_format="iodd")
+            rpm = _extract_encoder_rpm(payload)
+            speed_mps = _calc_speed_from_encoder_rpm(rpm, motion) if rpm is not None else None
+            session["encoder_last_data"] = payload
+            session["encoder_rpm"] = rpm
+            session["encoder_speed_mps"] = speed_mps
+            # Keep live speed visible even when trigger recording is stopped.
+            session["speed_mps"] = speed_mps
+        except Exception as exc:
+            logger.debug("Encoder poll failed: %s", exc)
+            session["encoder_rpm"] = None
+            session["encoder_speed_mps"] = None
+
+        time.sleep(poll_interval_ms / 1000.0)
+
+
+def _sync_encoder_worker(session: dict):
+    motion = device_manager.motion_settings or {}
+    mode = motion.get("mode", "fixed") or "fixed"
+    should_run = mode == "encoder"
+    thread = session.get("encoder_thread")
+    running = bool(thread and thread.is_alive())
+
+    if should_run and not running:
+        stop_event = threading.Event()
+        session["encoder_stop_event"] = stop_event
+        worker = threading.Thread(target=_run_encoder_loop, args=(session,), daemon=True)
+        session["encoder_thread"] = worker
+        worker.start()
+    elif (not should_run) and running:
+        stop_event = session.get("encoder_stop_event")
+        if stop_event:
+            stop_event.set()
+        session["encoder_thread"] = None
+        session["encoder_stop_event"] = None
+        session["encoder_rpm"] = None
+        session["encoder_speed_mps"] = None
+
+
+def ensure_encoder_monitor_started(app):
+    session = _get_session_from_app(app)
+    _sync_encoder_worker(session)
+
+
+def stop_encoder_monitor(app):
+    session = _get_session_from_app(app)
+    stop_event = session.get("encoder_stop_event")
+    if stop_event:
+        stop_event.set()
+    session["encoder_thread"] = None
+    session["encoder_stop_event"] = None
+    session["encoder_rpm"] = None
+    session["encoder_speed_mps"] = None
+
+
 def _update_session_once(session: dict, receiver_manager):
     if receiver_manager is None:
         return
+
+    _sync_encoder_worker(session)
 
     # update distance based on motion settings
     motion = device_manager.motion_settings or {}
@@ -70,32 +184,26 @@ def _update_session_once(session: dict, receiver_manager):
 
     now = time.time()
     last_ts = session.get("last_update_ts")
-    if last_ts is not None:
-        dt = max(0.0, now - last_ts)
-        if mode == "fixed":
-            session["distance_mm"] = float(session.get("distance_mm", 0.0) + fixed_speed * dt * 1000.0)
-        elif mode == "encoder":
-            if encoder_value_mm > 0 and encoder_rps > 0:
-                if encoder_mode == "circumference":
-                    circ_m = encoder_value_mm / 1000.0
-                else:
-                    circ_m = (encoder_value_mm * np.pi) / 1000.0
-                speed_mps = encoder_rps * circ_m
-                session["distance_mm"] = float(session.get("distance_mm", 0.0) + speed_mps * dt * 1000.0)
-    session["last_update_ts"] = now
+    current_speed_mps = None
     if mode == "fixed":
-        session["speed_mps"] = fixed_speed
+        current_speed_mps = fixed_speed
     elif mode == "encoder":
-        if encoder_value_mm > 0 and encoder_rps > 0:
+        encoder_live_speed = session.get("encoder_speed_mps")
+        if encoder_live_speed is not None:
+            current_speed_mps = float(encoder_live_speed)
+        elif encoder_value_mm > 0 and encoder_rps > 0:
             if encoder_mode == "circumference":
                 circ_m = encoder_value_mm / 1000.0
             else:
                 circ_m = (encoder_value_mm * np.pi) / 1000.0
-            session["speed_mps"] = encoder_rps * circ_m
-        else:
-            session["speed_mps"] = None
-    else:
-        session["speed_mps"] = None
+            current_speed_mps = encoder_rps * circ_m
+
+    if last_ts is not None:
+        dt = max(0.0, now - last_ts)
+        if current_speed_mps is not None:
+            session["distance_mm"] = float(session.get("distance_mm", 0.0) + current_speed_mps * dt * 1000.0)
+    session["last_update_ts"] = now
+    session["speed_mps"] = current_speed_mps
     session["profiling_distance_mm"] = profiling_distance_mm
 
     # fetch point clouds and merge
@@ -206,6 +314,7 @@ def start_trigger_session(app):
     session["profiles_count"] = 0
     session["start_delay_mm_remaining"] = 0.0
     session["devices"] = [d.device_id for d in device_manager.get_all_devices() if d.enabled]
+    _sync_encoder_worker(session)
     _update_session_once(session, app.state.receiver_manager)
     return session
 
@@ -287,6 +396,7 @@ def stop_trigger_session(app):
     if not session.get("recording"):
         return session
     session["recording"] = False
+    _sync_encoder_worker(session)
     stop_event = session.get("worker_stop_event")
     if stop_event:
         stop_event.set()
@@ -400,6 +510,7 @@ async def history_item(meas_id: str):
 @router.get("/trigger/status")
 async def trigger_status(request: Request):
     session = _get_session(request)
+    _sync_encoder_worker(session)
     tdc_state = getattr(request.app.state, "tdc_input_state", None)
     if tdc_state == 2:
         tdc_label = "HIGH"
@@ -411,6 +522,8 @@ async def trigger_status(request: Request):
         "recording": session.get("recording", False),
         "distance_mm": session.get("distance_mm", 0.0),
         "speed_mps": session.get("speed_mps"),
+        "encoder_rpm": session.get("encoder_rpm"),
+        "encoder_speed_mps": session.get("encoder_speed_mps"),
         "profiling_distance_mm": session.get("profiling_distance_mm"),
         "profiles_count": session.get("profiles_count", 0),
         "points_count": len(session.get("last_points") or []),
@@ -425,6 +538,7 @@ async def trigger_status_stream(request: Request):
     async def event_generator():
         while True:
             session = _get_session(request)
+            _sync_encoder_worker(session)
             tdc_state = getattr(request.app.state, "tdc_input_state", None)
             if tdc_state == 2:
                 tdc_label = "HIGH"
@@ -436,6 +550,8 @@ async def trigger_status_stream(request: Request):
                 "recording": session.get("recording", False),
                 "distance_mm": session.get("distance_mm", 0.0),
                 "speed_mps": session.get("speed_mps"),
+                "encoder_rpm": session.get("encoder_rpm"),
+                "encoder_speed_mps": session.get("encoder_speed_mps"),
                 "profiling_distance_mm": session.get("profiling_distance_mm"),
                 "profiles_count": session.get("profiles_count", 0),
                 "points_count": len(session.get("last_points") or []),

@@ -10,6 +10,8 @@ interface TriggerStatus {
   recording: boolean;
   distance_mm: number;
   speed_mps: number | null;
+  encoder_rpm?: number | null;
+  encoder_speed_mps?: number | null;
   profiling_distance_mm: number | null;
   profiles_count?: number;
   points_count: number;
@@ -43,6 +45,7 @@ export default function AcquisitionPage() {
   const viewerRef = useRef<PointCloudThreeViewerHandle | null>(null);
   const fitOnceRef = useRef(false);
   const statusStreamRef = useRef<EventSource | null>(null);
+  const prevRecordingRef = useRef<boolean>(false);
 
   const fetchStatus = async () => {
     const res = await api.get('/acquisition/trigger/status');
@@ -141,6 +144,15 @@ export default function AcquisitionPage() {
     setViewerKey((v) => v + 1);
   }, [showFloor]);
 
+  useEffect(() => {
+    const wasRecording = prevRecordingRef.current;
+    const isRecording = !!status.recording;
+    if (wasRecording && !isRecording) {
+      fetchLatest();
+    }
+    prevRecordingRef.current = isRecording;
+  }, [status.recording, fullCloud]);
+
   const handleStart = async () => {
     setLoading(true);
     try {
@@ -166,8 +178,9 @@ export default function AcquisitionPage() {
     }
   };
 
-  const speedLabel = status.speed_mps !== null
-    ? `${status.speed_mps.toFixed(2)} m/s`
+  const liveSpeedMps = status.encoder_speed_mps ?? status.speed_mps;
+  const speedLabel = liveSpeedMps !== null && liveSpeedMps !== undefined
+    ? `${liveSpeedMps.toFixed(2)} m/s`
     : 'Encoder';
 
   const distanceM = status.distance_mm / 1000.0;
@@ -211,7 +224,20 @@ export default function AcquisitionPage() {
     };
   }, [points]);
 
-  const displayPoints = useMemo(() => points, [points]);
+  const displayPoints = useMemo(
+    () =>
+      points.map((p) => {
+        if (!Array.isArray(p) || p.length < 3) return p;
+        const x = Number(p[0]);
+        const y = Number(p[1]);
+        const z = Number(p[2]);
+        // Keep cloud transform consistent with device/frame overlay mapping.
+        const transformed: number[] = [z, y, x];
+        if (p.length > 3) transformed.push(...p.slice(3));
+        return transformed;
+      }),
+    [points]
+  );
 
   const getCornerPosition = (corner: string, origin: string, w: number, h: number) => {
     const halfW = w / 2;
@@ -325,11 +351,15 @@ export default function AcquisitionPage() {
           : 0;
       // Frame is drawn on XZ plane (y=0)
       return {
-        position: [xMm, 0, zMm] as [number, number, number],
+        // Match System Config orientation in Acquisition view:
+        // frame X/Y (editor) maps to Acquisition XZ as (Y -> X, X -> Z).
+        position: [zMm, 0, xMm] as [number, number, number],
         color: 0xf97316,
         size: 35,
         label: d.name || d.device_id,
-        yawDeg,
+        // Fine-tuned to match Acquisition view orientation:
+        // device position is correct, sector direction needs 90 deg counter-clockwise shift.
+        yawDeg: (-yawDeg - 90.0),
         fovDeg: 90,
         rangeMm,
       };
@@ -473,7 +503,7 @@ export default function AcquisitionPage() {
             <div className="card">
               <h2 className="text-xl font-semibold text-slate-900">Live Metrics</h2>
               <div className="mt-2 text-xs text-gray-500">
-                axes: frame plane X/Z, points mapAxes xzy
+                axes: frame plane X/Z, points mapAxes xyz
               </div>
               <div className="mt-4 grid grid-cols-2 gap-4">
                 <div>
@@ -483,6 +513,9 @@ export default function AcquisitionPage() {
                 <div>
                   <p className="text-xs text-gray-500">Speed</p>
                   <p className="text-2xl font-semibold text-slate-900">{speedLabel}</p>
+                  {status.encoder_rpm !== null && status.encoder_rpm !== undefined && (
+                    <p className="text-xs text-gray-400">Encoder: {status.encoder_rpm.toFixed(1)} rpm</p>
+                  )}
                 </div>
                 <div>
                   <p className="text-xs text-gray-500">Trigger input</p>

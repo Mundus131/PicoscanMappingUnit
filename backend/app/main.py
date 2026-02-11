@@ -89,6 +89,7 @@ async def startup_event():
             "analysis_points": [],
             "analysis_duration_ms": None,
         }
+        acquisition.ensure_encoder_monitor_started(app)
         
         # Auto-start listening for all enabled devices
         enabled_devices = [d for d in device_manager.get_all_devices() if d.enabled]
@@ -115,6 +116,7 @@ async def shutdown_event():
             app.state.tcp_notifier.stop()
         if app.state.tdc_monitor:
             app.state.tdc_monitor.stop()
+        acquisition.stop_encoder_monitor(app)
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 

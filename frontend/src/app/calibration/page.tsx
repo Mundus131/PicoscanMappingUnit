@@ -24,13 +24,29 @@ interface Device {
   frame_rotation_deg?: number[] | null;
 }
 
+interface AcquisitionLiveStatus {
+  speed_mps: number | null;
+  encoder_rpm?: number | null;
+  encoder_speed_mps?: number | null;
+}
+
+type TriggerInputName = 'DI_A' | 'DI_B' | 'DI_C' | 'DI_D' | 'DIO_A' | 'DIO_B' | 'DIO_C' | 'DIO_D';
+
+const TRIGGER_INPUT_OPTIONS: TriggerInputName[] = ['DI_A', 'DI_B', 'DI_C', 'DI_D', 'DIO_A', 'DIO_B', 'DIO_C', 'DIO_D'];
+
+interface IoStateResponse {
+  enabled: boolean;
+  grpc_available: boolean;
+  read_ts: number;
+  states: Record<string, { state: number | null; label: string }>;
+}
+
 export default function CalibrationPage() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [previewActive, setPreviewActive] = useState(false);
   const [previewPoints, setPreviewPoints] = useState<number[][]>([]);
-  const [autoPreviewStarted, setAutoPreviewStarted] = useState(false);
   const [autoResult, setAutoResult] = useState<any>(null);
   const previewRef = useRef<PointCloudThreeViewerHandle | null>(null);
 
@@ -55,7 +71,7 @@ export default function CalibrationPage() {
   const [tdcPort, setTdcPort] = useState(8081);
   const [tdcLogin, setTdcLogin] = useState('admin');
   const [tdcPassword, setTdcPassword] = useState('Welcome1!');
-  const [tdcTriggerInput, setTdcTriggerInput] = useState('DI1');
+  const [tdcTriggerInput, setTdcTriggerInput] = useState<TriggerInputName>('DI_A');
   const [tdcPollInterval, setTdcPollInterval] = useState(200);
   const [tdcEncoderPort, setTdcEncoderPort] = useState<'1' | '2' | '3' | '4'>('1');
   const [tdcStartDelayMode, setTdcStartDelayMode] = useState<'time' | 'distance'>('time');
@@ -65,6 +81,8 @@ export default function CalibrationPage() {
   const [tdcStopDelayMs, setTdcStopDelayMs] = useState(0);
   const [tdcStopDelayMm, setTdcStopDelayMm] = useState(0);
   const [tdcStatus, setTdcStatus] = useState<any>(null);
+  const [acquisitionLiveStatus, setAcquisitionLiveStatus] = useState<AcquisitionLiveStatus | null>(null);
+  const [ioState, setIoState] = useState<IoStateResponse | null>(null);
   const [tdcSaving, setTdcSaving] = useState(false);
   const [tdcSavedAt, setTdcSavedAt] = useState<number | null>(null);
 
@@ -78,9 +96,6 @@ export default function CalibrationPage() {
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [detailsDevice, setDetailsDevice] = useState<Device | null>(null);
   const [editingDevice, setEditingDevice] = useState<Device | null>(null);
-  const [manualOverrideMap, setManualOverrideMap] = useState<Record<string, boolean>>({});
-  const [positionDirty, setPositionDirty] = useState(false);
-  const [rotationDirty, setRotationDirty] = useState(false);
   const [formData, setFormData] = useState({
     device_id: '',
     name: '',
@@ -281,7 +296,10 @@ export default function CalibrationPage() {
         setTdcPort(Number(res.data.port ?? 8081));
         setTdcLogin(res.data.login ?? 'admin');
         setTdcPassword(res.data.password ?? 'Welcome1!');
-        setTdcTriggerInput(res.data.trigger_input ?? 'DI1');
+        const triggerInput = String(res.data.trigger_input ?? 'DI_A').toUpperCase();
+        setTdcTriggerInput(
+          (TRIGGER_INPUT_OPTIONS.includes(triggerInput as TriggerInputName) ? triggerInput : 'DI_A') as TriggerInputName
+        );
         setTdcPollInterval(Number(res.data.poll_interval_ms ?? 200));
         setTdcEncoderPort((res.data.encoder_port ?? '1') as '1' | '2' | '3' | '4');
         setTdcStartDelayMode(res.data.start_delay_mode === 'distance' ? 'distance' : 'time');
@@ -302,6 +320,24 @@ export default function CalibrationPage() {
       setTdcStatus(res.data || null);
     } catch {
       setTdcStatus(null);
+    }
+  };
+
+  const loadAcquisitionLiveStatus = async () => {
+    try {
+      const res = await api.get('/acquisition/trigger/status');
+      setAcquisitionLiveStatus(res.data || null);
+    } catch {
+      setAcquisitionLiveStatus(null);
+    }
+  };
+
+  const loadIoState = async () => {
+    try {
+      const res = await api.get('/tdc/io-state');
+      setIoState(res.data || null);
+    } catch {
+      setIoState(null);
     }
   };
 
@@ -368,6 +404,8 @@ export default function CalibrationPage() {
     loadMotionSettings();
     loadTdcSettings();
     loadTdcStatus();
+    loadAcquisitionLiveStatus();
+    loadIoState();
   }, []);
 
   useEffect(() => {
@@ -381,9 +419,13 @@ export default function CalibrationPage() {
   useEffect(() => {
     const interval = setInterval(() => {
       loadTdcStatus();
+      loadAcquisitionLiveStatus();
+      loadIoState();
     }, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  const liveEncoderSpeedMps = acquisitionLiveStatus?.encoder_speed_mps ?? acquisitionLiveStatus?.speed_mps ?? null;
 
   useEffect(() => {
     if (!frameDirty) return;
@@ -394,15 +436,12 @@ export default function CalibrationPage() {
   }, [frameWidth, frameHeight, originMode, frameDirty]);
 
   useEffect(() => {
-    if (autoPreviewStarted) return;
     if (devices.length === 0) return;
     if (selectedIds.length > 0) return;
     const enabled = devices.filter((d) => d.enabled).map((d) => d.device_id);
     const initial = enabled.length > 0 ? enabled : [devices[0].device_id];
     setSelectedIds(initial);
-    setPreviewActive(true);
-    setAutoPreviewStarted(true);
-  }, [autoPreviewStarted, devices, selectedIds]);
+  }, [devices, selectedIds]);
 
   useEffect(() => {
     if (!previewActive || selectedIds.length === 0) return;
@@ -448,8 +487,6 @@ export default function CalibrationPage() {
         frame_rotation_deg: [0, 0, 0],
       });
     }
-    setPositionDirty(false);
-    setRotationDirty(false);
     setIsModalOpen(true);
   };
 
@@ -475,16 +512,8 @@ export default function CalibrationPage() {
       if (editingDevice) {
         const { device_id, ...updateData } = payload;
         await api.put(`/devices/${device_id}`, updateData);
-        setManualOverrideMap((prev) => ({
-          ...prev,
-          [device_id]: positionDirty || rotationDirty,
-        }));
       } else {
         await api.post('/devices/', payload);
-        setManualOverrideMap((prev) => ({
-          ...prev,
-          [payload.device_id]: positionDirty || rotationDirty,
-        }));
       }
       await loadDevices();
       handleCloseModal();
@@ -664,12 +693,17 @@ export default function CalibrationPage() {
                       </svg>
                       {devices.map((device) => {
                         const corner = device.frame_corner || 'bottom-left';
-                        const manualOverride = manualOverrideMap[device.device_id];
-                        const calPos = device.calibration?.translation || null;
+                        const cornerPos = getCornerPosition(corner, originMode);
+                        const savedPos = Array.isArray(device.frame_position) && device.frame_position.length >= 2
+                          ? device.frame_position
+                          : null;
+                        const isAtCorner = savedPos
+                          ? (Math.abs(savedPos[0] - cornerPos[0]) < 1e-6 && Math.abs(savedPos[1] - cornerPos[1]) < 1e-6)
+                          : true;
                         const calRot = device.calibration?.rotation_deg || null;
-                        const pos = manualOverride
-                          ? (device.frame_position || calPos || getCornerPosition(corner, originMode))
-                          : getCornerPosition(corner, originMode);
+                        const pos = savedPos && !isAtCorner
+                          ? savedPos
+                          : cornerPos;
                         const rot = (device.frame_rotation_deg || calRot || getCornerRotation(corner));
                         const p = worldToSvg(pos[0], pos[1]);
                         const yawAdj = rot?.[2] ?? 0;
@@ -789,7 +823,7 @@ export default function CalibrationPage() {
                     />
                   </div>
                   <div>
-                    <label className="text-xs text-gray-600">Encoder rotations per second (rps)</label>
+                    <label className="text-xs text-gray-600">Fallback encoder speed input (rps)</label>
                     <input
                       className="input mt-1"
                       type="number"
@@ -799,16 +833,12 @@ export default function CalibrationPage() {
                     />
                   </div>
                   <div className="flex items-end text-xs text-gray-500">
-                    Speed: {encoderRps > 0 && encoderWheelValue > 0
-                      ? (
-                        (() => {
-                          const circ = encoderWheelMode === 'circumference'
-                            ? encoderWheelValue / 1000
-                            : (encoderWheelValue * Math.PI) / 1000;
-                          return (encoderRps * circ).toFixed(3);
-                        })()
-                      )
-                      : '0.000'} m/s
+                    Live speed (from encoder): {liveEncoderSpeedMps !== null
+                      ? `${liveEncoderSpeedMps.toFixed(3)} m/s`
+                      : 'n/a'}
+                    {acquisitionLiveStatus?.encoder_rpm !== null && acquisitionLiveStatus?.encoder_rpm !== undefined
+                      ? `, ${acquisitionLiveStatus.encoder_rpm.toFixed(1)} rpm`
+                      : ''}
                   </div>
                 </>
               )}
@@ -880,20 +910,11 @@ export default function CalibrationPage() {
                 <select
                   className="input mt-1"
                   value={tdcTriggerInput}
-                  onChange={(e) => setTdcTriggerInput(e.target.value)}
+                  onChange={(e) => setTdcTriggerInput(e.target.value as TriggerInputName)}
                 >
-                  <option value="DI_A">DI_A</option>
-                  <option value="DI_B">DI_B</option>
-                  <option value="DI_C">DI_C</option>
-                  <option value="DI_D">DI_D</option>
-                  <option value="DIO_A">DIO_A</option>
-                  <option value="DIO_B">DIO_B</option>
-                  <option value="DIO_C">DIO_C</option>
-                  <option value="DIO_D">DIO_D</option>
-                  <option value="DI1">DI1</option>
-                  <option value="DI2">DI2</option>
-                  <option value="DI3">DI3</option>
-                  <option value="DI4">DI4</option>
+                  {TRIGGER_INPUT_OPTIONS.map((name) => (
+                    <option key={name} value={name}>{name}</option>
+                  ))}
                 </select>
               </div>
               <div>
@@ -1004,6 +1025,29 @@ export default function CalibrationPage() {
                   <div>token: {tdcStatus.token?.has_token ? 'ok' : 'no token'}</div>
                   <div>input: {tdcStatus.input_state === 2 ? 'HIGH' : tdcStatus.input_state === 1 ? 'LOW' : 'UNKNOWN'}</div>
                   <div>encoder port: {tdcStatus.encoder_port || '-'}</div>
+                  <div>encoder speed: {liveEncoderSpeedMps !== null ? `${liveEncoderSpeedMps.toFixed(3)} m/s` : '-'}</div>
+                  <div>encoder rpm: {acquisitionLiveStatus?.encoder_rpm !== null && acquisitionLiveStatus?.encoder_rpm !== undefined ? acquisitionLiveStatus.encoder_rpm.toFixed(1) : '-'}</div>
+                </div>
+              </div>
+            )}
+            {ioState && (
+              <div className="mt-3 rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 p-3 text-xs text-gray-600">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold text-gray-700 dark:text-gray-300">IO State</div>
+                  <div className="text-[11px] text-gray-500">live</div>
+                </div>
+                <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2">
+                  {Object.entries(ioState.states || {}).map(([name, entry]) => (
+                    <div key={name} className="flex items-center justify-between rounded border border-gray-200 dark:border-gray-800 px-2 py-1 bg-white/60 dark:bg-gray-900/40">
+                      <span className="font-mono text-[11px]">{name}</span>
+                      <span
+                        className={`h-2.5 w-2.5 rounded-full ${
+                          entry?.state === 2 ? 'bg-emerald-400' : entry?.state === 1 ? 'bg-rose-400' : 'bg-gray-400'
+                        }`}
+                        title={entry?.label || 'UNKNOWN'}
+                      />
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
@@ -1207,8 +1251,6 @@ export default function CalibrationPage() {
                         frame_position: nextPos,
                         frame_rotation_deg: nextRot,
                       });
-                      setPositionDirty(false);
-                      setRotationDirty(false);
                     }}
                   >
                     <option value="top-left">Top-left</option>
@@ -1226,8 +1268,6 @@ export default function CalibrationPage() {
                       const nextPos = getCornerPosition(formData.frame_corner, originMode);
                       const nextRot = getCornerRotation(formData.frame_corner);
                       setFormData({ ...formData, frame_position: nextPos, frame_rotation_deg: nextRot });
-                      setPositionDirty(false);
-                      setRotationDirty(false);
                     }}
                   >
                     Snap to corner
@@ -1238,7 +1278,6 @@ export default function CalibrationPage() {
                       type="number"
                       value={formData.frame_position[0]}
                       onChange={(e) => {
-                        setPositionDirty(true);
                         setFormData({ ...formData, frame_position: [parseFloat(e.target.value), formData.frame_position[1], formData.frame_position[2]] });
                       }}
                     />
@@ -1247,7 +1286,6 @@ export default function CalibrationPage() {
                       type="number"
                       value={formData.frame_position[1]}
                       onChange={(e) => {
-                        setPositionDirty(true);
                         setFormData({ ...formData, frame_position: [formData.frame_position[0], parseFloat(e.target.value), formData.frame_position[2]] });
                       }}
                     />
@@ -1261,7 +1299,6 @@ export default function CalibrationPage() {
                       type="number"
                       value={formData.frame_rotation_deg[2]}
                       onChange={(e) => {
-                        setRotationDirty(true);
                         setFormData({
                           ...formData,
                           frame_rotation_deg: [0, 0, parseFloat(e.target.value)],
@@ -1273,7 +1310,6 @@ export default function CalibrationPage() {
                         className="btn-secondary px-2 py-1"
                         type="button"
                         onClick={() => {
-                          setRotationDirty(true);
                           const v = (formData.frame_rotation_deg[2] ?? 0) - 5;
                           setFormData({ ...formData, frame_rotation_deg: [0, 0, v] });
                         }}
@@ -1284,7 +1320,6 @@ export default function CalibrationPage() {
                         className="btn-secondary px-2 py-1"
                         type="button"
                         onClick={() => {
-                          setRotationDirty(true);
                           const v = (formData.frame_rotation_deg[2] ?? 0) - 1;
                           setFormData({ ...formData, frame_rotation_deg: [0, 0, v] });
                         }}
@@ -1295,7 +1330,6 @@ export default function CalibrationPage() {
                         className="btn-secondary px-2 py-1"
                         type="button"
                         onClick={() => {
-                          setRotationDirty(true);
                           const v = (formData.frame_rotation_deg[2] ?? 0) + 1;
                           setFormData({ ...formData, frame_rotation_deg: [0, 0, v] });
                         }}
@@ -1306,7 +1340,6 @@ export default function CalibrationPage() {
                         className="btn-secondary px-2 py-1"
                         type="button"
                         onClick={() => {
-                          setRotationDirty(true);
                           const v = (formData.frame_rotation_deg[2] ?? 0) + 5;
                           setFormData({ ...formData, frame_rotation_deg: [0, 0, v] });
                         }}

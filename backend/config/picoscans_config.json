@@ -9,27 +9,27 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          1000.0,
+          500.0,
           0.0,
           1000.0
         ],
         "rotation_deg": [
           0.0,
-          135.0,
+          90.0,
           0.0
         ],
         "scale": 1.0
       },
       "frame_corner": "top-right",
       "frame_position": [
-        1.0,
+        0.5,
         1.0,
         0.0
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        135.0
+        90.0
       ],
       "segments_per_scan": null,
       "acquisition_mode": "continuous",
@@ -50,30 +50,30 @@
     "origin_mode": "bottom-left"
   },
   "motion_settings": {
-    "mode": "fixed",
-    "fixed_speed_mps": 0.5,
-    "profiling_distance_mm": 10.0,
-    "encoder_wheel_mode": "diameter",
-    "encoder_wheel_value_mm": 100.0,
+    "mode": "encoder",
+    "fixed_speed_mps": null,
+    "profiling_distance_mm": 1.0,
+    "encoder_wheel_mode": "circumference",
+    "encoder_wheel_value_mm": 200.0,
     "encoder_rps": 0.0
   },
   "tdc_settings": {
-    "enabled": false,
+    "enabled": true,
     "ip_address": "192.168.0.100",
     "port": 8081,
     "login": "admin",
     "password": "Welcome1!",
     "realm": "admin",
-    "trigger_input": "DI1",
+    "trigger_input": "DI_A",
     "poll_interval_ms": 200,
     "token_refresh_interval_s": 300,
     "grpc_timeout_s": 5.0,
     "encoder_port": "1",
-    "start_delay_mode": "time",
-    "start_delay_ms": 0.0,
+    "start_delay_mode": "distance",
+    "start_delay_ms": 100.0,
     "start_delay_mm": 0.0,
-    "stop_delay_mode": "time",
+    "stop_delay_mode": "distance",
     "stop_delay_ms": 0.0,
-    "stop_delay_mm": 0.0
+    "stop_delay_mm": 100.0
   }
 }
