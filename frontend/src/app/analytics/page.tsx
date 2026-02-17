@@ -36,6 +36,7 @@ interface LogMetrics {
 }
 
 type AnalysisApp = 'log' | 'conveyor_object';
+type ConveyorLocalizationAlgorithm = 'object_cloud_bbox' | 'box_top_plane';
 
 interface ConveyorMetrics {
   analysis_app: 'conveyor_object';
@@ -44,6 +45,7 @@ interface ConveyorMetrics {
     rmse_mm?: number | null;
   };
   object?: {
+    localization_algorithm?: ConveyorLocalizationAlgorithm;
     points_count?: number;
     centroid_mm?: [number, number, number];
     bbox_mm?: {
@@ -58,6 +60,13 @@ interface ConveyorMetrics {
       max?: number;
       avg?: number;
     };
+    top_plane?: {
+      points_count?: number;
+      height_avg_mm?: number;
+      height_min_mm?: number;
+      height_max_mm?: number;
+      footprint_angle_deg?: number;
+    } | null;
   };
 }
 
@@ -309,6 +318,9 @@ export default function AnalyticsPage() {
   const [convPlaneInlierMm, setConvPlaneInlierMm] = useState(8);
   const [convObjectMinHeightMm, setConvObjectMinHeightMm] = useState(8);
   const [convObjectMaxPoints, setConvObjectMaxPoints] = useState(60000);
+  const [convLocalizationAlgorithm, setConvLocalizationAlgorithm] = useState<ConveyorLocalizationAlgorithm>('object_cloud_bbox');
+  const [convTopPlaneQuantile, setConvTopPlaneQuantile] = useState(0.88);
+  const [convTopPlaneInlierMm, setConvTopPlaneInlierMm] = useState(4);
   const [convDenoiseEnabled, setConvDenoiseEnabled] = useState(true);
   const [convDenoiseCellMm, setConvDenoiseCellMm] = useState(8);
   const [convDenoiseMinPtsCell, setConvDenoiseMinPtsCell] = useState(3);
@@ -349,6 +361,10 @@ export default function AnalyticsPage() {
       if (typeof res.data?.conveyor_plane_inlier_mm === 'number') setConvPlaneInlierMm(res.data.conveyor_plane_inlier_mm);
       if (typeof res.data?.conveyor_object_min_height_mm === 'number') setConvObjectMinHeightMm(res.data.conveyor_object_min_height_mm);
       if (typeof res.data?.conveyor_object_max_points === 'number') setConvObjectMaxPoints(res.data.conveyor_object_max_points);
+      const locAlgo = res.data?.conveyor_localization_algorithm === 'box_top_plane' ? 'box_top_plane' : 'object_cloud_bbox';
+      setConvLocalizationAlgorithm(locAlgo);
+      if (typeof res.data?.conveyor_top_plane_quantile === 'number') setConvTopPlaneQuantile(res.data.conveyor_top_plane_quantile);
+      if (typeof res.data?.conveyor_top_plane_inlier_mm === 'number') setConvTopPlaneInlierMm(res.data.conveyor_top_plane_inlier_mm);
       if (typeof res.data?.conveyor_denoise_enabled === 'boolean') setConvDenoiseEnabled(res.data.conveyor_denoise_enabled);
       if (typeof res.data?.conveyor_denoise_cell_mm === 'number') setConvDenoiseCellMm(res.data.conveyor_denoise_cell_mm);
       if (typeof res.data?.conveyor_denoise_min_points_per_cell === 'number') setConvDenoiseMinPtsCell(res.data.conveyor_denoise_min_points_per_cell);
@@ -369,6 +385,9 @@ export default function AnalyticsPage() {
         conveyor_plane_inlier_mm: convPlaneInlierMm,
         conveyor_object_min_height_mm: convObjectMinHeightMm,
         conveyor_object_max_points: convObjectMaxPoints,
+        conveyor_localization_algorithm: convLocalizationAlgorithm,
+        conveyor_top_plane_quantile: convTopPlaneQuantile,
+        conveyor_top_plane_inlier_mm: convTopPlaneInlierMm,
         conveyor_denoise_enabled: convDenoiseEnabled,
         conveyor_denoise_cell_mm: convDenoiseCellMm,
         conveyor_denoise_min_points_per_cell: convDenoiseMinPtsCell,
@@ -887,6 +906,17 @@ export default function AnalyticsPage() {
                     </select>
                   </label>
                   <label className="flex flex-col gap-1">
+                    <span className="text-xs text-gray-500">Localization algorithm</span>
+                    <select
+                      className="input"
+                      value={convLocalizationAlgorithm}
+                      onChange={(e) => setConvLocalizationAlgorithm(e.target.value as ConveyorLocalizationAlgorithm)}
+                    >
+                      <option value="object_cloud_bbox">Object cloud bbox</option>
+                      <option value="box_top_plane">Box top plane</option>
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-1">
                     <span className="text-xs text-gray-500">Plane quantile</span>
                     <input className="input" type="number" step={0.01} min={0.05} max={0.8} value={convPlaneQuantile} onChange={(e) => setConvPlaneQuantile(Number(e.target.value || 0.35))} />
                   </label>
@@ -910,6 +940,33 @@ export default function AnalyticsPage() {
                     <span className="text-xs text-gray-500">Denoise min pts/cell</span>
                     <input className="input" type="number" min={1} step={1} value={convDenoiseMinPtsCell} onChange={(e) => setConvDenoiseMinPtsCell(Number(e.target.value || 3))} />
                   </label>
+                  {convLocalizationAlgorithm === 'box_top_plane' && (
+                    <>
+                      <label className="flex flex-col gap-1">
+                        <span className="text-xs text-gray-500">Top plane quantile</span>
+                        <input
+                          className="input"
+                          type="number"
+                          step={0.01}
+                          min={0.6}
+                          max={0.99}
+                          value={convTopPlaneQuantile}
+                          onChange={(e) => setConvTopPlaneQuantile(Number(e.target.value || 0.88))}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        <span className="text-xs text-gray-500">Top plane inlier [mm]</span>
+                        <input
+                          className="input"
+                          type="number"
+                          step={0.5}
+                          min={0.5}
+                          value={convTopPlaneInlierMm}
+                          onChange={(e) => setConvTopPlaneInlierMm(Number(e.target.value || 4))}
+                        />
+                      </label>
+                    </>
+                  )}
                   <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
                     <input type="checkbox" checked={convDenoiseEnabled} onChange={(e) => setConvDenoiseEnabled(e.target.checked)} />
                     Denoise enabled
@@ -1002,6 +1059,12 @@ export default function AnalyticsPage() {
                 <div className="mt-4 space-y-3 text-sm text-gray-500">
                   <div className="grid grid-cols-2 gap-3">
                     <div>
+                      <div className="text-xs text-gray-400">Localization</div>
+                      <div className="text-lg font-semibold text-slate-900">
+                        {conveyorAnalysis.object?.localization_algorithm === 'box_top_plane' ? 'box_top_plane' : 'object_cloud_bbox'}
+                      </div>
+                    </div>
+                    <div>
                       <div className="text-xs text-gray-400">Object points</div>
                       <div className="text-lg font-semibold text-slate-900">{conveyorAnalysis.object?.points_count ?? 0}</div>
                     </div>
@@ -1035,6 +1098,16 @@ export default function AnalyticsPage() {
                           : 'n/a'}
                       </div>
                     </div>
+                    {conveyorAnalysis.object?.top_plane && (
+                      <div>
+                        <div className="text-xs text-gray-400">Top plane angle</div>
+                        <div className="text-lg font-semibold text-slate-900">
+                          {conveyorAnalysis.object.top_plane.footprint_angle_deg !== undefined
+                            ? `${conveyorAnalysis.object.top_plane.footprint_angle_deg.toFixed(1)} deg`
+                            : 'n/a'}
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div className="text-xs text-gray-400">Object centroid [x, y, z] mm</div>
                   <div className="rounded-md border border-slate-200 px-3 py-2 text-xs font-mono text-slate-700">

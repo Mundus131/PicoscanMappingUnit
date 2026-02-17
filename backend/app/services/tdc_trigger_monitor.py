@@ -17,6 +17,9 @@ class TdcTriggerMonitor:
         self._last_state = None
         self._config_cache = {}
         self._last_read_ts = None
+        self._pending_start_at = None
+        self._pending_stop_at = None
+        self._pending_stop_target_mm = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -47,6 +50,9 @@ class TdcTriggerMonitor:
             config = self._get_config()
             if not config.get("enabled"):
                 self._last_state = None
+                self._pending_start_at = None
+                self._pending_stop_at = None
+                self._pending_stop_target_mm = None
                 time.sleep(0.5)
                 continue
             if not tdc_grpc_available():
@@ -66,36 +72,58 @@ class TdcTriggerMonitor:
                 self.app.state.tdc_input_state = state
                 self.app.state.tdc_input_ts = time.time()
                 self._last_read_ts = self.app.state.tdc_input_ts
-                if self._last_state is None:
-                    self._last_state = state
-                else:
-                    # IOState: 1=LOW, 2=HIGH
-                    if self._last_state == 1 and state == 2:
-                        logger.info("TDC trigger rising edge detected")
+                session = acquisition_api._get_session_from_app(self.app)
+                recording = bool(session.get("recording"))
+                now = time.time()
+
+                # IOState: 1=LOW, 2=HIGH
+                if state == 2:
+                    # Cancel pending stop when trigger is high again
+                    self._pending_stop_at = None
+                    self._pending_stop_target_mm = None
+
+                    if not recording:
                         if config["start_delay_mode"] == "time" and config["start_delay_ms"] > 0:
-                            time.sleep(config["start_delay_ms"] / 1000.0)
-                        session = acquisition_api.start_trigger_session(self.app)
-                        session["trigger_source"] = "tdc"
-                        if config["start_delay_mode"] == "distance" and config["start_delay_mm"] > 0:
-                            session["start_delay_mm_remaining"] = float(config["start_delay_mm"])
-                    elif self._last_state == 2 and state == 1:
-                        logger.info("TDC trigger falling edge detected")
+                            if self._pending_start_at is None:
+                                self._pending_start_at = now + (config["start_delay_ms"] / 1000.0)
+                            elif now >= self._pending_start_at:
+                                start_session = acquisition_api.start_trigger_session(self.app)
+                                start_session["trigger_source"] = "tdc"
+                                self._pending_start_at = None
+                        else:
+                            start_session = acquisition_api.start_trigger_session(self.app)
+                            start_session["trigger_source"] = "tdc"
+                            if config["start_delay_mode"] == "distance" and config["start_delay_mm"] > 0:
+                                start_session["start_delay_mm_remaining"] = float(config["start_delay_mm"])
+                            self._pending_start_at = None
+                elif state == 1:
+                    # Cancel pending start when trigger is low
+                    self._pending_start_at = None
+
+                    if recording:
                         if config["stop_delay_mode"] == "time" and config["stop_delay_ms"] > 0:
-                            time.sleep(config["stop_delay_ms"] / 1000.0)
-                            acquisition_api.stop_trigger_session(self.app)
+                            if self._pending_stop_at is None:
+                                self._pending_stop_at = now + (config["stop_delay_ms"] / 1000.0)
+                            elif now >= self._pending_stop_at:
+                                acquisition_api.stop_trigger_session(self.app)
+                                acquisition_api._get_session_from_app(self.app)["trigger_source"] = "tdc"
+                                self._pending_stop_at = None
                         elif config["stop_delay_mode"] == "distance" and config["stop_delay_mm"] > 0:
-                            target = acquisition_api._get_session_from_app(self.app).get("distance_mm", 0.0) + float(config["stop_delay_mm"])
-                            while not self._stop_event.is_set():
-                                session = acquisition_api._get_session_from_app(self.app)
-                                if not session.get("recording"):
-                                    break
-                                if session.get("distance_mm", 0.0) >= target:
-                                    acquisition_api.stop_trigger_session(self.app)
-                                    break
-                                time.sleep(0.05)
+                            if self._pending_stop_target_mm is None:
+                                self._pending_stop_target_mm = float(session.get("distance_mm", 0.0)) + float(config["stop_delay_mm"])
+                            elif float(session.get("distance_mm", 0.0)) >= float(self._pending_stop_target_mm):
+                                acquisition_api.stop_trigger_session(self.app)
+                                acquisition_api._get_session_from_app(self.app)["trigger_source"] = "tdc"
+                                self._pending_stop_target_mm = None
                         else:
                             acquisition_api.stop_trigger_session(self.app)
-                        acquisition_api._get_session_from_app(self.app)["trigger_source"] = "tdc"
-                    self._last_state = state
+                            acquisition_api._get_session_from_app(self.app)["trigger_source"] = "tdc"
+                            self._pending_stop_at = None
+                            self._pending_stop_target_mm = None
+                    else:
+                        self._pending_stop_at = None
+                        self._pending_stop_target_mm = None
+
+                self._last_state = state
 
             time.sleep(poll_interval / 1000.0)

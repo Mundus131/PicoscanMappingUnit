@@ -53,8 +53,8 @@ async def update_device(device_id: str, device_update: DeviceUpdate):
     
     # Add device_id to the update data
     update_data["device_id"] = device_id
-    update_data["ip_address"] = device.ip_address  # Keep existing IP
-    update_data["port"] = device.port  # Keep existing port
+    update_data["ip_address"] = update_data.get("ip_address", device.ip_address)
+    update_data["port"] = update_data.get("port", device.port)
     
     if device_manager.update_device(device_id, update_data):
         return device_manager.get_device(device_id).to_dict()

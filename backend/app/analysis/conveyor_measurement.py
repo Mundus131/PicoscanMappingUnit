@@ -61,11 +61,50 @@ def _largest_connected_component_cells(cells: np.ndarray) -> set[tuple[int, int]
     return best_component
 
 
+def _fit_plane_general(points_xyz: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Fit plane n.x + d = 0 by SVD."""
+    centroid = np.mean(points_xyz, axis=0)
+    centered = points_xyz - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    n = vh[-1, :]
+    norm = np.linalg.norm(n)
+    if norm <= 1e-12:
+        n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        n = n / norm
+    d = -float(np.dot(n, centroid))
+    return n.astype(np.float64), d
+
+
+def _fit_footprint_pca(uu: np.ndarray, vv: np.ndarray) -> Tuple[float, float, float]:
+    """Returns (length_mm, width_mm, angle_deg) for 2D footprint points in conveyor basis."""
+    uv = np.column_stack([uu, vv]).astype(np.float64)
+    if uv.shape[0] < 3:
+        return 0.0, 0.0, 0.0
+    mean = np.mean(uv, axis=0)
+    centered = uv - mean
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvecs = eigvecs[:, order]
+    proj = centered @ eigvecs
+    p0_min, p0_max = float(np.min(proj[:, 0])), float(np.max(proj[:, 0]))
+    p1_min, p1_max = float(np.min(proj[:, 1])), float(np.max(proj[:, 1]))
+    length_mm = max(0.0, p0_max - p0_min)
+    width_mm = max(0.0, p1_max - p1_min)
+    angle_rad = float(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+    angle_deg = float(np.degrees(angle_rad))
+    return length_mm, width_mm, angle_deg
+
+
 def compute_conveyor_object_metrics(
     points: Iterable[Iterable[float]],
     plane_quantile: float = 0.35,
     plane_inlier_mm: float = 8.0,
     object_min_height_mm: float = 8.0,
+    localization_algorithm: str = "object_cloud_bbox",
+    top_plane_quantile: float = 0.88,
+    top_plane_inlier_mm: float = 4.0,
     denoise_enabled: bool = True,
     denoise_cell_mm: float = 8.0,
     denoise_min_points_per_cell: int = 3,
@@ -147,9 +186,61 @@ def compute_conveyor_object_metrics(
     u_min, u_max = float(np.min(uu)), float(np.max(uu))
     v_min, v_max = float(np.min(vv)), float(np.max(vv))
     h_min, h_max = float(np.min(hh)), float(np.max(hh))
-    length_mm = max(0.0, u_max - u_min)
-    width_mm = max(0.0, v_max - v_min)
-    height_mm = max(0.0, h_max - h_min)
+    localization_algorithm = localization_algorithm if localization_algorithm in {"object_cloud_bbox", "box_top_plane"} else "object_cloud_bbox"
+    top_plane_info: Dict[str, Any] | None = None
+
+    if localization_algorithm == "box_top_plane":
+        tq = float(np.clip(top_plane_quantile, 0.6, 0.99))
+        top_thr = float(np.quantile(hh, tq))
+        top_seed_mask = hh >= top_thr
+        if int(np.count_nonzero(top_seed_mask)) < 20:
+            top_seed_mask = hh >= float(np.quantile(hh, 0.80))
+        top_seed_pts = obj_pts[top_seed_mask]
+
+        if top_seed_pts.shape[0] >= 20:
+            tn, td = _fit_plane_general(top_seed_pts)
+            # Use inliers around top plane to stabilize footprint.
+            top_dist = np.abs(top_seed_pts @ tn + td)
+            top_inliers_local = top_dist <= float(max(0.5, top_plane_inlier_mm))
+            if int(np.count_nonzero(top_inliers_local)) >= 15:
+                top_pts = top_seed_pts[top_inliers_local]
+                top_hh = hh[top_seed_mask][top_inliers_local]
+                top_uu = uu[top_seed_mask][top_inliers_local]
+                top_vv = vv[top_seed_mask][top_inliers_local]
+            else:
+                top_pts = top_seed_pts
+                top_hh = hh[top_seed_mask]
+                top_uu = uu[top_seed_mask]
+                top_vv = vv[top_seed_mask]
+
+            length_mm, width_mm, footprint_angle_deg = _fit_footprint_pca(top_uu, top_vv)
+            if length_mm <= 0 or width_mm <= 0:
+                length_mm = max(0.0, u_max - u_min)
+                width_mm = max(0.0, v_max - v_min)
+            # For a box on conveyor, height is top plane distance over conveyor plane.
+            height_mm = max(0.0, float(np.mean(top_hh)))
+            h_max = max(h_max, height_mm)
+            top_plane_info = {
+                "points_count": int(top_pts.shape[0]),
+                "height_avg_mm": float(np.mean(top_hh)),
+                "height_min_mm": float(np.min(top_hh)),
+                "height_max_mm": float(np.max(top_hh)),
+                "footprint_angle_deg": footprint_angle_deg,
+                "equation": {
+                    "nx": float(tn[0]),
+                    "ny": float(tn[1]),
+                    "nz": float(tn[2]),
+                    "d": float(td),
+                },
+            }
+        else:
+            length_mm = max(0.0, u_max - u_min)
+            width_mm = max(0.0, v_max - v_min)
+            height_mm = max(0.0, h_max - h_min)
+    else:
+        length_mm = max(0.0, u_max - u_min)
+        width_mm = max(0.0, v_max - v_min)
+        height_mm = max(0.0, h_max - h_min)
     bbox_volume_mm3 = length_mm * width_mm * height_mm
 
     centroid = np.mean(obj_pts, axis=0)
@@ -165,6 +256,7 @@ def compute_conveyor_object_metrics(
             "rmse_mm": rmse,
         },
         "object": {
+            "localization_algorithm": localization_algorithm,
             "points_count": int(obj_pts.shape[0]),
             "centroid_mm": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
             "bbox_mm": {
@@ -179,6 +271,7 @@ def compute_conveyor_object_metrics(
                 "max": h_max,
                 "avg": float(np.mean(hh)),
             },
+            "top_plane": top_plane_info,
         },
         # Used by augmentation helper
         "_internal": {

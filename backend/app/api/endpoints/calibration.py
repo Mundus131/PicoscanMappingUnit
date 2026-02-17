@@ -32,11 +32,15 @@ def _euler_xyz_to_rotation_matrix_deg(r_deg: list[float]) -> np.ndarray:
     Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
     return Rz @ Ry @ Rx
 
+
+def _norm_deg(v: float) -> float:
+    return ((float(v) + 180.0) % 360.0) - 180.0
+
 @router.post("/auto", response_model=AutoCalibrationResponse)
 async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
     """
     Auto-calibrate devices using ICP alignment.
-    Uses first device as reference frame.
+    Uses explicit reference_device_id when provided, otherwise first device.
     """
     try:
         import open3d as o3d
@@ -53,8 +57,14 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
     # Acquire point clouds from receivers
     point_clouds = receiver_manager.get_point_clouds(num_segments=10)
 
+    # Determine reference device
+    ref_id = (req.reference_device_id or (req.device_ids[0] if req.device_ids else None))
+    if not ref_id:
+        raise HTTPException(status_code=400, detail="reference device is required")
+    if ref_id not in req.device_ids:
+        req.device_ids = [ref_id] + [d for d in req.device_ids if d != ref_id]
+
     # Ensure reference device has data
-    ref_id = req.device_ids[0]
     ref_points = point_clouds.get(ref_id)
     if ref_points is None or len(ref_points) < 50:
         raise HTTPException(status_code=400, detail=f"No point cloud data for reference device {ref_id}")
@@ -113,14 +123,20 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
         t = T[:3, 3].tolist()
         r_deg = _rotation_matrix_to_euler_xyz(R)
 
+        # For LMS4000, apply additional +90 deg CCW yaw correction after ICP.
+        # This keeps receiver geometry raw and puts mounting correction in calibration.
+        yaw_correction_deg = 90.0 if str(getattr(device, "device_type", "")).lower() == "lms4000" else 0.0
+        corrected_yaw = _norm_deg(float(r_deg[1]) + yaw_correction_deg)
+        corrected_r_deg = [float(r_deg[0]), corrected_yaw, float(r_deg[2])]
+
         calibration = {
             "translation": t,
-            "rotation_deg": r_deg,
+            "rotation_deg": corrected_r_deg,
             "scale": 1.0,
         }
         # Map data coords -> frame coords (frame X/Y plane, Z motion)
         frame_position = [t[0] / 1000.0, t[2] / 1000.0, t[1] / 1000.0]
-        frame_rotation_deg = [0.0, 0.0, float(r_deg[1])]
+        frame_rotation_deg = [0.0, 0.0, corrected_yaw]
         device_manager.update_device(
             device_id,
             {
@@ -137,7 +153,7 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
             AutoCalibrationResult(
                 device_id=device_id,
                 translation=t,
-                rotation_deg=r_deg,
+                rotation_deg=corrected_r_deg,
                 scale=1.0,
                 score=float(reg.fitness) if hasattr(reg, "fitness") else None,
             )
@@ -254,10 +270,18 @@ async def update_analysis_settings(req: AnalysisSettings):
     active_app = (req.active_app or "log").strip()
     if active_app not in {"log", "conveyor_object"}:
         active_app = "log"
+    loc_algo = (
+        req.conveyor_localization_algorithm
+        if req.conveyor_localization_algorithm is not None
+        else current.get("conveyor_localization_algorithm", "object_cloud_bbox")
+    )
+    if loc_algo not in {"object_cloud_bbox", "box_top_plane"}:
+        loc_algo = "object_cloud_bbox"
     device_manager.analysis_settings = {
         "active_app": active_app,
         "log_window_profiles": int(req.log_window_profiles if req.log_window_profiles is not None else current.get("log_window_profiles", 10)),
         "log_min_points": int(req.log_min_points if req.log_min_points is not None else current.get("log_min_points", 50)),
+        "conveyor_localization_algorithm": loc_algo,
         "conveyor_plane_quantile": float(
             req.conveyor_plane_quantile
             if req.conveyor_plane_quantile is not None
@@ -277,6 +301,16 @@ async def update_analysis_settings(req: AnalysisSettings):
             req.conveyor_object_max_points
             if req.conveyor_object_max_points is not None
             else current.get("conveyor_object_max_points", 60000)
+        ),
+        "conveyor_top_plane_quantile": float(
+            req.conveyor_top_plane_quantile
+            if req.conveyor_top_plane_quantile is not None
+            else current.get("conveyor_top_plane_quantile", 0.88)
+        ),
+        "conveyor_top_plane_inlier_mm": float(
+            req.conveyor_top_plane_inlier_mm
+            if req.conveyor_top_plane_inlier_mm is not None
+            else current.get("conveyor_top_plane_inlier_mm", 4.0)
         ),
         "conveyor_denoise_enabled": bool(
             req.conveyor_denoise_enabled

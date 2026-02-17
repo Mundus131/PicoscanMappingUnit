@@ -7,6 +7,7 @@ from app.analysis.log_measurement import compute_log_metrics, build_augmented_cl
 from app.analysis.conveyor_measurement import compute_conveyor_object_metrics, build_conveyor_augmented_cloud
 from app.analysis.history_store import save_measurement, list_measurements, get_measurement
 from app.services.picoscan_receiver import PicoscanReceiver, PicoscanReceiverManager
+from app.services.lms4000_receiver import Lms4000Receiver
 from app.services.point_cloud_processor import PointCloudProcessor
 from app.services import tdc_rest
 import logging
@@ -336,6 +337,9 @@ def _run_analysis_for_session(session: dict, app):
                     plane_quantile=float(analysis_cfg.get("conveyor_plane_quantile", 0.35) or 0.35),
                     plane_inlier_mm=float(analysis_cfg.get("conveyor_plane_inlier_mm", 8.0) or 8.0),
                     object_min_height_mm=float(analysis_cfg.get("conveyor_object_min_height_mm", 8.0) or 8.0),
+                    localization_algorithm=str(analysis_cfg.get("conveyor_localization_algorithm", "object_cloud_bbox") or "object_cloud_bbox"),
+                    top_plane_quantile=float(analysis_cfg.get("conveyor_top_plane_quantile", 0.88) or 0.88),
+                    top_plane_inlier_mm=float(analysis_cfg.get("conveyor_top_plane_inlier_mm", 4.0) or 4.0),
                     denoise_enabled=bool(analysis_cfg.get("conveyor_denoise_enabled", True)),
                     denoise_cell_mm=float(analysis_cfg.get("conveyor_denoise_cell_mm", 8.0) or 8.0),
                     denoise_min_points_per_cell=int(analysis_cfg.get("conveyor_denoise_min_points_per_cell", 3) or 3),
@@ -462,7 +466,14 @@ async def start_listening(request: Request):
                 results[device.device_id] = True
                 continue
 
-            ok = receiver_manager.start_listening(device.device_id, listen_ip, device.port, segments_per_scan=getattr(device, 'segments_per_scan', None))
+            ok = receiver_manager.start_listening(
+                device.device_id,
+                listen_ip,
+                device.port,
+                segments_per_scan=getattr(device, 'segments_per_scan', None),
+                device_type=getattr(device, 'device_type', 'picoscan'),
+                sensor_ip=getattr(device, 'ip_address', None),
+            )
             results[device.device_id] = ok
         
         return {
@@ -685,42 +696,15 @@ async def receive_point_cloud_data(req: AcquisitionRequest, request: Request):
             raise HTTPException(status_code=500, detail="Receiver manager not initialized")
 
         point_clouds_to_merge = []
-        
+        latest_clouds = receiver_manager.get_point_clouds(num_segments=req.num_segments or 1)
         for device_id in req.device_ids:
             device = device_manager.get_device(device_id)
             if not device:
                 raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
-            
-            # Get existing receiver or use temporary one
-            receiver_info = receiver_manager.receivers.get(device_id)
-            
-            if receiver_info and isinstance(receiver_info, dict):
-                receiver = receiver_info.get("receiver")
-            else:
-                receiver = receiver_info
-            
-            if not receiver or not receiver.connected:
+            points = latest_clouds.get(device_id)
+            if points is None or len(points) == 0:
                 continue
-            
-            # Determine segments per scan (device-specific or request)
-            segments_per_scan = (
-                getattr(device, 'segments_per_scan', None)
-                or device_manager.point_cloud_settings.get("segments_per_scan")
-                or req.num_segments
-                or 1
-            )
-
-            # Receive segments
-            segments = receiver.receive_segments(segments_per_scan)
-            if not segments:
-                continue
-            
-            # Convert to point cloud
-            segment_list = _extract_segments(segments)
-            points = receiver.segments_to_point_cloud(segment_list)
-            
-            if len(points) > 0:
-                point_clouds_to_merge.append((points, device.calibration))
+            point_clouds_to_merge.append((points, device.calibration))
         
         if not point_clouds_to_merge:
             raise HTTPException(status_code=400, detail="No data received - ensure Picoscan is sending UDP")
@@ -748,8 +732,8 @@ async def get_receiver_status(device_id: str, request: Request):
     if receiver_manager is None:
         raise HTTPException(status_code=500, detail="Receiver manager not initialized")
 
-    receiver = receiver_manager.receivers.get(device_id)
-    if not receiver:
+    receiver_info = receiver_manager.receivers.get(device_id)
+    if not receiver_info:
         device = device_manager.get_device(device_id)
         if not device:
             raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
@@ -758,11 +742,12 @@ async def get_receiver_status(device_id: str, request: Request):
             "listening": False,
             "info": "Receiver not initialized"
         }
+    receiver = receiver_info.get("receiver") if isinstance(receiver_info, dict) else receiver_info
     
     return {
         "device_id": device_id,
-        "listening": receiver.connected,
-        "info": receiver.get_info()
+        "listening": bool(getattr(receiver, "connected", False)),
+        "info": receiver.get_info() if hasattr(receiver, "get_info") else {}
     }
 
 
@@ -803,35 +788,46 @@ async def test_receive(device_id: str, num_segments: int = 1):
         if not device:
             raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
         
-        # Create temporary receiver
-        receiver = PicoscanReceiver(
-            listen_ip="0.0.0.0",
-            listen_port=device.port
-        )
-        
-        # Start listening
-        if not receiver.start_listening():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to listen on port {device.port}"
+        device_type = str(getattr(device, "device_type", "picoscan") or "picoscan").lower()
+        if device_type == "lms4000":
+            receiver = Lms4000Receiver(sensor_ip=device.ip_address, sensor_port=device.port)
+            if not receiver.start_listening():
+                raise HTTPException(status_code=400, detail=f"Failed to connect to LMS4000 {device.ip_address}:{device.port}")
+            points = receiver.receive_point_cloud(max(1, num_segments))
+            receiver.stop_listening()
+            if points is None or len(points) == 0:
+                return {
+                    "device_id": device_id,
+                    "status": "connected_but_no_data",
+                    "message": f"Connected to LMS4000 {device.ip_address}:{device.port}, but no LMDscandata received",
+                    "points": [],
+                }
+        else:
+            # Create temporary receiver
+            receiver = PicoscanReceiver(
+                listen_ip="0.0.0.0",
+                listen_port=device.port
             )
-        
-        # Try to receive data
-        segments = receiver.receive_segments(num_segments)
-        receiver.stop_listening()
-        
-        if not segments:
-            return {
-                "device_id": device_id,
-                "status": "listening_but_no_data",
-                "message": f"Port {device.port} is open and listening, but no data from Picoscan",
-                "info": "Check Picoscan settings - ensure it's configured to send UDP to this PC",
-                "points": []
-            }
-        
-        # Convert to point cloud
-        segment_list = _extract_segments(segments)
-        points = receiver.segments_to_point_cloud(segment_list)
+            # Start listening
+            if not receiver.start_listening():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to listen on port {device.port}"
+                )
+            # Try to receive data
+            segments = receiver.receive_segments(num_segments)
+            receiver.stop_listening()
+            if not segments:
+                return {
+                    "device_id": device_id,
+                    "status": "listening_but_no_data",
+                    "message": f"Port {device.port} is open and listening, but no data from Picoscan",
+                    "info": "Check Picoscan settings - ensure it's configured to send UDP to this PC",
+                    "points": []
+                }
+            # Convert to point cloud
+            segment_list = _extract_segments(segments)
+            points = receiver.segments_to_point_cloud(segment_list)
         
         # Convert numpy array to list for JSON serialization
         if hasattr(points, 'tolist'):
@@ -870,17 +866,23 @@ async def live_preview(device_id: str, request: Request):
             # Check if receiver already exists (from auto-start)
             receiver_info = receiver_manager.receivers.get(device_id)
             
+            device_type = str(getattr(device, "device_type", "picoscan") or "picoscan").lower()
             if not receiver_info:
                 # No active receiver - create temporary one
-                receiver = PicoscanReceiver(
-                    listen_ip="0.0.0.0",
-                    listen_port=device.port
-                )
-                
-                # Try to start listening
-                if not receiver.start_listening():
-                    yield f"data: {json.dumps({'error': 'Failed to start listening on port ' + str(device.port)})}\n\n"
-                    return
+                if device_type == "lms4000":
+                    receiver = Lms4000Receiver(sensor_ip=device.ip_address, sensor_port=device.port)
+                    if not receiver.start_listening():
+                        yield f"data: {json.dumps({'error': 'Failed to connect LMS4000 ' + str(device.ip_address) + ':' + str(device.port)})}\n\n"
+                        return
+                else:
+                    receiver = PicoscanReceiver(
+                        listen_ip="0.0.0.0",
+                        listen_port=device.port
+                    )
+                    # Try to start listening
+                    if not receiver.start_listening():
+                        yield f"data: {json.dumps({'error': 'Failed to start listening on port ' + str(device.port)})}\n\n"
+                        return
                 
                 own_receiver = True
             else:
@@ -898,41 +900,50 @@ async def live_preview(device_id: str, request: Request):
                 frame_count = 0
                 while True:
                     try:
-                        # Receive one segment at a time
-                        # Determine segments per scan (device-specific or default)
-                        segments_per_scan = None
-                        try:
-                            device = device_manager.get_device(device_id)
-                            segments_per_scan = (
-                                getattr(device, 'segments_per_scan', None)
-                                or device_manager.point_cloud_settings.get("segments_per_scan")
-                            )
-                        except Exception:
+                        if not own_receiver:
+                            latest = receiver_manager.get_latest_point_cloud(device_id)
+                            if not latest or latest.get("points") is None or len(latest.get("points")) == 0:
+                                yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
+                                await asyncio.sleep(0.05)
+                                continue
+                            points = latest["points"]
+                            frame_number = latest.get("frame")
+                        elif device_type == "lms4000":
+                            points = receiver.receive_point_cloud(2)
+                            if points is None or len(points) == 0:
+                                yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
+                                await asyncio.sleep(0.05)
+                                continue
+                            frame_number = None
+                        else:
                             segments_per_scan = None
-
-                        segments_to_get = segments_per_scan or 1
-                        segments = receiver.receive_segments(num_segments=segments_to_get)
-                        if not segments:
-                            # Heartbeat to keep SSE alive, but do not clear points on client
-                            yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
-                            await asyncio.sleep(0.05)
-                            continue
-
-                        segment_list = _extract_segments(segments)
-                        points = receiver.segments_to_point_cloud(segment_list)
+                            try:
+                                device = device_manager.get_device(device_id)
+                                segments_per_scan = (
+                                    getattr(device, 'segments_per_scan', None)
+                                    or device_manager.point_cloud_settings.get("segments_per_scan")
+                                )
+                            except Exception:
+                                segments_per_scan = None
+                            segments_to_get = segments_per_scan or 1
+                            segments = receiver.receive_segments(num_segments=segments_to_get)
+                            if not segments:
+                                yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
+                                await asyncio.sleep(0.05)
+                                continue
+                            segment_list = _extract_segments(segments)
+                            points = receiver.segments_to_point_cloud(segment_list)
+                            frame_number = None
+                            try:
+                                if segment_list and segment_list[0].get("Modules"):
+                                    frame_number = segment_list[0]["Modules"][0].get("FrameNumber")
+                            except Exception:
+                                frame_number = None
                         
                         if hasattr(points, 'tolist'):
                             points_list = points.tolist()
                         else:
                             points_list = list(points)
-
-                        # Prefer frame number from segment if available
-                        frame_number = None
-                        try:
-                            if segment_list and segment_list[0].get("Modules"):
-                                frame_number = segment_list[0]["Modules"][0].get("FrameNumber")
-                        except Exception:
-                            frame_number = None
 
                         frame_count += 1
                         data = {

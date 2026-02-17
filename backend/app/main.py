@@ -15,14 +15,28 @@ from app.services.tcp_notifier import TcpNotifier
 from app.services.tdc_trigger_monitor import TdcTriggerMonitor
 from app.core.device_manager import device_manager
 
+class _ConsoleSanitizeFilter(logging.Filter):
+    """Strip control chars from console logs to avoid blank/noisy output."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        cleaned = "".join(ch if 32 <= ord(ch) <= 126 else " " for ch in msg)
+        record.msg = cleaned
+        record.args = ()
+        return True
+
+
 # Configure logging
+_file_handler = logging.FileHandler(settings.log_file)
+_stream_handler = logging.StreamHandler()
+_stream_handler.addFilter(_ConsoleSanitizeFilter())
+
 logging.basicConfig(
     level=settings.log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(settings.log_file),
-        logging.StreamHandler()
-    ]
+    handlers=[_file_handler, _stream_handler]
 )
 
 logger = logging.getLogger(__name__)
@@ -100,7 +114,14 @@ async def startup_event():
                 # address is not assigned to a local interface (WinError 10049).
                 listen_ip = "0.0.0.0"
                 # Pass per-device segments_per_scan if configured
-                receiver_manager.start_listening(device.device_id, listen_ip, device.port, segments_per_scan=getattr(device, 'segments_per_scan', None))
+                receiver_manager.start_listening(
+                    device.device_id,
+                    listen_ip,
+                    device.port,
+                    segments_per_scan=getattr(device, 'segments_per_scan', None),
+                    device_type=getattr(device, 'device_type', 'picoscan'),
+                    sensor_ip=getattr(device, 'ip_address', None),
+                )
     except Exception as e:
         logger.error(f"Error during startup: {e}")
 

@@ -11,6 +11,9 @@ class DeviceCreate(BaseModel):
     name: str
     ip_address: str
     port: int = 2111
+    device_type: str = "picoscan"
+    protocol: str | None = None
+    format_type: str | None = None
     enabled: bool = True
     segments_per_scan: int | None = None
     calibration: CalibrationData
@@ -23,7 +26,12 @@ class DeviceCreate(BaseModel):
 
 class DeviceUpdate(BaseModel):
     name: Optional[str] = None
+    ip_address: Optional[str] = None
+    port: Optional[int] = None
     enabled: Optional[bool] = None
+    device_type: Optional[str] = None
+    protocol: Optional[str] = None
+    format_type: Optional[str] = None
     segments_per_scan: Optional[int] = None
     calibration: Optional[CalibrationData] = None
     frame_corner: Optional[str] = None
@@ -38,6 +46,9 @@ class DeviceResponse(BaseModel):
     name: str
     ip_address: str
     port: int
+    device_type: str = "picoscan"
+    protocol: str | None = None
+    format_type: str | None = None
     enabled: bool
     connection_status: str
     calibration: CalibrationData
@@ -51,6 +62,7 @@ class DeviceResponse(BaseModel):
 
 class AutoCalibrationRequest(BaseModel):
     device_ids: List[str]
+    reference_device_id: Optional[str] = None
     method: str = "icp"
     max_iterations: int = 50
 
@@ -88,10 +100,13 @@ class AnalysisSettings(BaseModel):
     active_app: str  # "log" | "conveyor_object"
     log_window_profiles: int | None = None
     log_min_points: int | None = None
+    conveyor_localization_algorithm: str | None = None  # "object_cloud_bbox" | "box_top_plane"
     conveyor_plane_quantile: float | None = None
     conveyor_plane_inlier_mm: float | None = None
     conveyor_object_min_height_mm: float | None = None
     conveyor_object_max_points: int | None = None
+    conveyor_top_plane_quantile: float | None = None
+    conveyor_top_plane_inlier_mm: float | None = None
     conveyor_denoise_enabled: bool | None = None
     conveyor_denoise_cell_mm: float | None = None
     conveyor_denoise_min_points_per_cell: int | None = None

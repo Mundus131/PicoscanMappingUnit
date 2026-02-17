@@ -5,6 +5,48 @@
       "name": "Picoscan123",
       "ip_address": "192.168.0.1",
       "port": 2115,
+      "device_type": "picoscan",
+      "protocol": "udp",
+      "format_type": "compact",
+      "enabled": true,
+      "connection_status": "disconnected",
+      "calibration": {
+        "translation": [
+          1081.3091562297432,
+          0.0,
+          286.52937051848676
+        ],
+        "rotation_deg": [
+          0.0,
+          53.606382481564566,
+          180.0
+        ],
+        "scale": 1.0
+      },
+      "frame_corner": "top-right",
+      "frame_position": [
+        1.0813091562297432,
+        0.28652937051848676,
+        0.0
+      ],
+      "frame_rotation_deg": [
+        0.0,
+        0.0,
+        53.606382481564566
+      ],
+      "segments_per_scan": null,
+      "acquisition_mode": "continuous",
+      "encoder_enabled": false,
+      "speed_profile": "fixed"
+    },
+    {
+      "device_id": "LMS_1770807524479",
+      "name": "LM4000",
+      "ip_address": "192.168.0.2",
+      "port": 2111,
+      "device_type": "lms4000",
+      "protocol": "tcp",
+      "format_type": "lmdscandata",
       "enabled": true,
       "connection_status": "disconnected",
       "calibration": {
@@ -61,10 +103,13 @@
     "active_app": "conveyor_object",
     "log_window_profiles": 10,
     "log_min_points": 50,
+    "conveyor_localization_algorithm": "object_cloud_bbox",
     "conveyor_plane_quantile": 0.4,
     "conveyor_plane_inlier_mm": 2.0,
     "conveyor_object_min_height_mm": 8.0,
     "conveyor_object_max_points": 60000,
+    "conveyor_top_plane_quantile": 0.88,
+    "conveyor_top_plane_inlier_mm": 5.0,
     "conveyor_denoise_enabled": true,
     "conveyor_denoise_cell_mm": 20.0,
     "conveyor_denoise_min_points_per_cell": 5,

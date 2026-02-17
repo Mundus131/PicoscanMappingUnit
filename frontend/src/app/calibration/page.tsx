@@ -12,6 +12,9 @@ interface Device {
   name: string;
   ip_address: string;
   port: number;
+  device_type?: 'picoscan' | 'lms4000';
+  protocol?: string | null;
+  format_type?: string | null;
   enabled: boolean;
   connection_status?: string;
   calibration: {
@@ -45,11 +48,13 @@ interface IoStateResponse {
 export default function CalibrationPage() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [referenceDeviceId, setReferenceDeviceId] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [previewActive, setPreviewActive] = useState(false);
   const [previewPoints, setPreviewPoints] = useState<number[][]>([]);
   const [autoResult, setAutoResult] = useState<any>(null);
   const previewRef = useRef<PointCloudThreeViewerHandle | null>(null);
+  const previewFitDoneRef = useRef(false);
 
   // System configurator fields
   const [frameWidth, setFrameWidth] = useState(2.0); // meters
@@ -111,6 +116,9 @@ export default function CalibrationPage() {
     name: '',
     ip_address: '',
     port: 2115,
+    device_type: 'picoscan' as 'picoscan' | 'lms4000',
+    protocol: 'udp',
+    format_type: 'compact',
     enabled: true,
     calibration: {
       translation: [0, 0, 0],
@@ -490,19 +498,48 @@ export default function CalibrationPage() {
   }, [devices, selectedIds]);
 
   useEffect(() => {
+    if (selectedIds.length === 0) {
+      setReferenceDeviceId('');
+      return;
+    }
+    if (!referenceDeviceId || !selectedIds.includes(referenceDeviceId)) {
+      setReferenceDeviceId(selectedIds[0]);
+    }
+  }, [selectedIds, referenceDeviceId]);
+
+  useEffect(() => {
     if (!previewActive || selectedIds.length === 0) return;
+    previewFitDoneRef.current = false;
 
     const fetchPreview = async () => {
-      const res = await api.get(`/calibration/preview`, {
-        params: { device_ids: selectedIds.join(','), max_points: 20000 },
-      });
-      setPreviewPoints(res.data?.points || []);
+      try {
+        const res = await api.get(`/calibration/preview`, {
+          params: { device_ids: selectedIds.join(','), max_points: 20000 },
+        });
+        setPreviewPoints(res.data?.points || []);
+      } catch {
+        setPreviewPoints([]);
+      }
     };
 
     fetchPreview();
     const interval = setInterval(fetchPreview, 800);
     return () => clearInterval(interval);
   }, [previewActive, selectedIds]);
+
+  useEffect(() => {
+    if (!previewActive) {
+      previewFitDoneRef.current = false;
+      return;
+    }
+    if (previewPoints.length === 0) return;
+    if (previewFitDoneRef.current) return;
+    previewFitDoneRef.current = true;
+    setTimeout(() => {
+      previewRef.current?.resetView();
+      previewRef.current?.fitToPoints();
+    }, 100);
+  }, [previewActive, previewPoints]);
 
   // Disable auto reset/fit for live preview (manual control only)
 
@@ -511,6 +548,9 @@ export default function CalibrationPage() {
       setEditingDevice(device);
       setFormData({
         ...device,
+        device_type: (device.device_type === 'lms4000' ? 'lms4000' : 'picoscan'),
+        protocol: device.protocol || (device.device_type === 'lms4000' ? 'tcp' : 'udp'),
+        format_type: device.format_type || (device.device_type === 'lms4000' ? 'lmdscandata' : 'compact'),
         frame_corner: device.frame_corner || 'bottom-left',
         frame_position: device.frame_position || [0, 0, 0],
         frame_rotation_deg: device.frame_rotation_deg || [0, 0, 0],
@@ -522,6 +562,9 @@ export default function CalibrationPage() {
         name: '',
         ip_address: '',
         port: 2115,
+        device_type: 'picoscan',
+        protocol: 'udp',
+        format_type: 'compact',
         enabled: true,
         calibration: {
           translation: [0, 0, 0],
@@ -590,10 +633,14 @@ export default function CalibrationPage() {
 
   const runAutoCalibration = async () => {
     if (selectedIds.length === 0) return;
+    const ref = referenceDeviceId && selectedIds.includes(referenceDeviceId)
+      ? referenceDeviceId
+      : selectedIds[0];
     setLoading(true);
     try {
       const res = await api.post('/calibration/auto', {
         device_ids: selectedIds,
+        reference_device_id: ref,
         method: 'icp',
         max_iterations: 50,
       });
@@ -1235,6 +1282,22 @@ export default function CalibrationPage() {
                 ))}
               </select>
               <div className="mt-3 flex gap-2">
+                <div className="min-w-[220px]">
+                  <label className="text-xs text-gray-600">Reference device</label>
+                  <select
+                    className="input mt-1"
+                    value={referenceDeviceId}
+                    onChange={(e) => setReferenceDeviceId(e.target.value)}
+                  >
+                    {devices
+                      .filter((d) => selectedIds.includes(d.device_id))
+                      .map((d) => (
+                        <option key={d.device_id} value={d.device_id}>
+                          {d.name || d.device_id}
+                        </option>
+                      ))}
+                  </select>
+                </div>
                 <button className="btn-primary" onClick={runAutoCalibration} disabled={loading || selectedIds.length === 0}>
                   <Wand2 size={14} />
                   Auto-Calibration (ICP)
@@ -1321,12 +1384,31 @@ export default function CalibrationPage() {
                     onChange={(e) => setFormData({ ...formData, device_id: e.target.value })}
                   />
                 )}
+                <div>
+                  <label className="text-xs text-gray-600">Device type</label>
+                  <select
+                    className="input mt-1"
+                    value={formData.device_type}
+                    onChange={(e) => {
+                      const nextType = e.target.value as 'picoscan' | 'lms4000';
+                      setFormData({
+                        ...formData,
+                        device_type: nextType,
+                        protocol: nextType === 'lms4000' ? 'tcp' : 'udp',
+                        format_type: nextType === 'lms4000' ? 'lmdscandata' : 'compact',
+                        port: nextType === 'lms4000' ? 2111 : 2115,
+                      });
+                    }}
+                  >
+                    <option value="picoscan">Picoscan (UDP compact)</option>
+                    <option value="lms4000">LMS4000 (TCP LMDscandata)</option>
+                  </select>
+                </div>
                 <input
                   className="input"
-                  placeholder="IP Address"
+                  placeholder={formData.device_type === 'lms4000' ? 'Sensor IP Address' : 'IP Address'}
                   value={formData.ip_address}
                   onChange={(e) => setFormData({ ...formData, ip_address: e.target.value })}
-                  disabled={!!editingDevice}
                 />
                 <input
                   className="input"
@@ -1334,7 +1416,6 @@ export default function CalibrationPage() {
                   placeholder="Port"
                   value={formData.port.toString()}
                   onChange={(e) => setFormData({ ...formData, port: parseInt(e.target.value) })}
-                  disabled={!!editingDevice}
                 />
               </div>
               <div className="space-y-4">

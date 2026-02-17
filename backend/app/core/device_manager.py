@@ -10,13 +10,16 @@ logger = logging.getLogger(__name__)
 
 
 class PicoscanDevice:
-    """Represents a single Picoscan device"""
+    """Represents a single sensor device"""
     
     def __init__(self, device_config: dict):
         self.device_id = device_config.get("device_id")
         self.name = device_config.get("name")
         self.ip_address = device_config.get("ip_address")
         self.port = device_config.get("port", 2111)
+        self.device_type = (device_config.get("device_type") or "picoscan").lower()
+        self.protocol = device_config.get("protocol") or ("tcp" if self.device_type == "lms4000" else "udp")
+        self.format_type = device_config.get("format_type") or ("lmdscandata" if self.device_type == "lms4000" else "compact")
         self.enabled = device_config.get("enabled", True)
         # Number of segments that make up a full scan for this device
         # If None, system-wide/default value will be used
@@ -39,6 +42,9 @@ class PicoscanDevice:
             "name": self.name,
             "ip_address": self.ip_address,
             "port": self.port,
+            "device_type": self.device_type,
+            "protocol": self.protocol,
+            "format_type": self.format_type,
             "enabled": self.enabled,
             "connection_status": self.connection_status,
             "calibration": self.calibration,
@@ -109,6 +115,8 @@ class DeviceManager:
                 self.analysis_settings["log_window_profiles"] = 10
             if "log_min_points" not in self.analysis_settings:
                 self.analysis_settings["log_min_points"] = 50
+            if "conveyor_localization_algorithm" not in self.analysis_settings:
+                self.analysis_settings["conveyor_localization_algorithm"] = "object_cloud_bbox"
             if "conveyor_plane_quantile" not in self.analysis_settings:
                 self.analysis_settings["conveyor_plane_quantile"] = 0.35
             if "conveyor_plane_inlier_mm" not in self.analysis_settings:
@@ -117,6 +125,10 @@ class DeviceManager:
                 self.analysis_settings["conveyor_object_min_height_mm"] = 8.0
             if "conveyor_object_max_points" not in self.analysis_settings:
                 self.analysis_settings["conveyor_object_max_points"] = 60000
+            if "conveyor_top_plane_quantile" not in self.analysis_settings:
+                self.analysis_settings["conveyor_top_plane_quantile"] = 0.88
+            if "conveyor_top_plane_inlier_mm" not in self.analysis_settings:
+                self.analysis_settings["conveyor_top_plane_inlier_mm"] = 4.0
             if "conveyor_denoise_enabled" not in self.analysis_settings:
                 self.analysis_settings["conveyor_denoise_enabled"] = True
             if "conveyor_denoise_cell_mm" not in self.analysis_settings:
@@ -219,6 +231,12 @@ class DeviceManager:
             device.name = device_config.get("name", device.name)
             device.ip_address = device_config.get("ip_address", device.ip_address)
             device.port = device_config.get("port", device.port)
+            if "device_type" in device_config and device_config.get("device_type"):
+                device.device_type = str(device_config.get("device_type")).lower()
+            if "protocol" in device_config and device_config.get("protocol"):
+                device.protocol = str(device_config.get("protocol")).lower()
+            if "format_type" in device_config and device_config.get("format_type"):
+                device.format_type = str(device_config.get("format_type")).lower()
             device.enabled = device_config.get("enabled", device.enabled)
             # Allow updating segments_per_scan per-device
             if "segments_per_scan" in device_config:

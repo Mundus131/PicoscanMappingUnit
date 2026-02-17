@@ -5,6 +5,9 @@ PC jest SERWEREM, Picoscan wysyła dane UDP
 import logging
 from typing import Optional, List, Tuple
 import numpy as np
+import threading
+import time
+from app.services.lms4000_receiver import Lms4000Receiver
 
 # Importy z ScanSegmentAPI
 try:
@@ -190,15 +193,6 @@ class PicoscanReceiver:
         points = []
         
         try:
-            # DEBUG: Log angle ranges from first segment to diagnose coordinate issues
-            if not hasattr(self, '_angle_logged'):
-                first_module = segment.get("Modules", [{}])[0]
-                phi_list = first_module.get("Phi", [])
-                theta_start_list = first_module.get("ThetaStart", [])
-                theta_stop_list = first_module.get("ThetaStop", [])
-                logger.warning(f"ANGLES DEBUG: Phi={phi_list}, ThetaStart={theta_start_list[:3]}, ThetaStop={theta_stop_list[:3]}")
-                self._angle_logged = True
-            
             for module_idx, module in enumerate(segment.get("Modules", [])):
                 # Get angles for this module
                 phi_list = module.get("Phi", [0.0])
@@ -265,13 +259,23 @@ class PicoscanReceiverManager:
     
     def __init__(self):
         self.receivers: dict = {}
-    
+        self._worker_threads: dict[str, threading.Thread] = {}
+        self._worker_stops: dict[str, threading.Event] = {}
+
     def add_receiver(self, device_id: str, receiver: PicoscanReceiver) -> bool:
         """Add receiver"""
         self.receivers[device_id] = receiver
         return True
     
-    def start_listening(self, device_id: str, listen_ip: str = "0.0.0.0", listen_port: int = 2115, segments_per_scan: int = None) -> bool:
+    def start_listening(
+        self,
+        device_id: str,
+        listen_ip: str = "0.0.0.0",
+        listen_port: int = 2115,
+        segments_per_scan: int = None,
+        device_type: str = "picoscan",
+        sensor_ip: str | None = None,
+    ) -> bool:
         """Start listening for a specific device"""
         try:
             # If receiver already exists and is listening, skip starting another
@@ -282,13 +286,50 @@ class PicoscanReceiverManager:
                 if isinstance(existing, PicoscanReceiver) and existing.connected:
                     return True
 
+            dev_type = (device_type or "picoscan").lower()
+            if dev_type == "lms4000":
+                if not sensor_ip:
+                    logger.error("Missing sensor_ip for LMS4000 receiver %s", device_id)
+                    return False
+                receiver = Lms4000Receiver(sensor_ip=sensor_ip, sensor_port=listen_port)
+                ok = receiver.start_listening()
+                if ok:
+                    logger.info("Listening for LMS4000 on TCP %s:%s (%s)", sensor_ip, listen_port, device_id)
+                    self.receivers[device_id] = {
+                        "receiver": receiver,
+                        "type": "lms4000",
+                        "listening": True,
+                        "listen_ip": sensor_ip,
+                        "listen_port": listen_port,
+                        "segments": [],
+                        "segments_per_scan": 2,
+                        "latest_points": None,
+                        "latest_update_ts": None,
+                        "frame_counter": 0,
+                        "lock": threading.Lock(),
+                    }
+                    self._start_worker(device_id)
+                return ok
+
             receiver = PicoscanReceiver(listen_ip, listen_port)
             if receiver.start_listening():
                 # Store optional segments_per_scan provided from device config
-                self.receivers[device_id] = {"receiver": receiver, "listening": True, "listen_ip": listen_ip, "listen_port": listen_port, "segments": [], "segments_per_scan": segments_per_scan}
+                self.receivers[device_id] = {
+                    "receiver": receiver,
+                    "type": "picoscan",
+                    "listening": True,
+                    "listen_ip": listen_ip,
+                    "listen_port": listen_port,
+                    "segments": [],
+                    "segments_per_scan": segments_per_scan,
+                    "latest_points": None,
+                    "latest_update_ts": None,
+                    "frame_counter": 0,
+                    "lock": threading.Lock(),
+                }
+                self._start_worker(device_id)
                 return True
-            else:
-                return False
+            return False
         except Exception as e:
             logger.error(f"Error starting listening for {device_id}: {e}")
             return False
@@ -296,6 +337,12 @@ class PicoscanReceiverManager:
     def stop_listening(self, device_id: str) -> bool:
         """Stop listening for a specific device"""
         try:
+            stop_event = self._worker_stops.pop(device_id, None)
+            if stop_event:
+                stop_event.set()
+            worker = self._worker_threads.pop(device_id, None)
+            if worker and worker.is_alive():
+                worker.join(timeout=1.0)
             if device_id in self.receivers:
                 receiver_info = self.receivers[device_id]
                 if isinstance(receiver_info, dict) and "receiver" in receiver_info:
@@ -325,23 +372,91 @@ class PicoscanReceiverManager:
         for device_id in list(self.receivers.keys()):
             results[device_id] = self.stop_listening(device_id)
         return results
+
+    def _start_worker(self, device_id: str):
+        if device_id in self._worker_threads:
+            w = self._worker_threads[device_id]
+            if w.is_alive():
+                return
+        stop_event = threading.Event()
+        self._worker_stops[device_id] = stop_event
+        worker = threading.Thread(target=self._worker_loop, args=(device_id, stop_event), daemon=True)
+        self._worker_threads[device_id] = worker
+        worker.start()
+
+    def _worker_loop(self, device_id: str, stop_event: threading.Event):
+        while not stop_event.is_set():
+            info = self.receivers.get(device_id)
+            if not isinstance(info, dict):
+                time.sleep(0.05)
+                continue
+            if not info.get("listening"):
+                time.sleep(0.05)
+                continue
+            receiver = info.get("receiver")
+            if not receiver or not getattr(receiver, "connected", False):
+                time.sleep(0.05)
+                continue
+            rtype = str(info.get("type") or "picoscan").lower()
+            try:
+                points = None
+                if rtype == "lms4000" and hasattr(receiver, "receive_point_cloud"):
+                    scans_to_request = info.get("segments_per_scan") or 2
+                    points = receiver.receive_point_cloud(int(scans_to_request))
+                else:
+                    segments_to_request = info.get("segments_per_scan") or 1
+                    segments = receiver.receive_segments(segments_to_request)
+                    if segments:
+                        segment_payload = segments[0] if isinstance(segments, tuple) else segments
+                        segment_list = segment_payload if isinstance(segment_payload, list) else [segment_payload]
+                        points = receiver.segments_to_point_cloud(segment_list)
+
+                if points is not None and len(points) > 0:
+                    lock = info.get("lock")
+                    if lock is None:
+                        info["latest_points"] = points
+                        info["latest_update_ts"] = time.time()
+                        info["frame_counter"] = int(info.get("frame_counter", 0) + 1)
+                    else:
+                        with lock:
+                            info["latest_points"] = np.array(points, copy=True)
+                            info["latest_update_ts"] = time.time()
+                            info["frame_counter"] = int(info.get("frame_counter", 0) + 1)
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                logger.debug("Receiver worker error [%s]: %s", device_id, e)
+                time.sleep(0.05)
+
+    def get_latest_point_cloud(self, device_id: str):
+        info = self.receivers.get(device_id)
+        if not isinstance(info, dict):
+            return None
+        lock = info.get("lock")
+        pts = None
+        frame = int(info.get("frame_counter", 0))
+        ts = info.get("latest_update_ts")
+        if lock is None:
+            pts = info.get("latest_points")
+        else:
+            with lock:
+                src = info.get("latest_points")
+                if src is not None:
+                    pts = np.array(src, copy=True)
+        if pts is None:
+            return None
+        return {
+            "points": pts,
+            "frame": frame,
+            "timestamp": ts,
+        }
     
     def get_point_clouds(self, num_segments: int = 1) -> dict:
         """Get point clouds from all receivers"""
         point_clouds = {}
         for device_id, receiver_info in self.receivers.items():
             if isinstance(receiver_info, dict) and receiver_info.get("listening"):
-                receiver = receiver_info.get("receiver")
-                if receiver and receiver.connected:
-                    # Determine segments to request: prefer per-receiver setting, otherwise use provided num_segments
-                    segments_to_request = receiver_info.get("segments_per_scan") or num_segments or 10
-                    try:
-                        segments = receiver.receive_segments(segments_to_request)
-                    except Exception:
-                        segments = receiver.receive_segments(num_segments)
-                    if segments:
-                        # Normalize segments tuple to list
-                        segment_payload = segments[0] if isinstance(segments, tuple) else segments
-                        segment_list = segment_payload if isinstance(segment_payload, list) else [segment_payload]
-                        point_clouds[device_id] = receiver.segments_to_point_cloud(segment_list)
+                latest = self.get_latest_point_cloud(device_id)
+                if latest and latest.get("points") is not None and len(latest["points"]) > 0:
+                    point_clouds[device_id] = latest["points"]
         return point_clouds
