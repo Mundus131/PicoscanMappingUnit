@@ -5,7 +5,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
-import { Plus, Edit, Trash2, X, Eye, Wand2 } from 'lucide-react';
+import { Plus, Edit, Trash2, X, Wand2 } from 'lucide-react';
 
 interface Device {
   device_id: string;
@@ -45,6 +45,42 @@ interface IoStateResponse {
   states: Record<string, { state: number | null; label: string }>;
 }
 
+interface TdcStatusResponse {
+  poll_interval_ms?: number | null;
+  grpc_available?: boolean | null;
+  token?: { has_token?: boolean | null } | null;
+  input_state?: number | null;
+  encoder_port?: string | null;
+}
+
+interface LiveAdjustment {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+}
+
+interface AutoCalibrationResultItem {
+  device_id: string;
+  translation: number[];
+  rotation_deg: number[];
+  scale: number;
+  score?: number | null;
+}
+
+interface AutoCalibrationResponsePayload {
+  method: string;
+  saved?: boolean;
+  results: AutoCalibrationResultItem[];
+}
+
+interface RegionRectNorm {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 export default function CalibrationPage() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -52,17 +88,52 @@ export default function CalibrationPage() {
   const [loading, setLoading] = useState(false);
   const [previewActive, setPreviewActive] = useState(false);
   const [previewPoints, setPreviewPoints] = useState<number[][]>([]);
-  const [autoResult, setAutoResult] = useState<any>(null);
+  const [previewVisibleIds, setPreviewVisibleIds] = useState<string[]>([]);
+  const [previewDeviceId, setPreviewDeviceId] = useState<string>('');
+  const [liveAdjustments, setLiveAdjustments] = useState<Record<string, LiveAdjustment>>({});
+  const liveAdjustSaveTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const [autoResult, setAutoResult] = useState<AutoCalibrationResponsePayload | null>(null);
   const previewRef = useRef<PointCloudThreeViewerHandle | null>(null);
   const previewFitDoneRef = useRef(false);
+  const previewRequestInFlightRef = useRef(false);
+  const previewPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewViewportRef = useRef<HTMLDivElement | null>(null);
+  const regionDragRef = useRef<{
+    mode: 'move' | 'nw' | 'ne' | 'sw' | 'se';
+    startX: number;
+    startY: number;
+    startRect: RegionRectNorm;
+  } | null>(null);
 
   // System configurator fields
   const [frameWidth, setFrameWidth] = useState(2.0); // meters
   const [frameHeight, setFrameHeight] = useState(1.2); // meters
   const [originMode, setOriginMode] = useState<'center' | 'bottom-left' | 'front-left'>('center');
+  const [clipPointsToFrame, setClipPointsToFrame] = useState(false);
   const [frameSaving, setFrameSaving] = useState(false);
   const [frameDirty, setFrameDirty] = useState(false);
   const [frameSavedAt, setFrameSavedAt] = useState<number | null>(null);
+  const [frameSaveError, setFrameSaveError] = useState<string | null>(null);
+  const [previewRefreshTick, setPreviewRefreshTick] = useState(0);
+  const [autoCalibSaveResult, setAutoCalibSaveResult] = useState(false);
+  const [previewAutoCalibrationEnabled, setPreviewAutoCalibrationEnabled] = useState(false);
+  const [previewEdgeFilterEnabled, setPreviewEdgeFilterEnabled] = useState(false);
+  const [previewEdgeCurvatureThreshold, setPreviewEdgeCurvatureThreshold] = useState(0.08);
+  const [previewVoxelDenoiseEnabled, setPreviewVoxelDenoiseEnabled] = useState(false);
+  const [previewVoxelCellMm, setPreviewVoxelCellMm] = useState(8);
+  const [previewVoxelMinPointsPerCell, setPreviewVoxelMinPointsPerCell] = useState(3);
+  const [previewVoxelKeepLargestComponent, setPreviewVoxelKeepLargestComponent] = useState(false);
+  const [previewRegionEnabled, setPreviewRegionEnabled] = useState(false);
+  const [previewRegionRect, setPreviewRegionRect] = useState<RegionRectNorm>({ x0: 0.2, y0: 0.15, x1: 0.8, y1: 0.85 });
+  const [previewOrthogonalFilterEnabled, setPreviewOrthogonalFilterEnabled] = useState(false);
+  const [previewOrthogonalToleranceDeg, setPreviewOrthogonalToleranceDeg] = useState(12);
+  const [previewNoiseFilterEnabled, setPreviewNoiseFilterEnabled] = useState(false);
+  const [previewNoiseFilterK, setPreviewNoiseFilterK] = useState(16);
+  const [previewNoiseFilterStdRatio, setPreviewNoiseFilterStdRatio] = useState(1.2);
+  const [autoCalibApplying, setAutoCalibApplying] = useState(false);
+  const [autoCalibCandidateMap, setAutoCalibCandidateMap] = useState<Record<string, { translation: number[]; rotation_deg: number[]; scale: number }>>({});
+  const [previewFilterSaving, setPreviewFilterSaving] = useState(false);
+  const [previewFilterSavedAt, setPreviewFilterSavedAt] = useState<number | null>(null);
   const [motionMode, setMotionMode] = useState<'fixed' | 'encoder'>('fixed');
   const [fixedSpeed, setFixedSpeed] = useState(0.5);
   const [profilingDistance, setProfilingDistance] = useState(10);
@@ -95,7 +166,7 @@ export default function CalibrationPage() {
   const [tdcStopDelayMode, setTdcStopDelayMode] = useState<'time' | 'distance'>('time');
   const [tdcStopDelayMs, setTdcStopDelayMs] = useState(0);
   const [tdcStopDelayMm, setTdcStopDelayMm] = useState(0);
-  const [tdcStatus, setTdcStatus] = useState<any>(null);
+  const [tdcStatus, setTdcStatus] = useState<TdcStatusResponse | null>(null);
   const [acquisitionLiveStatus, setAcquisitionLiveStatus] = useState<AcquisitionLiveStatus | null>(null);
   const [ioState, setIoState] = useState<IoStateResponse | null>(null);
   const [tdcSaving, setTdcSaving] = useState(false);
@@ -105,6 +176,48 @@ export default function CalibrationPage() {
     width: frameWidth * 1000,
     height: frameHeight * 1000,
   }), [frameWidth, frameHeight]);
+
+  const toFramePositionFromCalibration = (translation: number[] | undefined) => {
+    const tx = Number(translation?.[0] ?? 0);
+    const ty = Number(translation?.[1] ?? 0);
+    const tz = Number(translation?.[2] ?? 0);
+    return {
+      x: tx / 1000.0,
+      y: tz / 1000.0,
+      z: ty / 1000.0,
+    };
+  };
+
+  const normalizedRegionRect = React.useMemo(() => {
+    const x0 = Math.max(0, Math.min(1, Math.min(previewRegionRect.x0, previewRegionRect.x1)));
+    const x1 = Math.max(0, Math.min(1, Math.max(previewRegionRect.x0, previewRegionRect.x1)));
+    const y0 = Math.max(0, Math.min(1, Math.min(previewRegionRect.y0, previewRegionRect.y1)));
+    const y1 = Math.max(0, Math.min(1, Math.max(previewRegionRect.y0, previewRegionRect.y1)));
+    return { x0, y0, x1, y1 };
+  }, [previewRegionRect]);
+
+  const previewRegionWorldBounds = React.useMemo(() => {
+    const widthMm = frameWidth * 1000.0;
+    const heightMm = frameHeight * 1000.0;
+    const xMin = originMode === 'center' ? -widthMm / 2.0 : 0.0;
+    const xMax = originMode === 'center' ? widthMm / 2.0 : widthMm;
+    const zMin = originMode === 'center' ? -heightMm / 2.0 : 0.0;
+    const zMax = originMode === 'center' ? heightMm / 2.0 : heightMm;
+    const spanX = xMax - xMin;
+    const spanZ = zMax - zMin;
+    const nxToX = (nx: number) => xMin + nx * spanX;
+    const nyToZ = (ny: number) => zMax - ny * spanZ;
+    const aX = nxToX(normalizedRegionRect.x0);
+    const bX = nxToX(normalizedRegionRect.x1);
+    const aZ = nyToZ(normalizedRegionRect.y0);
+    const bZ = nyToZ(normalizedRegionRect.y1);
+    return {
+      minX: Math.min(aX, bX),
+      maxX: Math.max(aX, bX),
+      minZ: Math.min(aZ, bZ),
+      maxZ: Math.max(aZ, bZ),
+    };
+  }, [frameWidth, frameHeight, originMode, normalizedRegionRect]);
 
   // Device management (moved from Settings)
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -243,6 +356,71 @@ export default function CalibrationPage() {
     setDevices(res.data || []);
   };
 
+  const getLiveAdjustmentFromDevice = (device: Device): LiveAdjustment => {
+    const pos = Array.isArray(device.frame_position) && device.frame_position.length >= 3
+      ? device.frame_position
+      : [0, 0, 0];
+    const rot = Array.isArray(device.frame_rotation_deg) && device.frame_rotation_deg.length >= 3
+      ? device.frame_rotation_deg
+      : [0, 0, 0];
+    return {
+      x: Number(pos[0] ?? 0),
+      y: Number(pos[1] ?? 0),
+      z: Number(pos[2] ?? 0),
+      yaw: Number(rot[2] ?? 0),
+    };
+  };
+
+  const buildCalibrationPayloadFromFrame = (framePosition: number[], frameRotationDeg: number[]) => {
+    const translationMmFrame = framePosition.map((v) => Number(v) * 1000);
+    const translationMmData = [translationMmFrame[0], translationMmFrame[2], translationMmFrame[1]];
+    const rotZ = Number(frameRotationDeg[2] ?? 0);
+    const rotData = [0, rotZ, 0];
+    return {
+      translation: translationMmData,
+      rotation_deg: rotData,
+      scale: 1.0,
+    };
+  };
+
+  const persistLiveAdjustment = async (deviceId: string, adjustment: LiveAdjustment) => {
+    const device = devices.find((d) => d.device_id === deviceId);
+    if (!device) return;
+    const framePosition = [adjustment.x, adjustment.y, adjustment.z];
+    const frameRotationDeg = [0, 0, adjustment.yaw];
+    const baseCalibration = device.calibration || { translation: [0, 0, 0], rotation_deg: [0, 0, 0], scale: 1.0 };
+
+    await api.put(`/devices/${deviceId}`, {
+      frame_position: framePosition,
+      frame_rotation_deg: frameRotationDeg,
+      calibration: {
+        ...baseCalibration,
+        ...buildCalibrationPayloadFromFrame(framePosition, frameRotationDeg),
+      },
+    });
+  };
+
+  const handleLiveAdjustmentChange = (deviceId: string, patch: Partial<LiveAdjustment>) => {
+    setLiveAdjustments((prev) => {
+      const current = prev[deviceId] || { x: 0, y: 0, z: 0, yaw: 0 };
+      const next = { ...current, ...patch };
+      const nextMap = { ...prev, [deviceId]: next };
+
+      if (liveAdjustSaveTimersRef.current[deviceId]) {
+        clearTimeout(liveAdjustSaveTimersRef.current[deviceId]);
+      }
+      liveAdjustSaveTimersRef.current[deviceId] = setTimeout(async () => {
+        try {
+          await persistLiveAdjustment(deviceId, next);
+        } catch (error) {
+          console.error(`Failed to persist live adjustment for ${deviceId}:`, error);
+        }
+      }, 250);
+
+      return nextMap;
+    });
+  };
+
   const refreshPing = async (ids: string[]) => {
     try {
       const results = await Promise.all(
@@ -270,6 +448,7 @@ export default function CalibrationPage() {
         setFrameWidth(res.data.width_m ?? 2.0);
         setFrameHeight(res.data.height_m ?? 1.2);
         setOriginMode(res.data.origin_mode ?? 'center');
+        setClipPointsToFrame(!!res.data.clip_points_to_frame);
         setFrameDirty(false);
       }
     } catch (error) {
@@ -358,6 +537,51 @@ export default function CalibrationPage() {
     }
   };
 
+  const loadPreviewFilterSettings = async () => {
+    try {
+      const res = await api.get('/calibration/preview-filter-settings');
+      const data = res.data || {};
+      setPreviewEdgeFilterEnabled(!!data.use_edge_filter);
+      if (typeof data.edge_curvature_threshold === 'number') {
+        setPreviewEdgeCurvatureThreshold(Number(data.edge_curvature_threshold));
+      }
+      setPreviewVoxelDenoiseEnabled(!!data.use_voxel_denoise);
+      if (typeof data.voxel_cell_mm === 'number') {
+        setPreviewVoxelCellMm(Number(data.voxel_cell_mm));
+      }
+      if (typeof data.voxel_min_points_per_cell === 'number') {
+        setPreviewVoxelMinPointsPerCell(Number(data.voxel_min_points_per_cell));
+      }
+      setPreviewVoxelKeepLargestComponent(!!data.voxel_keep_largest_component);
+      setPreviewRegionEnabled(!!data.use_region_filter);
+      if (Array.isArray(data.region_rect_norm) && data.region_rect_norm.length === 4) {
+        const [x0, y0, x1, y1] = data.region_rect_norm;
+        setPreviewRegionRect({
+          x0: Number(x0),
+          y0: Number(y0),
+          x1: Number(x1),
+          y1: Number(y1),
+        });
+      }
+      setPreviewOrthogonalFilterEnabled(!!data.use_orthogonal_filter);
+      if (typeof data.orthogonal_angle_tolerance_deg === 'number') {
+        setPreviewOrthogonalToleranceDeg(Number(data.orthogonal_angle_tolerance_deg));
+      }
+      setPreviewNoiseFilterEnabled(!!data.use_noise_filter);
+      if (typeof data.noise_filter_k === 'number') {
+        setPreviewNoiseFilterK(Number(data.noise_filter_k));
+      }
+      if (typeof data.noise_filter_std_ratio === 'number') {
+        setPreviewNoiseFilterStdRatio(Number(data.noise_filter_std_ratio));
+      }
+      if (Array.isArray(data.visible_device_ids)) {
+        setPreviewVisibleIds(data.visible_device_ids.map((v: unknown) => String(v)));
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const loadAcquisitionLiveStatus = async () => {
     try {
       const res = await api.get('/acquisition/trigger/status');
@@ -376,20 +600,40 @@ export default function CalibrationPage() {
     }
   };
 
-  async function handleSaveFrameSettings() {
+  async function handleSaveFrameSettings(overrides?: Partial<{ width_m: number; height_m: number; origin_mode: typeof originMode; clip_points_to_frame: boolean }>) {
     setFrameSaving(true);
+    setFrameSaveError(null);
     try {
+      const width = overrides?.width_m ?? frameWidth;
+      const height = overrides?.height_m ?? frameHeight;
+      const origin = overrides?.origin_mode ?? originMode;
+      const clip = overrides?.clip_points_to_frame ?? clipPointsToFrame;
+      const safeWidth = Number.isFinite(width) && width > 0 ? width : 2.0;
+      const safeHeight = Number.isFinite(height) && height > 0 ? height : 1.2;
       await api.put('/calibration/frame-settings', {
-        width_m: frameWidth,
-        height_m: frameHeight,
-        origin_mode: originMode,
+        width_m: safeWidth,
+        height_m: safeHeight,
+        origin_mode: origin,
+        clip_points_to_frame: clip,
       });
+      if (safeWidth !== frameWidth) setFrameWidth(safeWidth);
+      if (safeHeight !== frameHeight) setFrameHeight(safeHeight);
+      if (clip !== clipPointsToFrame) setClipPointsToFrame(clip);
       setFrameDirty(false);
       setFrameSavedAt(Date.now());
+      setPreviewRefreshTick((v) => v + 1);
+    } catch {
+      setFrameSaveError('Failed to save frame settings');
     } finally {
       setFrameSaving(false);
     }
   }
+
+  const handleToggleClipPoints = (nextChecked: boolean) => {
+    setClipPointsToFrame(nextChecked);
+    setFrameDirty(false);
+    void handleSaveFrameSettings({ clip_points_to_frame: nextChecked });
+  };
 
   async function handleSaveMotionSettings() {
     setMotionSaving(true);
@@ -451,12 +695,38 @@ export default function CalibrationPage() {
     }
   }
 
+  async function handleSavePreviewFilterSettings() {
+    setPreviewFilterSaving(true);
+    try {
+      await api.put('/calibration/preview-filter-settings', {
+        use_edge_filter: previewEdgeFilterEnabled,
+        edge_curvature_threshold: previewEdgeCurvatureThreshold,
+        use_voxel_denoise: previewVoxelDenoiseEnabled,
+        voxel_cell_mm: previewVoxelCellMm,
+        voxel_min_points_per_cell: previewVoxelMinPointsPerCell,
+        voxel_keep_largest_component: previewVoxelKeepLargestComponent,
+        use_region_filter: previewRegionEnabled,
+        region_rect_norm: [normalizedRegionRect.x0, normalizedRegionRect.y0, normalizedRegionRect.x1, normalizedRegionRect.y1],
+        use_orthogonal_filter: previewOrthogonalFilterEnabled,
+        orthogonal_angle_tolerance_deg: previewOrthogonalToleranceDeg,
+        use_noise_filter: previewNoiseFilterEnabled,
+        noise_filter_k: previewNoiseFilterK,
+        noise_filter_std_ratio: previewNoiseFilterStdRatio,
+        visible_device_ids: previewVisibleIds,
+      });
+      setPreviewFilterSavedAt(Date.now());
+    } finally {
+      setPreviewFilterSaving(false);
+    }
+  }
+
   useEffect(() => {
     loadDevices();
     loadFrameSettings();
     loadMotionSettings();
     loadAnalysisSettings();
     loadTdcSettings();
+    loadPreviewFilterSettings();
     loadTdcStatus();
     loadAcquisitionLiveStatus();
     loadIoState();
@@ -484,10 +754,10 @@ export default function CalibrationPage() {
   useEffect(() => {
     if (!frameDirty) return;
     const timer = setTimeout(() => {
-      handleSaveFrameSettings();
+      void handleSaveFrameSettings();
     }, 700);
     return () => clearTimeout(timer);
-  }, [frameWidth, frameHeight, originMode, frameDirty]);
+  }, [frameWidth, frameHeight, originMode, clipPointsToFrame, frameDirty]);
 
   useEffect(() => {
     if (devices.length === 0) return;
@@ -508,24 +778,117 @@ export default function CalibrationPage() {
   }, [selectedIds, referenceDeviceId]);
 
   useEffect(() => {
-    if (!previewActive || selectedIds.length === 0) return;
+    if (!previewActive || previewVisibleIds.length === 0) return;
     previewFitDoneRef.current = false;
+    let cancelled = false;
+    const pollMs = 900;
 
-    const fetchPreview = async () => {
+    const fetchPreview = async (): Promise<void> => {
+      if (cancelled || previewRequestInFlightRef.current) return;
+      previewRequestInFlightRef.current = true;
       try {
-        const res = await api.get(`/calibration/preview`, {
-          params: { device_ids: selectedIds.join(','), max_points: 20000 },
+        const res = await api.post('/calibration/preview', {
+          device_ids: previewVisibleIds,
+          max_points: 20000,
+          calibration_overrides:
+            previewAutoCalibrationEnabled && Object.keys(autoCalibCandidateMap).length > 0
+              ? autoCalibCandidateMap
+              : null,
+          use_edge_filter: previewEdgeFilterEnabled,
+          edge_curvature_threshold: previewEdgeCurvatureThreshold,
+          use_voxel_denoise: previewVoxelDenoiseEnabled,
+          voxel_cell_mm: previewVoxelCellMm,
+          voxel_min_points_per_cell: previewVoxelMinPointsPerCell,
+          voxel_keep_largest_component: previewVoxelKeepLargestComponent,
+          use_region_filter: previewRegionEnabled,
+          region_min_x_mm: previewRegionEnabled ? previewRegionWorldBounds.minX : null,
+          region_max_x_mm: previewRegionEnabled ? previewRegionWorldBounds.maxX : null,
+          region_min_z_mm: previewRegionEnabled ? previewRegionWorldBounds.minZ : null,
+          region_max_z_mm: previewRegionEnabled ? previewRegionWorldBounds.maxZ : null,
+          use_orthogonal_filter: previewOrthogonalFilterEnabled,
+          orthogonal_angle_tolerance_deg: previewOrthogonalToleranceDeg,
+          use_noise_filter: previewNoiseFilterEnabled,
+          noise_filter_k: previewNoiseFilterK,
+          noise_filter_std_ratio: previewNoiseFilterStdRatio,
         });
         setPreviewPoints(res.data?.points || []);
       } catch {
         setPreviewPoints([]);
+      } finally {
+        previewRequestInFlightRef.current = false;
+        if (!cancelled) {
+          previewPollTimerRef.current = setTimeout(() => {
+            void fetchPreview();
+          }, pollMs);
+        }
       }
     };
 
-    fetchPreview();
-    const interval = setInterval(fetchPreview, 800);
-    return () => clearInterval(interval);
-  }, [previewActive, selectedIds]);
+    void fetchPreview();
+    return () => {
+      cancelled = true;
+      if (previewPollTimerRef.current) {
+        clearTimeout(previewPollTimerRef.current);
+        previewPollTimerRef.current = null;
+      }
+      previewRequestInFlightRef.current = false;
+    };
+  }, [
+    previewActive,
+    previewVisibleIds,
+    previewRefreshTick,
+    previewAutoCalibrationEnabled,
+    autoCalibCandidateMap,
+    previewEdgeFilterEnabled,
+    previewEdgeCurvatureThreshold,
+    previewVoxelDenoiseEnabled,
+    previewVoxelCellMm,
+    previewVoxelMinPointsPerCell,
+    previewVoxelKeepLargestComponent,
+    previewRegionEnabled,
+    previewRegionWorldBounds,
+    previewOrthogonalFilterEnabled,
+    previewOrthogonalToleranceDeg,
+    previewNoiseFilterEnabled,
+    previewNoiseFilterK,
+    previewNoiseFilterStdRatio,
+  ]);
+
+  useEffect(() => {
+    if (!previewActive) return;
+    const selectedDevices = devices.filter((d) => previewVisibleIds.includes(d.device_id));
+    if (selectedDevices.length === 0) return;
+    setLiveAdjustments((prev) => {
+      const next = { ...prev };
+      for (const d of selectedDevices) {
+        next[d.device_id] = getLiveAdjustmentFromDevice(d);
+      }
+      return next;
+    });
+    if (!previewDeviceId || !previewVisibleIds.includes(previewDeviceId)) {
+      setPreviewDeviceId(selectedDevices[0].device_id);
+    }
+  }, [previewActive, previewVisibleIds, devices, previewDeviceId]);
+
+  useEffect(() => {
+    if (!previewActive) return;
+    if (previewVisibleIds.length > 0) return;
+    if (selectedIds.length > 0) {
+      setPreviewVisibleIds(selectedIds);
+      return;
+    }
+    const enabled = devices.filter((d) => d.enabled).map((d) => d.device_id);
+    if (enabled.length > 0) {
+      setPreviewVisibleIds(enabled);
+    }
+  }, [previewActive, previewVisibleIds, selectedIds, devices]);
+
+  useEffect(() => {
+    return () => {
+      const timers = liveAdjustSaveTimersRef.current;
+      Object.values(timers).forEach((t) => clearTimeout(t));
+    };
+  }, []);
 
   useEffect(() => {
     if (!previewActive) {
@@ -586,16 +949,11 @@ export default function CalibrationPage() {
 
   const handleSaveDevice = async () => {
     try {
-      const translationMmFrame = formData.frame_position.map((v) => v * 1000);
-      const translationMmData = [translationMmFrame[0], translationMmFrame[2], translationMmFrame[1]];
-      const rotZ = formData.frame_rotation_deg[2] ?? 0;
-      const rotData = [0, rotZ, 0];
       const payload = {
         ...formData,
         calibration: {
           ...(formData.calibration || { scale: 1.0, translation: [0, 0, 0], rotation_deg: [0, 0, 0] }),
-          translation: translationMmData,
-          rotation_deg: rotData,
+          ...buildCalibrationPayloadFromFrame(formData.frame_position, formData.frame_rotation_deg),
         },
       };
       if (editingDevice) {
@@ -631,10 +989,12 @@ export default function CalibrationPage() {
     setIsDetailsOpen(false);
   };
 
-  const runAutoCalibration = async () => {
+  const runAutoCalibration = async (options?: { referenceDeviceId?: string; saveResult?: boolean }) => {
     if (selectedIds.length === 0) return;
-    const ref = referenceDeviceId && selectedIds.includes(referenceDeviceId)
-      ? referenceDeviceId
+    const resolvedReference = options?.referenceDeviceId ?? referenceDeviceId;
+    const saveResult = options?.saveResult ?? autoCalibSaveResult;
+    const ref = resolvedReference && selectedIds.includes(resolvedReference)
+      ? resolvedReference
       : selectedIds[0];
     setLoading(true);
     try {
@@ -643,14 +1003,115 @@ export default function CalibrationPage() {
         reference_device_id: ref,
         method: 'icp',
         max_iterations: 50,
+        save_result: saveResult,
       });
-      setAutoResult(res.data);
-      await loadDevices();
+      const data = res.data as AutoCalibrationResponsePayload;
+      setAutoResult(data);
+      const nextCandidateMap: Record<string, { translation: number[]; rotation_deg: number[]; scale: number }> = {};
+      (data.results || []).forEach((r) => {
+        nextCandidateMap[r.device_id] = {
+          translation: r.translation || [0, 0, 0],
+          rotation_deg: r.rotation_deg || [0, 0, 0],
+          scale: typeof r.scale === 'number' ? r.scale : 1.0,
+        };
+      });
+      setAutoCalibCandidateMap(nextCandidateMap);
+      if (!saveResult) {
+        setPreviewAutoCalibrationEnabled(true);
+      }
+      if (saveResult) {
+        await loadDevices();
+      }
+      setPreviewRefreshTick((v) => v + 1);
     } catch (error) {
       console.error('Auto-calibration failed:', error);
     } finally {
       setLoading(false);
     }
+  };
+
+  const applyAutoCalibrationCandidate = async () => {
+    if (!autoResult || !autoResult.results || autoResult.results.length === 0) return;
+    setAutoCalibApplying(true);
+    try {
+      await api.post('/calibration/apply-auto-results', {
+        results: autoResult.results,
+      });
+      setAutoResult((prev) => (prev ? { ...prev, saved: true } : prev));
+      await loadDevices();
+      setPreviewRefreshTick((v) => v + 1);
+    } catch (error) {
+      console.error('Failed to apply auto-calibration results:', error);
+    } finally {
+      setAutoCalibApplying(false);
+    }
+  };
+
+  const startRegionDrag = (
+    mode: 'move' | 'nw' | 'ne' | 'sw' | 'se',
+    event: React.MouseEvent<HTMLDivElement | HTMLButtonElement>
+  ) => {
+    if (!previewRegionEnabled) return;
+    const host = previewViewportRef.current;
+    if (!host) return;
+    const rect = host.getBoundingClientRect();
+    const startX = (event.clientX - rect.left) / Math.max(rect.width, 1);
+    const startY = (event.clientY - rect.top) / Math.max(rect.height, 1);
+    regionDragRef.current = { mode, startX, startY, startRect: normalizedRegionRect };
+    event.preventDefault();
+    event.stopPropagation();
+
+    const minW = 0.04;
+    const minH = 0.04;
+
+    const onMove = (ev: MouseEvent) => {
+      const state = regionDragRef.current;
+      const hostMove = previewViewportRef.current;
+      if (!state || !hostMove) return;
+      const r = hostMove.getBoundingClientRect();
+      const nx = (ev.clientX - r.left) / Math.max(r.width, 1);
+      const ny = (ev.clientY - r.top) / Math.max(r.height, 1);
+      const dx = nx - state.startX;
+      const dy = ny - state.startY;
+      const s = state.startRect;
+
+      if (state.mode === 'move') {
+        const w = s.x1 - s.x0;
+        const h = s.y1 - s.y0;
+        const x0 = Math.max(0, Math.min(1 - w, s.x0 + dx));
+        const y0 = Math.max(0, Math.min(1 - h, s.y0 + dy));
+        setPreviewRegionRect({ x0, y0, x1: x0 + w, y1: y0 + h });
+        return;
+      }
+
+      let x0 = s.x0;
+      let y0 = s.y0;
+      let x1 = s.x1;
+      let y1 = s.y1;
+      if (state.mode === 'nw') {
+        x0 = Math.max(0, Math.min(s.x1 - minW, s.x0 + dx));
+        y0 = Math.max(0, Math.min(s.y1 - minH, s.y0 + dy));
+      } else if (state.mode === 'ne') {
+        x1 = Math.min(1, Math.max(s.x0 + minW, s.x1 + dx));
+        y0 = Math.max(0, Math.min(s.y1 - minH, s.y0 + dy));
+      } else if (state.mode === 'sw') {
+        x0 = Math.max(0, Math.min(s.x1 - minW, s.x0 + dx));
+        y1 = Math.min(1, Math.max(s.y0 + minH, s.y1 + dy));
+      } else if (state.mode === 'se') {
+        x1 = Math.min(1, Math.max(s.x0 + minW, s.x1 + dx));
+        y1 = Math.min(1, Math.max(s.y0 + minH, s.y1 + dy));
+      }
+      setPreviewRegionRect({ x0, y0, x1, y1 });
+    };
+
+    const onUp = () => {
+      regionDragRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   };
 
   return (
@@ -737,6 +1198,29 @@ export default function CalibrationPage() {
                 {frameSaving ? 'Saving...' : 'Save Frame Settings'}
               </button>
             </div>
+            <div className="mt-3 flex items-center gap-2">
+              <label htmlFor="clip_points_to_frame" className="synergy-toggle">
+                <input
+                  id="clip_points_to_frame"
+                  className="synergy-toggle-input"
+                  type="checkbox"
+                  checked={clipPointsToFrame}
+                  onChange={(e) => handleToggleClipPoints(e.target.checked)}
+                />
+                <span className={`synergy-toggle-track ${clipPointsToFrame ? 'is-on' : ''}`} aria-hidden="true">
+                  <span className="synergy-toggle-thumb" />
+                </span>
+                <span className="synergy-toggle-label text-xs text-gray-600">
+                  Auto-filter points outside frame (X/Z)
+                </span>
+                <span className={`synergy-toggle-state ${clipPointsToFrame ? 'is-on' : ''}`}>
+                  {clipPointsToFrame ? 'ON' : 'OFF'}
+                </span>
+              </label>
+            </div>
+            {frameSaveError && (
+              <div className="mt-2 text-xs text-red-600">{frameSaveError}</div>
+            )}
             {frameSavedAt && (
               <div className="mt-2 text-xs text-gray-500 text-right">
                 Saved {new Date(frameSavedAt).toLocaleTimeString()}
@@ -1186,16 +1670,28 @@ export default function CalibrationPage() {
                   <div className="font-semibold text-gray-700 dark:text-gray-300">IO State</div>
                   <div className="text-[11px] text-gray-500">live</div>
                 </div>
-                <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2">
+                <div className="mt-2 pin-grid">
                   {Object.entries(ioState.states || {}).map(([name, entry]) => (
-                    <div key={name} className="flex items-center justify-between rounded border border-gray-200 dark:border-gray-800 px-2 py-1 bg-white/60 dark:bg-gray-900/40">
-                      <span className="font-mono text-[11px]">{name}</span>
-                      <span
-                        className={`h-2.5 w-2.5 rounded-full ${
-                          entry?.state === 2 ? 'bg-emerald-400' : entry?.state === 1 ? 'bg-rose-400' : 'bg-gray-400'
-                        }`}
-                        title={entry?.label || 'UNKNOWN'}
-                      />
+                    <div key={name} className="pin-card">
+                      <div className="min-w-0">
+                        <div className="font-mono text-[11px] font-semibold truncate">{name}</div>
+                        <div className="text-[10px] text-gray-500 truncate">{entry?.label || 'UNKNOWN'}</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`pin-chip ${
+                            entry?.state === 2 ? 'is-high' : entry?.state === 1 ? 'is-low' : ''
+                          }`}
+                        >
+                          {entry?.state === 2 ? 'HIGH' : entry?.state === 1 ? 'LOW' : 'UNK'}
+                        </span>
+                        <span
+                          className={`pin-led ${
+                            entry?.state === 2 ? 'is-high' : entry?.state === 1 ? 'is-low' : 'is-unknown'
+                          }`}
+                          title={entry?.label || 'UNKNOWN'}
+                        />
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -1250,10 +1746,10 @@ export default function CalibrationPage() {
                             {ping === undefined ? 'checking' : ping ? 'reachable' : 'no ping'}
                           </div>
                           <div className="flex gap-2 justify-end">
-                            <button className="btn-secondary px-2 py-2" onClick={() => handleOpenModal(device)} aria-label="Edit">
+                            <button className="btn-secondary btn-sm btn-icon" onClick={() => handleOpenModal(device)} aria-label="Edit">
                               <Edit size={14} />
                             </button>
-                            <button className="btn-danger px-2 py-2" onClick={() => handleDeleteDevice(device.device_id)} aria-label="Delete">
+                            <button className="btn-danger btn-sm btn-icon" onClick={() => handleDeleteDevice(device.device_id)} aria-label="Delete">
                               <Trash2 size={14} />
                             </button>
                           </div>
@@ -1302,26 +1798,41 @@ export default function CalibrationPage() {
                   <Wand2 size={14} />
                   Auto-Calibration (ICP)
                 </button>
-                <button className="btn-secondary" onClick={() => setPreviewActive((v) => !v)} disabled={selectedIds.length === 0}>
+                <button
+                  className="btn-secondary"
+                  onClick={() => setPreviewActive((v) => !v)}
+                  disabled={selectedIds.length === 0}
+                >
                   {previewActive ? 'Stop Preview' : 'Live Preview'}
                 </button>
               </div>
               {autoResult && (
                 <div className="mt-3 text-xs text-gray-600 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-800 rounded-lg p-3">
-                  <div className="font-semibold text-gray-700 dark:text-gray-300 mb-3">Auto-calibration result</div>
+                  <div className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Auto-calibration result</div>
+                  <div className="text-[11px] text-gray-500 mb-3">
+                    Mode: {autoResult.saved === false ? 'Preview only (not saved)' : 'Saved to device calibration'}
+                  </div>
                   <div className="grid grid-cols-1 gap-2">
-                    {(autoResult.results || []).map((r: any) => (
-                      <div key={r.device_id} className="flex items-center justify-between bg-white/70 dark:bg-gray-900/60 rounded-md px-3 py-2 border border-gray-200 dark:border-gray-800">
-                        <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">{r.device_id}</div>
-                        <div className="text-xs text-gray-500">score: {typeof r.score === 'number' ? r.score.toFixed(3) : '-'}</div>
-                        <div className="text-xs text-gray-500">
-                          t: {r.translation?.map((v: number) => v.toFixed(1)).join(', ') || '-'}
+                    {(autoResult.results || []).map((r: AutoCalibrationResultItem) => {
+                      const framePos = toFramePositionFromCalibration(r.translation);
+                      return (
+                        <div key={r.device_id} className="bg-white/70 dark:bg-gray-900/60 rounded-md px-3 py-2 border border-gray-200 dark:border-gray-800">
+                          <div className="flex items-center justify-between">
+                            <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">{r.device_id}</div>
+                            <div className="text-xs text-gray-500">score: {typeof r.score === 'number' ? r.score.toFixed(3) : '-'}</div>
+                          </div>
+                          <div className="mt-1 text-xs text-gray-500">
+                            t[mm]: {r.translation?.map((v: number) => v.toFixed(2)).join(', ') || '-'}
+                          </div>
+                          <div className="text-xs text-gray-500">
+                            r[deg]: {r.rotation_deg?.map((v: number) => v.toFixed(3)).join(', ') || '-'}
+                          </div>
+                          <div className="text-xs text-gray-500">
+                            frame[m]: x={framePos.x.toFixed(4)}, y={framePos.y.toFixed(4)}, z={framePos.z.toFixed(4)} | yaw={Number(r.rotation_deg?.[1] ?? 0).toFixed(3)} deg
+                          </div>
                         </div>
-                        <div className="text-xs text-gray-500">
-                          r: {r.rotation_deg?.map((v: number) => v.toFixed(2)).join(', ') || '-'}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -1330,27 +1841,540 @@ export default function CalibrationPage() {
         </div>
 
         {previewActive && (
-          <div className="card">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-semibold text-slate-900">Live Preview (Unified Frame)</h2>
-              <div className="text-xs text-gray-500">{previewPoints.length} points</div>
+          <div className="fixed inset-0 z-40 flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-black/45 backdrop-blur-sm" onClick={() => setPreviewActive(false)} />
+            <div className="relative w-[min(1860px,99vw)] h-[min(1020px,97vh)] glass-card p-0 overflow-hidden">
+              <div className="card-header flex items-center justify-between">
+                <div className="text-lg font-semibold text-slate-900">Live Preview (Unified Frame)</div>
+                <div className="flex items-center gap-3">
+                  <div className="text-xs text-gray-500">{previewPoints.length} points</div>
+                  <button className="btn-secondary btn-sm btn-icon" onClick={() => setPreviewActive(false)} aria-label="Close preview">
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="card-body grid grid-cols-1 xl:grid-cols-[1fr_420px] gap-4 h-[calc(100%-64px)]">
+                <div ref={previewViewportRef} className="relative h-full rounded-lg overflow-hidden border border-gray-200">
+                  <PointCloudThreeViewer
+                    ref={previewRef}
+                    points={previewPoints}
+                    mapAxes="xzy"
+                    view="2d"
+                    width="100%"
+                    height="100%"
+                    showOriginAxes
+                    originAxisSize={1000}
+                    showFrame
+                    frameSizeMm={frameSizeMm}
+                    frameOriginMode={originMode}
+                  />
+                  {previewRegionEnabled && (
+                    <div className="absolute inset-0 z-20 pointer-events-none">
+                      <div
+                        className="absolute border-2 border-cyan-400 bg-cyan-300/10 rounded-sm pointer-events-auto"
+                        style={{
+                          left: `${normalizedRegionRect.x0 * 100}%`,
+                          top: `${normalizedRegionRect.y0 * 100}%`,
+                          width: `${(normalizedRegionRect.x1 - normalizedRegionRect.x0) * 100}%`,
+                          height: `${(normalizedRegionRect.y1 - normalizedRegionRect.y0) * 100}%`,
+                          cursor: 'move',
+                        }}
+                        onMouseDown={(e) => startRegionDrag('move', e)}
+                      >
+                        <button
+                          className="absolute -left-1.5 -top-1.5 w-3 h-3 rounded-full bg-cyan-400 border border-white"
+                          style={{ cursor: 'nwse-resize' }}
+                          onMouseDown={(e) => startRegionDrag('nw', e)}
+                        />
+                        <button
+                          className="absolute -right-1.5 -top-1.5 w-3 h-3 rounded-full bg-cyan-400 border border-white"
+                          style={{ cursor: 'nesw-resize' }}
+                          onMouseDown={(e) => startRegionDrag('ne', e)}
+                        />
+                        <button
+                          className="absolute -left-1.5 -bottom-1.5 w-3 h-3 rounded-full bg-cyan-400 border border-white"
+                          style={{ cursor: 'nesw-resize' }}
+                          onMouseDown={(e) => startRegionDrag('sw', e)}
+                        />
+                        <button
+                          className="absolute -right-1.5 -bottom-1.5 w-3 h-3 rounded-full bg-cyan-400 border border-white"
+                          style={{ cursor: 'nwse-resize' }}
+                          onMouseDown={(e) => startRegionDrag('se', e)}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div className="h-full overflow-auto border border-gray-200 rounded-lg p-3 bg-white/70">
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold text-slate-800">Live Device Placement</div>
+                    <div className="flex items-center gap-1">
+                      <button className="btn-secondary btn-sm" onClick={loadPreviewFilterSettings} type="button">
+                        Reload Config
+                      </button>
+                      <button className="btn-success btn-sm" onClick={handleSavePreviewFilterSettings} disabled={previewFilterSaving} type="button">
+                        {previewFilterSaving ? 'Saving...' : 'Save Filter Config'}
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Zmiany zapisują się automatycznie i odświeżają podgląd na żywo.
+                  </p>
+                  {previewFilterSavedAt && (
+                    <div className="mt-1 text-[11px] text-gray-500">
+                      Filter config saved {new Date(previewFilterSavedAt).toLocaleTimeString()}
+                    </div>
+                  )}
+                  <div className="mt-3 rounded-lg border border-gray-200 bg-white px-2.5 py-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs text-gray-600">Visible scanners (preview)</label>
+                      <div className="flex items-center gap-1">
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => setPreviewVisibleIds(devices.filter((d) => d.enabled).map((d) => d.device_id))}
+                          type="button"
+                        >
+                          All
+                        </button>
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => setPreviewVisibleIds(selectedIds)}
+                          type="button"
+                        >
+                          Selected
+                        </button>
+                      </div>
+                    </div>
+                    <select
+                      className="input mt-1"
+                      multiple
+                      value={previewVisibleIds}
+                      onChange={(e) => {
+                        const opts = Array.from(e.target.selectedOptions).map((o) => o.value);
+                        setPreviewVisibleIds(opts);
+                      }}
+                    >
+                      {devices
+                        .filter((d) => d.enabled)
+                        .map((d) => (
+                          <option key={`preview-visible-${d.device_id}`} value={d.device_id}>
+                            {d.name || d.device_id}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                  <div className="mt-3 rounded-lg border border-gray-200 bg-white px-2.5 py-2 space-y-2.5">
+                    <div className="text-xs font-semibold text-gray-700">Auto-calibration (ICP)</div>
+                    <div>
+                      <label className="text-xs text-gray-600">Reference device</label>
+                      <select
+                        className="input mt-1"
+                        value={referenceDeviceId}
+                        onChange={(e) => setReferenceDeviceId(e.target.value)}
+                      >
+                        {devices
+                          .filter((d) => selectedIds.includes(d.device_id))
+                          .map((d) => (
+                            <option key={d.device_id} value={d.device_id}>
+                              {d.name || d.device_id}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                    <label htmlFor="auto_calib_save_result_preview" className="synergy-toggle">
+                      <input
+                        id="auto_calib_save_result_preview"
+                        className="synergy-toggle-input"
+                        type="checkbox"
+                        checked={autoCalibSaveResult}
+                        onChange={(e) => setAutoCalibSaveResult(e.target.checked)}
+                      />
+                      <span className={`synergy-toggle-track ${autoCalibSaveResult ? 'is-on' : ''}`} aria-hidden="true">
+                        <span className="synergy-toggle-thumb" />
+                      </span>
+                      <span className="synergy-toggle-label text-xs text-gray-700">
+                        Save calibration after run
+                      </span>
+                      <span className={`synergy-toggle-state ${autoCalibSaveResult ? 'is-on' : ''}`}>
+                        {autoCalibSaveResult ? 'ON' : 'OFF'}
+                      </span>
+                    </label>
+                    <button
+                      className="btn-primary w-full"
+                      onClick={() => runAutoCalibration({ referenceDeviceId, saveResult: autoCalibSaveResult })}
+                      disabled={loading || selectedIds.length === 0}
+                    >
+                      <Wand2 size={14} />
+                      {loading ? 'Calibrating...' : 'Run Auto-Calibration'}
+                    </button>
+                    <label htmlFor="preview_auto_calibration_toggle" className="synergy-toggle">
+                      <input
+                        id="preview_auto_calibration_toggle"
+                        className="synergy-toggle-input"
+                        type="checkbox"
+                        checked={previewAutoCalibrationEnabled}
+                        onChange={(e) => setPreviewAutoCalibrationEnabled(e.target.checked)}
+                        disabled={!autoResult || (autoResult.results || []).length === 0}
+                      />
+                      <span className={`synergy-toggle-track ${previewAutoCalibrationEnabled ? 'is-on' : ''}`} aria-hidden="true">
+                        <span className="synergy-toggle-thumb" />
+                      </span>
+                      <span className="synergy-toggle-label text-xs text-gray-700">
+                        Preview auto-calibration result
+                      </span>
+                      <span className={`synergy-toggle-state ${previewAutoCalibrationEnabled ? 'is-on' : ''}`}>
+                        {previewAutoCalibrationEnabled ? 'ON' : 'OFF'}
+                      </span>
+                    </label>
+                    <div className="text-[11px] text-gray-500">
+                      Workflow: run ICP without save, compare in preview, then apply to config.
+                    </div>
+                    <button
+                      className="btn-success w-full"
+                      onClick={applyAutoCalibrationCandidate}
+                      disabled={autoCalibApplying || !autoResult || (autoResult.results || []).length === 0 || autoResult.saved === true}
+                    >
+                      {autoCalibApplying ? 'Applying...' : 'Apply Auto-Calibration To Config'}
+                    </button>
+                    {autoResult && (autoResult.results || []).length > 0 && (
+                      <div className="rounded border border-gray-200 bg-gray-50/70 px-2 py-2">
+                        <div className="text-[11px] font-semibold text-gray-700 mb-1">Transform preview</div>
+                        <div className="space-y-1">
+                          {autoResult.results.map((r: AutoCalibrationResultItem) => {
+                            const framePos = toFramePositionFromCalibration(r.translation);
+                            return (
+                              <div key={`preview-transform-${r.device_id}`} className="text-[11px] text-gray-600 leading-4">
+                                <div className="font-medium text-gray-700">{r.device_id}</div>
+                                <div>t[mm]: {r.translation?.map((v: number) => v.toFixed(2)).join(', ') || '-'}</div>
+                                <div>r[deg]: {r.rotation_deg?.map((v: number) => v.toFixed(3)).join(', ') || '-'}</div>
+                                <div>frame[m]: x={framePos.x.toFixed(4)} y={framePos.y.toFixed(4)} z={framePos.z.toFixed(4)} | yaw={Number(r.rotation_deg?.[1] ?? 0).toFixed(3)}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="mt-3 rounded-lg border border-gray-200 bg-white px-2.5 py-2">
+                    <label htmlFor="clip_points_to_frame_preview" className="synergy-toggle">
+                      <input
+                        id="clip_points_to_frame_preview"
+                        className="synergy-toggle-input"
+                        type="checkbox"
+                        checked={clipPointsToFrame}
+                        onChange={(e) => handleToggleClipPoints(e.target.checked)}
+                      />
+                      <span className={`synergy-toggle-track ${clipPointsToFrame ? 'is-on' : ''}`} aria-hidden="true">
+                        <span className="synergy-toggle-thumb" />
+                      </span>
+                      <span className="synergy-toggle-label text-xs text-gray-700">
+                        Clip points to frame
+                      </span>
+                      <span className={`synergy-toggle-state ${clipPointsToFrame ? 'is-on' : ''}`}>
+                        {clipPointsToFrame ? 'ON' : 'OFF'}
+                      </span>
+                    </label>
+                    <div className="mt-2">
+                      <label htmlFor="voxel_denoise_preview" className="synergy-toggle">
+                        <input
+                          id="voxel_denoise_preview"
+                          className="synergy-toggle-input"
+                          type="checkbox"
+                          checked={previewVoxelDenoiseEnabled}
+                          onChange={(e) => setPreviewVoxelDenoiseEnabled(e.target.checked)}
+                        />
+                        <span className={`synergy-toggle-track ${previewVoxelDenoiseEnabled ? 'is-on' : ''}`} aria-hidden="true">
+                          <span className="synergy-toggle-thumb" />
+                        </span>
+                        <span className="synergy-toggle-label text-xs text-gray-700">
+                          Shadow denoise (voxel)
+                        </span>
+                        <span className={`synergy-toggle-state ${previewVoxelDenoiseEnabled ? 'is-on' : ''}`}>
+                          {previewVoxelDenoiseEnabled ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+                    </div>
+                    {previewVoxelDenoiseEnabled && (
+                      <div className="mt-2 space-y-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
+                        <div>
+                          <label className="text-xs text-gray-600">Voxel cell size: {previewVoxelCellMm} mm</label>
+                          <input
+                            className="w-full mt-1"
+                            type="range"
+                            min={2}
+                            max={40}
+                            step={1}
+                            value={previewVoxelCellMm}
+                            onChange={(e) => setPreviewVoxelCellMm(Number(e.target.value))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-600">Min points per voxel: {previewVoxelMinPointsPerCell}</label>
+                          <input
+                            className="w-full mt-1"
+                            type="range"
+                            min={1}
+                            max={12}
+                            step={1}
+                            value={previewVoxelMinPointsPerCell}
+                            onChange={(e) => setPreviewVoxelMinPointsPerCell(Number(e.target.value))}
+                          />
+                        </div>
+                        <label htmlFor="voxel_keep_lcc_preview" className="synergy-toggle">
+                          <input
+                            id="voxel_keep_lcc_preview"
+                            className="synergy-toggle-input"
+                            type="checkbox"
+                            checked={previewVoxelKeepLargestComponent}
+                            onChange={(e) => setPreviewVoxelKeepLargestComponent(e.target.checked)}
+                          />
+                          <span className={`synergy-toggle-track ${previewVoxelKeepLargestComponent ? 'is-on' : ''}`} aria-hidden="true">
+                            <span className="synergy-toggle-thumb" />
+                          </span>
+                          <span className="synergy-toggle-label text-xs text-gray-700">
+                            Keep largest component
+                          </span>
+                          <span className={`synergy-toggle-state ${previewVoxelKeepLargestComponent ? 'is-on' : ''}`}>
+                            {previewVoxelKeepLargestComponent ? 'ON' : 'OFF'}
+                          </span>
+                        </label>
+                      </div>
+                    )}
+                    <div className="mt-2">
+                      <label htmlFor="region_filter_preview" className="synergy-toggle">
+                        <input
+                          id="region_filter_preview"
+                          className="synergy-toggle-input"
+                          type="checkbox"
+                          checked={previewRegionEnabled}
+                          onChange={(e) => setPreviewRegionEnabled(e.target.checked)}
+                        />
+                        <span className={`synergy-toggle-track ${previewRegionEnabled ? 'is-on' : ''}`} aria-hidden="true">
+                          <span className="synergy-toggle-thumb" />
+                        </span>
+                        <span className="synergy-toggle-label text-xs text-gray-700">
+                          Region filter (ROI rectangle)
+                        </span>
+                        <span className={`synergy-toggle-state ${previewRegionEnabled ? 'is-on' : ''}`}>
+                          {previewRegionEnabled ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+                    </div>
+                    {previewRegionEnabled && (
+                      <div className="mt-2 space-y-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
+                        <div className="text-[11px] text-gray-600">
+                          Drag rectangle on preview. Resize by grabbing corners.
+                        </div>
+                        <div className="text-[11px] text-gray-600">
+                          X: {previewRegionWorldBounds.minX.toFixed(1)} .. {previewRegionWorldBounds.maxX.toFixed(1)} mm
+                        </div>
+                        <div className="text-[11px] text-gray-600">
+                          Z: {previewRegionWorldBounds.minZ.toFixed(1)} .. {previewRegionWorldBounds.maxZ.toFixed(1)} mm
+                        </div>
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => setPreviewRegionRect({ x0: 0.2, y0: 0.15, x1: 0.8, y1: 0.85 })}
+                        >
+                          Reset Region
+                        </button>
+                      </div>
+                    )}
+                    <div className="mt-2">
+                      <label htmlFor="orthogonal_filter_preview" className="synergy-toggle">
+                        <input
+                          id="orthogonal_filter_preview"
+                          className="synergy-toggle-input"
+                          type="checkbox"
+                          checked={previewOrthogonalFilterEnabled}
+                          onChange={(e) => setPreviewOrthogonalFilterEnabled(e.target.checked)}
+                        />
+                        <span className={`synergy-toggle-track ${previewOrthogonalFilterEnabled ? 'is-on' : ''}`} aria-hidden="true">
+                          <span className="synergy-toggle-thumb" />
+                        </span>
+                        <span className="synergy-toggle-label text-xs text-gray-700">
+                          Orthogonal surfaces only
+                        </span>
+                        <span className={`synergy-toggle-state ${previewOrthogonalFilterEnabled ? 'is-on' : ''}`}>
+                          {previewOrthogonalFilterEnabled ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+                    </div>
+                    {previewOrthogonalFilterEnabled && (
+                      <div className="mt-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
+                        <label className="text-xs text-gray-600">
+                          Angle tolerance: +/- {previewOrthogonalToleranceDeg} deg
+                        </label>
+                        <input
+                          className="w-full mt-1"
+                          type="range"
+                          min={3}
+                          max={35}
+                          step={1}
+                          value={previewOrthogonalToleranceDeg}
+                          onChange={(e) => setPreviewOrthogonalToleranceDeg(Number(e.target.value))}
+                        />
+                      </div>
+                    )}
+                    <div className="mt-2">
+                      <label htmlFor="noise_filter_preview" className="synergy-toggle">
+                        <input
+                          id="noise_filter_preview"
+                          className="synergy-toggle-input"
+                          type="checkbox"
+                          checked={previewNoiseFilterEnabled}
+                          onChange={(e) => setPreviewNoiseFilterEnabled(e.target.checked)}
+                        />
+                        <span className={`synergy-toggle-track ${previewNoiseFilterEnabled ? 'is-on' : ''}`} aria-hidden="true">
+                          <span className="synergy-toggle-thumb" />
+                        </span>
+                        <span className="synergy-toggle-label text-xs text-gray-700">
+                          Noise filter (statistical)
+                        </span>
+                        <span className={`synergy-toggle-state ${previewNoiseFilterEnabled ? 'is-on' : ''}`}>
+                          {previewNoiseFilterEnabled ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+                    </div>
+                    {previewNoiseFilterEnabled && (
+                      <div className="mt-2 space-y-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
+                        <div>
+                          <label className="text-xs text-gray-600">Neighbors (k): {previewNoiseFilterK}</label>
+                          <input
+                            className="w-full mt-1"
+                            type="range"
+                            min={4}
+                            max={48}
+                            step={1}
+                            value={previewNoiseFilterK}
+                            onChange={(e) => setPreviewNoiseFilterK(Number(e.target.value))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-600">
+                            Outlier sensitivity (std ratio): {previewNoiseFilterStdRatio.toFixed(2)}
+                          </label>
+                          <input
+                            className="w-full mt-1"
+                            type="range"
+                            min={0.2}
+                            max={3.0}
+                            step={0.1}
+                            value={previewNoiseFilterStdRatio}
+                            onChange={(e) => setPreviewNoiseFilterStdRatio(Number(e.target.value))}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    <div className="mt-2">
+                      <label htmlFor="edge_filter_preview" className="synergy-toggle">
+                        <input
+                          id="edge_filter_preview"
+                          className="synergy-toggle-input"
+                          type="checkbox"
+                          checked={previewEdgeFilterEnabled}
+                          onChange={(e) => setPreviewEdgeFilterEnabled(e.target.checked)}
+                        />
+                        <span className={`synergy-toggle-track ${previewEdgeFilterEnabled ? 'is-on' : ''}`} aria-hidden="true">
+                          <span className="synergy-toggle-thumb" />
+                        </span>
+                        <span className="synergy-toggle-label text-xs text-gray-700">
+                          Edge filter (preview)
+                        </span>
+                        <span className={`synergy-toggle-state ${previewEdgeFilterEnabled ? 'is-on' : ''}`}>
+                          {previewEdgeFilterEnabled ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+                    </div>
+                    {previewEdgeFilterEnabled && (
+                      <div className="mt-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
+                        <label className="text-xs text-gray-600">
+                          Edge curvature threshold: {previewEdgeCurvatureThreshold.toFixed(2)}
+                        </label>
+                        <input
+                          className="w-full mt-1"
+                          type="range"
+                          min={0.01}
+                          max={0.50}
+                          step={0.01}
+                          value={previewEdgeCurvatureThreshold}
+                          onChange={(e) => setPreviewEdgeCurvatureThreshold(Number(e.target.value))}
+                        />
+                      </div>
+                    )}
+                  </div>
+                  <div className="mt-3">
+                    <label className="text-xs text-gray-600">Scanner</label>
+                    <select
+                      className="input mt-1"
+                      value={previewDeviceId}
+                      onChange={(e) => setPreviewDeviceId(e.target.value)}
+                    >
+                      {devices
+                        .filter((d) => previewVisibleIds.includes(d.device_id))
+                        .map((d) => (
+                          <option key={d.device_id} value={d.device_id}>
+                            {d.name || d.device_id}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                  {previewDeviceId && liveAdjustments[previewDeviceId] && (
+                    <div className="mt-3 space-y-3">
+                      <div>
+                        <label className="text-xs text-gray-600">Position X [m]</label>
+                        <input
+                          className="input mt-1"
+                          type="number"
+                          step="0.01"
+                          value={liveAdjustments[previewDeviceId].x}
+                          onChange={(e) => handleLiveAdjustmentChange(previewDeviceId, { x: Number(e.target.value) })}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-gray-600">Position Y [m]</label>
+                        <input
+                          className="input mt-1"
+                          type="number"
+                          step="0.01"
+                          value={liveAdjustments[previewDeviceId].y}
+                          onChange={(e) => handleLiveAdjustmentChange(previewDeviceId, { y: Number(e.target.value) })}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-gray-600">Position Z [m]</label>
+                        <input
+                          className="input mt-1"
+                          type="number"
+                          step="0.01"
+                          value={liveAdjustments[previewDeviceId].z}
+                          onChange={(e) => handleLiveAdjustmentChange(previewDeviceId, { z: Number(e.target.value) })}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-gray-600">Rotation Z [deg]</label>
+                        <input
+                          className="input mt-1"
+                          type="number"
+                          step="0.5"
+                          value={liveAdjustments[previewDeviceId].yaw}
+                          onChange={(e) => handleLiveAdjustmentChange(previewDeviceId, { yaw: Number(e.target.value) })}
+                        />
+                      </div>
+                      <div className="grid grid-cols-4 gap-2">
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { x: liveAdjustments[previewDeviceId].x - 0.01 })}>X-</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { x: liveAdjustments[previewDeviceId].x + 0.01 })}>X+</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { y: liveAdjustments[previewDeviceId].y - 0.01 })}>Y-</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { y: liveAdjustments[previewDeviceId].y + 0.01 })}>Y+</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { z: liveAdjustments[previewDeviceId].z - 0.01 })}>Z-</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { z: liveAdjustments[previewDeviceId].z + 0.01 })}>Z+</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { yaw: liveAdjustments[previewDeviceId].yaw - 1 })}>R-</button>
+                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { yaw: liveAdjustments[previewDeviceId].yaw + 1 })}>R+</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
-            <div className="mt-3" style={{ height: '500px' }}>
-              <PointCloudThreeViewer
-                ref={previewRef}
-                points={previewPoints}
-                mapAxes="xzy"
-                view="2d"
-                width="100%"
-                height="100%"
-                showOriginAxes
-                originAxisSize={1000}
-                showFrame
-                frameSizeMm={frameSizeMm}
-                frameOriginMode={originMode as any}
-              />
-            </div>
-            <div className="mt-2 text-xs text-gray-500">Live preview uses X/Z plane for 2D view.</div>
           </div>
         )}
       </div>
@@ -1363,7 +2387,7 @@ export default function CalibrationPage() {
               <div className="text-lg font-semibold text-slate-900">
                 {editingDevice ? 'Edit Device' : 'Add New Device'}
               </div>
-              <button className="btn-secondary px-2 py-2" onClick={handleCloseModal}>
+              <button className="btn-secondary btn-sm btn-icon" onClick={handleCloseModal}>
                 <X size={16} />
               </button>
             </div>
@@ -1391,17 +2415,39 @@ export default function CalibrationPage() {
                     value={formData.device_type}
                     onChange={(e) => {
                       const nextType = e.target.value as 'picoscan' | 'lms4000';
+                      const nextFormat =
+                        nextType === 'lms4000'
+                          ? 'lmdscandata'
+                          : (formData.format_type === 'msgpack' ? 'msgpack' : 'compact');
                       setFormData({
                         ...formData,
                         device_type: nextType,
                         protocol: nextType === 'lms4000' ? 'tcp' : 'udp',
-                        format_type: nextType === 'lms4000' ? 'lmdscandata' : 'compact',
+                        format_type: nextFormat,
                         port: nextType === 'lms4000' ? 2111 : 2115,
                       });
                     }}
                   >
-                    <option value="picoscan">Picoscan (UDP compact)</option>
+                    <option value="picoscan">Picoscan (UDP)</option>
                     <option value="lms4000">LMS4000 (TCP LMDscandata)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-600">Data format</label>
+                  <select
+                    className="input mt-1"
+                    value={formData.format_type}
+                    onChange={(e) => setFormData({ ...formData, format_type: e.target.value })}
+                    disabled={formData.device_type === 'lms4000'}
+                  >
+                    {formData.device_type === 'lms4000' ? (
+                      <option value="lmdscandata">lmdscandata</option>
+                    ) : (
+                      <>
+                        <option value="compact">compact</option>
+                        <option value="msgpack">messagepack</option>
+                      </>
+                    )}
                   </select>
                 </div>
                 <input
@@ -1491,7 +2537,7 @@ export default function CalibrationPage() {
                     />
                     <div className="flex gap-2">
                       <button
-                        className="btn-secondary px-2 py-1"
+                        className="btn-secondary btn-sm"
                         type="button"
                         onClick={() => {
                           const v = (formData.frame_rotation_deg[2] ?? 0) - 5;
@@ -1501,7 +2547,7 @@ export default function CalibrationPage() {
                         -5°
                       </button>
                       <button
-                        className="btn-secondary px-2 py-1"
+                        className="btn-secondary btn-sm"
                         type="button"
                         onClick={() => {
                           const v = (formData.frame_rotation_deg[2] ?? 0) - 1;
@@ -1511,7 +2557,7 @@ export default function CalibrationPage() {
                         -1°
                       </button>
                       <button
-                        className="btn-secondary px-2 py-1"
+                        className="btn-secondary btn-sm"
                         type="button"
                         onClick={() => {
                           const v = (formData.frame_rotation_deg[2] ?? 0) + 1;
@@ -1521,7 +2567,7 @@ export default function CalibrationPage() {
                         +1°
                       </button>
                       <button
-                        className="btn-secondary px-2 py-1"
+                        className="btn-secondary btn-sm"
                         type="button"
                         onClick={() => {
                           const v = (formData.frame_rotation_deg[2] ?? 0) + 5;
@@ -1551,7 +2597,7 @@ export default function CalibrationPage() {
           <div className="relative w-full max-w-2xl mx-4 glass-card p-0 overflow-hidden">
             <div className="card-header flex items-center justify-between">
               <div className="text-lg font-semibold text-slate-900">Device Details</div>
-              <button className="btn-secondary px-2 py-2" onClick={closeDetails}>
+              <button className="btn-secondary btn-sm btn-icon" onClick={closeDetails}>
                 <X size={16} />
               </button>
             </div>

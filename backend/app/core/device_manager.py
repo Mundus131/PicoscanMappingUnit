@@ -18,8 +18,14 @@ class PicoscanDevice:
         self.ip_address = device_config.get("ip_address")
         self.port = device_config.get("port", 2111)
         self.device_type = (device_config.get("device_type") or "picoscan").lower()
-        self.protocol = device_config.get("protocol") or ("tcp" if self.device_type == "lms4000" else "udp")
-        self.format_type = device_config.get("format_type") or ("lmdscandata" if self.device_type == "lms4000" else "compact")
+        self.protocol = str(device_config.get("protocol") or ("tcp" if self.device_type == "lms4000" else "udp")).lower()
+        fmt = str(device_config.get("format_type") or ("lmdscandata" if self.device_type == "lms4000" else "compact")).lower()
+        if self.device_type == "lms4000":
+            self.protocol = "tcp"
+            self.format_type = "lmdscandata"
+        else:
+            self.protocol = "udp"
+            self.format_type = fmt if fmt in ("compact", "msgpack") else "compact"
         self.enabled = device_config.get("enabled", True)
         # Number of segments that make up a full scan for this device
         # If None, system-wide/default value will be used
@@ -67,7 +73,9 @@ class DeviceManager:
         self.frame_settings = {}
         self.motion_settings = {}
         self.analysis_settings = {}
+        self.output_settings = {}
         self.tdc_settings = {}
+        self.preview_filter_settings = {}
         self.load_configuration()
     
     def load_configuration(self):
@@ -86,7 +94,9 @@ class DeviceManager:
             self.frame_settings = config.get("frame_settings", {})
             self.motion_settings = config.get("motion_settings", {})
             self.analysis_settings = config.get("analysis_settings", {})
+            self.output_settings = config.get("output_settings", {})
             self.tdc_settings = config.get("tdc_settings", {})
+            self.preview_filter_settings = config.get("preview_filter_settings", {})
             # Ensure sensible default for segments_per_scan
             if "segments_per_scan" not in self.point_cloud_settings:
                 self.point_cloud_settings["segments_per_scan"] = 10
@@ -96,6 +106,8 @@ class DeviceManager:
                 self.frame_settings["height_m"] = 1.2
             if "origin_mode" not in self.frame_settings:
                 self.frame_settings["origin_mode"] = "center"
+            if "clip_points_to_frame" not in self.frame_settings:
+                self.frame_settings["clip_points_to_frame"] = False
             if "mode" not in self.motion_settings:
                 self.motion_settings["mode"] = "fixed"
             if "fixed_speed_mps" not in self.motion_settings:
@@ -137,6 +149,41 @@ class DeviceManager:
                 self.analysis_settings["conveyor_denoise_min_points_per_cell"] = 3
             if "conveyor_keep_largest_component" not in self.analysis_settings:
                 self.analysis_settings["conveyor_keep_largest_component"] = True
+            # Output defaults
+            if "enabled" not in self.output_settings:
+                self.output_settings["enabled"] = False
+            if "connection_mode" not in self.output_settings:
+                self.output_settings["connection_mode"] = "server"
+            if "host" not in self.output_settings:
+                self.output_settings["host"] = "0.0.0.0"
+            if "port" not in self.output_settings:
+                self.output_settings["port"] = 2120
+            if "payload_mode" not in self.output_settings:
+                self.output_settings["payload_mode"] = "ascii"
+            if "separator" not in self.output_settings:
+                self.output_settings["separator"] = ";"
+            if "prefix" not in self.output_settings:
+                self.output_settings["prefix"] = "\x02"
+            if "suffix" not in self.output_settings:
+                self.output_settings["suffix"] = "\x03"
+            if "include_labels" not in self.output_settings:
+                self.output_settings["include_labels"] = False
+            if "float_precision" not in self.output_settings:
+                self.output_settings["float_precision"] = 2
+            if "length_unit" not in self.output_settings:
+                self.output_settings["length_unit"] = "mm"
+            if "volume_unit" not in self.output_settings:
+                self.output_settings["volume_unit"] = "m3"
+            if "selected_fields" not in self.output_settings:
+                self.output_settings["selected_fields"] = [
+                    "timestamp_iso",
+                    "analysis_app",
+                    "volume",
+                    "length",
+                    "diameter_start",
+                    "diameter_end",
+                    "diameter_avg",
+                ]
             # TDC defaults
             if "enabled" not in self.tdc_settings:
                 self.tdc_settings["enabled"] = False
@@ -172,6 +219,35 @@ class DeviceManager:
                 self.tdc_settings["stop_delay_ms"] = 0.0
             if "stop_delay_mm" not in self.tdc_settings:
                 self.tdc_settings["stop_delay_mm"] = 0.0
+            # Preview filter defaults
+            if "use_edge_filter" not in self.preview_filter_settings:
+                self.preview_filter_settings["use_edge_filter"] = False
+            if "edge_curvature_threshold" not in self.preview_filter_settings:
+                self.preview_filter_settings["edge_curvature_threshold"] = 0.08
+            if "use_voxel_denoise" not in self.preview_filter_settings:
+                self.preview_filter_settings["use_voxel_denoise"] = False
+            if "voxel_cell_mm" not in self.preview_filter_settings:
+                self.preview_filter_settings["voxel_cell_mm"] = 8.0
+            if "voxel_min_points_per_cell" not in self.preview_filter_settings:
+                self.preview_filter_settings["voxel_min_points_per_cell"] = 3
+            if "voxel_keep_largest_component" not in self.preview_filter_settings:
+                self.preview_filter_settings["voxel_keep_largest_component"] = False
+            if "use_region_filter" not in self.preview_filter_settings:
+                self.preview_filter_settings["use_region_filter"] = False
+            if "region_rect_norm" not in self.preview_filter_settings:
+                self.preview_filter_settings["region_rect_norm"] = [0.2, 0.15, 0.8, 0.85]
+            if "use_orthogonal_filter" not in self.preview_filter_settings:
+                self.preview_filter_settings["use_orthogonal_filter"] = False
+            if "orthogonal_angle_tolerance_deg" not in self.preview_filter_settings:
+                self.preview_filter_settings["orthogonal_angle_tolerance_deg"] = 12.0
+            if "use_noise_filter" not in self.preview_filter_settings:
+                self.preview_filter_settings["use_noise_filter"] = False
+            if "noise_filter_k" not in self.preview_filter_settings:
+                self.preview_filter_settings["noise_filter_k"] = 16
+            if "noise_filter_std_ratio" not in self.preview_filter_settings:
+                self.preview_filter_settings["noise_filter_std_ratio"] = 1.2
+            if "visible_device_ids" not in self.preview_filter_settings:
+                self.preview_filter_settings["visible_device_ids"] = None
         except FileNotFoundError:
             logger.warning(f"Configuration file not found: {config_path}")
         except Exception as e:
@@ -187,7 +263,9 @@ class DeviceManager:
                 "frame_settings": self.frame_settings,
                 "motion_settings": self.motion_settings,
                 "analysis_settings": self.analysis_settings,
+                "output_settings": self.output_settings,
                 "tdc_settings": self.tdc_settings,
+                "preview_filter_settings": self.preview_filter_settings,
             }
             
             with open(config_path, 'w') as f:
@@ -237,6 +315,13 @@ class DeviceManager:
                 device.protocol = str(device_config.get("protocol")).lower()
             if "format_type" in device_config and device_config.get("format_type"):
                 device.format_type = str(device_config.get("format_type")).lower()
+            if device.device_type == "lms4000":
+                device.protocol = "tcp"
+                device.format_type = "lmdscandata"
+            else:
+                device.protocol = "udp"
+                if device.format_type not in ("compact", "msgpack"):
+                    device.format_type = "compact"
             device.enabled = device_config.get("enabled", device.enabled)
             # Allow updating segments_per_scan per-device
             if "segments_per_scan" in device_config:

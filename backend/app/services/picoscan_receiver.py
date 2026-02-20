@@ -8,12 +8,15 @@ import numpy as np
 import threading
 import time
 from app.services.lms4000_receiver import Lms4000Receiver
+from app.core.device_manager import device_manager
 
 # Importy z ScanSegmentAPI
 try:
+    from scansegmentapi.scansegmentapi import msgpack as MsgpackApi
     from scansegmentapi.scansegmentapi import compact as CompactApi
     from scansegmentapi.scansegmentapi.udp_handler import UDPHandler
 except ImportError:
+    from scansegmentapi import msgpack as MsgpackApi
     from scansegmentapi import compact as CompactApi
     from scansegmentapi.udp_handler import UDPHandler
 
@@ -23,7 +26,7 @@ logger = logging.getLogger(__name__)
 class PicoscanReceiver:
     """Nasłuchuje na danych UDP od Picoscanu (PC = SERVER)"""
     
-    def __init__(self, listen_ip: str = "0.0.0.0", listen_port: int = 2115):
+    def __init__(self, listen_ip: str = "0.0.0.0", listen_port: int = 2115, format_type: str = "compact"):
         """
         Initialize receiver
         
@@ -33,6 +36,8 @@ class PicoscanReceiver:
         """
         self.listen_ip = listen_ip
         self.listen_port = listen_port
+        ft = (format_type or "compact").lower()
+        self.format_type = ft if ft in ("compact", "msgpack") else "compact"
         self.receiver = None
         self.transport_layer = None
         self.connected = False
@@ -53,8 +58,10 @@ class PicoscanReceiver:
                 65535  # Max packet size
             )
             
-            # Compact format receiver
-            self.receiver = CompactApi.Receiver(self.transport_layer)
+            if self.format_type == "msgpack":
+                self.receiver = MsgpackApi.Receiver(self.transport_layer)
+            else:
+                self.receiver = CompactApi.Receiver(self.transport_layer)
             
             self.connected = True
             logger.info(f"Listening for Picoscan on UDP {self.listen_ip}:{self.listen_port}")
@@ -103,8 +110,12 @@ class PicoscanReceiver:
 
                 def _write(s):
                     try:
-                        if isinstance(s, str) and ("Received segment" in s or ("Received" in s and "segment" in s)):
-                            return len(s)
+                        if isinstance(s, str):
+                            if not s.strip():
+                                return len(s)
+                            lowered = s.lower()
+                            if "received segment" in lowered or ("received" in lowered and "segment" in lowered):
+                                return len(s)
                     except Exception:
                         pass
                     return orig_write(s)
@@ -165,6 +176,7 @@ class PicoscanReceiver:
             "listen_ip": self.listen_ip,
             "listen_port": self.listen_port,
             "listening": self.connected,
+            "format": self.format_type,
             "total_segments_received": self.total_segments_received,
             "total_frames_received": self.total_frames_received,
             "last_frame_number": self.last_frame_number,
@@ -173,12 +185,15 @@ class PicoscanReceiver:
         }
     
     def segments_to_point_cloud(self, segments: List[dict]) -> np.ndarray:
-        """Convert Compact segments to point cloud (X, Y, Z, RSSI)"""
+        """Convert segments to point cloud (X, Y, Z, RSSI)."""
         points = []
         
         try:
             for segment in segments:
-                points.extend(self._extract_points_compact(segment))
+                if self.format_type == "msgpack":
+                    points.extend(self._extract_points_msgpack(segment))
+                else:
+                    points.extend(self._extract_points_compact(segment))
             
             if points:
                 return np.array(points, dtype=np.float32)
@@ -243,6 +258,52 @@ class PicoscanReceiver:
             logger.warning(f"Error extracting points: {e}")
         
         return points
+
+    def _extract_points_msgpack(self, segment: dict) -> List[list]:
+        """Extract points from msgpack format segment."""
+        points = []
+
+        try:
+            for scan in segment.get("SegmentData", []):
+                distances = scan.get("Distance", [])
+                if not distances:
+                    continue
+                num_echos = len(distances)
+                num_beams = len(distances[0]) if num_echos > 0 else 0
+                if num_beams == 0:
+                    continue
+
+                phi = scan.get("Phi", 0.0)
+                theta_start = scan.get("ThetaStart", 0.0)
+                theta_stop = scan.get("ThetaStop", theta_start)
+                channel_theta = scan.get("ChannelTheta")
+                rssi = scan.get("Rssi")
+
+                for beam_idx in range(num_beams):
+                    if channel_theta is not None and len(channel_theta) > beam_idx:
+                        theta = channel_theta[beam_idx]
+                    else:
+                        denom = (num_beams - 1) if num_beams > 1 else 1
+                        theta = theta_start + beam_idx * (theta_stop - theta_start) / denom
+
+                    for echo_idx in range(num_echos):
+                        distance = distances[echo_idx][beam_idx]
+                        if distance <= 0:
+                            continue
+                        x = distance * np.cos(theta) * np.cos(phi)
+                        y = distance * np.cos(theta) * np.sin(phi)
+                        z = distance * np.sin(theta)
+                        rssi_val = 0.0
+                        try:
+                            if rssi is not None and len(rssi) > echo_idx and len(rssi[echo_idx]) > beam_idx:
+                                rssi_val = float(rssi[echo_idx][beam_idx])
+                        except Exception:
+                            rssi_val = 0.0
+                        points.append([x, y, z, rssi_val])
+        except Exception as e:
+            logger.warning(f"Error extracting msgpack points: {e}")
+
+        return points
     
     def get_info(self) -> dict:
         """Get receiver info"""
@@ -250,7 +311,7 @@ class PicoscanReceiver:
             "listen_ip": self.listen_ip,
             "listen_port": self.listen_port,
             "listening": self.connected,
-            "format": "compact"
+            "format": self.format_type
         }
 
 
@@ -273,6 +334,7 @@ class PicoscanReceiverManager:
         listen_ip: str = "0.0.0.0",
         listen_port: int = 2115,
         segments_per_scan: int = None,
+        format_type: str = "compact",
         device_type: str = "picoscan",
         sensor_ip: str | None = None,
     ) -> bool:
@@ -311,12 +373,35 @@ class PicoscanReceiverManager:
                     self._start_worker(device_id)
                 return ok
 
-            receiver = PicoscanReceiver(listen_ip, listen_port)
+            # One UDP socket bind per local (ip, port). Two picoscan receivers
+            # on identical endpoint will conflict on Windows/Linux.
+            for existing_id, existing_info in self.receivers.items():
+                if existing_id == device_id:
+                    continue
+                if not isinstance(existing_info, dict):
+                    continue
+                if str(existing_info.get("type") or "picoscan").lower() != "picoscan":
+                    continue
+                same_ip = str(existing_info.get("listen_ip") or "") == str(listen_ip or "")
+                same_port = int(existing_info.get("listen_port") or 0) == int(listen_port)
+                if same_ip and same_port and bool(existing_info.get("listening")):
+                    logger.error(
+                        "Cannot start receiver %s on UDP %s:%s. Endpoint already used by %s. "
+                        "Configure unique local UDP ports per Picoscan device.",
+                        device_id,
+                        listen_ip,
+                        listen_port,
+                        existing_id,
+                    )
+                    return False
+
+            receiver = PicoscanReceiver(listen_ip, listen_port, format_type=format_type)
             if receiver.start_listening():
                 # Store optional segments_per_scan provided from device config
                 self.receivers[device_id] = {
                     "receiver": receiver,
                     "type": "picoscan",
+                    "format_type": receiver.format_type,
                     "listening": True,
                     "listen_ip": listen_ip,
                     "listen_port": listen_port,
@@ -404,7 +489,10 @@ class PicoscanReceiverManager:
                     scans_to_request = info.get("segments_per_scan") or 2
                     points = receiver.receive_point_cloud(int(scans_to_request))
                 else:
-                    segments_to_request = info.get("segments_per_scan") or 1
+                    segments_to_request = info.get("segments_per_scan")
+                    if not segments_to_request:
+                        segments_to_request = int((device_manager.point_cloud_settings or {}).get("segments_per_scan") or 1)
+                    segments_to_request = max(1, int(segments_to_request))
                     segments = receiver.receive_segments(segments_to_request)
                     if segments:
                         segment_payload = segments[0] if isinstance(segments, tuple) else segments
@@ -459,4 +547,16 @@ class PicoscanReceiverManager:
                 latest = self.get_latest_point_cloud(device_id)
                 if latest and latest.get("points") is not None and len(latest["points"]) > 0:
                     point_clouds[device_id] = latest["points"]
+        return point_clouds
+
+    def get_point_clouds_for_devices(self, device_ids: List[str], num_segments: int = 1) -> dict:
+        """Get point clouds only for requested device ids."""
+        point_clouds = {}
+        for device_id in (device_ids or []):
+            receiver_info = self.receivers.get(device_id)
+            if not (isinstance(receiver_info, dict) and receiver_info.get("listening")):
+                continue
+            latest = self.get_latest_point_cloud(device_id)
+            if latest and latest.get("points") is not None and len(latest["points"]) > 0:
+                point_clouds[device_id] = latest["points"]
         return point_clouds

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from typing import List
 from app.core.device_manager import device_manager
 from app.schemas.device import DeviceResponse, DeviceCreate, DeviceUpdate
@@ -7,6 +7,43 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+def _sync_device_listener(request: Request, device_id: str) -> None:
+    """Start/stop/restart receiver for a device after config changes."""
+    receiver_manager = getattr(request.app.state, "receiver_manager", None)
+    if receiver_manager is None:
+        return
+
+    device = device_manager.get_device(device_id)
+    if not device:
+        return
+
+    try:
+        if device_id in receiver_manager.receivers:
+            receiver_manager.stop_listening(device_id)
+    except Exception as exc:
+        logger.warning("Failed to stop existing listener for %s: %s", device_id, exc)
+
+    if not bool(getattr(device, "enabled", True)):
+        return
+
+    ok = receiver_manager.start_listening(
+        device.device_id,
+        "0.0.0.0",
+        device.port,
+        segments_per_scan=getattr(device, "segments_per_scan", None),
+        format_type=getattr(device, "format_type", "compact"),
+        device_type=getattr(device, "device_type", "picoscan"),
+        sensor_ip=getattr(device, "ip_address", None),
+    )
+    if not ok:
+        logger.warning(
+            "Listener did not start for %s (port=%s, type=%s, format=%s).",
+            device.device_id,
+            device.port,
+            getattr(device, "device_type", "picoscan"),
+            getattr(device, "format_type", "compact"),
+        )
 
 
 @router.get("/", response_model=List[DeviceResponse])
@@ -26,10 +63,11 @@ async def get_device(device_id: str):
 
 
 @router.post("/", response_model=DeviceResponse)
-async def create_device(device_config: DeviceCreate):
+async def create_device(device_config: DeviceCreate, request: Request):
     """Create new device"""
     try:
         device = device_manager.add_device(device_config.model_dump())
+        _sync_device_listener(request, device.device_id)
         return device.to_dict()
     except Exception as e:
         logger.error(f"Error creating device: {e}")
@@ -37,7 +75,7 @@ async def create_device(device_config: DeviceCreate):
 
 
 @router.put("/{device_id}", response_model=DeviceResponse)
-async def update_device(device_id: str, device_update: DeviceUpdate):
+async def update_device(device_id: str, device_update: DeviceUpdate, request: Request):
     """Update device"""
     device = device_manager.get_device(device_id)
     if not device:
@@ -57,6 +95,7 @@ async def update_device(device_id: str, device_update: DeviceUpdate):
     update_data["port"] = update_data.get("port", device.port)
     
     if device_manager.update_device(device_id, update_data):
+        _sync_device_listener(request, device_id)
         return device_manager.get_device(device_id).to_dict()
     else:
         raise HTTPException(status_code=400, detail="Failed to update device")

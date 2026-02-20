@@ -126,8 +126,12 @@ class PicoscanHandler:
 
                 def _write(s):
                     try:
-                        if isinstance(s, str) and ("Received segment" in s or ("Received" in s and "segment" in s)):
-                            return len(s)
+                        if isinstance(s, str):
+                            if not s.strip():
+                                return len(s)
+                            lowered = s.lower()
+                            if "received segment" in lowered or ("received" in lowered and "segment" in lowered):
+                                return len(s)
                     except Exception:
                         pass
                     return orig_write(s)

@@ -8,7 +8,7 @@ from app.analysis.conveyor_measurement import compute_conveyor_object_metrics, b
 from app.analysis.history_store import save_measurement, list_measurements, get_measurement
 from app.services.picoscan_receiver import PicoscanReceiver, PicoscanReceiverManager
 from app.services.lms4000_receiver import Lms4000Receiver
-from app.services.point_cloud_processor import PointCloudProcessor
+from app.services.point_cloud_processor import PointCloudProcessor, PointCloud
 from app.services import tdc_rest
 import logging
 import json
@@ -16,6 +16,7 @@ import time
 import asyncio
 import numpy as np
 import threading
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -24,6 +25,92 @@ router = APIRouter()
 class AcquisitionRequest(BaseModel):
     device_ids: List[str]
     num_segments: int = 1
+
+
+def _region_bounds_from_normalized_rect(frame_settings: dict, rect_norm: list[float]) -> tuple[float, float, float, float] | None:
+    if not isinstance(rect_norm, list) or len(rect_norm) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [float(v) for v in rect_norm]
+    except Exception:
+        return None
+    x0 = max(0.0, min(1.0, x0))
+    x1 = max(0.0, min(1.0, x1))
+    y0 = max(0.0, min(1.0, y0))
+    y1 = max(0.0, min(1.0, y1))
+    nx0, nx1 = min(x0, x1), max(x0, x1)
+    ny0, ny1 = min(y0, y1), max(y0, y1)
+
+    width_m = float((frame_settings or {}).get("width_m", 0.0) or 0.0)
+    height_m = float((frame_settings or {}).get("height_m", 0.0) or 0.0)
+    origin_mode = str((frame_settings or {}).get("origin_mode", "center") or "center")
+    if width_m <= 0 or height_m <= 0:
+        return None
+    width_mm = width_m * 1000.0
+    height_mm = height_m * 1000.0
+    if origin_mode == "center":
+        x_min = -width_mm / 2.0
+        x_max = width_mm / 2.0
+        z_min = -height_mm / 2.0
+        z_max = height_mm / 2.0
+    else:
+        x_min = 0.0
+        x_max = width_mm
+        z_min = 0.0
+        z_max = height_mm
+    span_x = x_max - x_min
+    span_z = z_max - z_min
+    rx0 = x_min + nx0 * span_x
+    rx1 = x_min + nx1 * span_x
+    rz0 = z_max - ny1 * span_z
+    rz1 = z_max - ny0 * span_z
+    return (rx0, rx1, rz0, rz1)
+
+
+def _apply_configured_preview_filters(points: np.ndarray) -> np.ndarray:
+    if points is None or len(points) == 0:
+        return points
+    frame = device_manager.frame_settings or {}
+    cfg = device_manager.preview_filter_settings or {}
+
+    if bool(frame.get("clip_points_to_frame", False)):
+        points = PointCloudProcessor.clip_points_to_frame(points, frame)
+
+    if bool(cfg.get("use_region_filter", False)):
+        bounds = _region_bounds_from_normalized_rect(frame, cfg.get("region_rect_norm") or [0.2, 0.15, 0.8, 0.85])
+        if bounds is not None:
+            points = PointCloudProcessor.filter_region_xz(points, bounds[0], bounds[1], bounds[2], bounds[3])
+
+    if bool(cfg.get("use_voxel_denoise", False)):
+        points = PointCloudProcessor.filter_voxel_density(
+            points,
+            cell_mm=float(cfg.get("voxel_cell_mm", 8.0) or 8.0),
+            min_points_per_cell=int(cfg.get("voxel_min_points_per_cell", 3) or 3),
+            keep_largest_component=bool(cfg.get("voxel_keep_largest_component", False)),
+        )
+
+    if bool(cfg.get("use_orthogonal_filter", False)):
+        points = PointCloudProcessor.filter_orthogonal_directions_xz(
+            points,
+            angle_tolerance_deg=float(cfg.get("orthogonal_angle_tolerance_deg", 12.0) or 12.0),
+            k=10,
+        )
+
+    if bool(cfg.get("use_noise_filter", False)):
+        points = PointCloudProcessor.filter_statistical_noise(
+            points,
+            k=int(cfg.get("noise_filter_k", 16) or 16),
+            std_ratio=float(cfg.get("noise_filter_std_ratio", 1.2) or 1.2),
+        )
+
+    if bool(cfg.get("use_edge_filter", False)):
+        points = PointCloudProcessor.filter_edge_points(
+            points,
+            k=12,
+            curvature_threshold=float(cfg.get("edge_curvature_threshold", 0.08) or 0.08),
+        )
+
+    return points
 
 
 def _get_session_from_app(app) -> dict:
@@ -45,6 +132,7 @@ def _get_session_from_app(app) -> dict:
             "analysis_metrics": None,
             "analysis_points": [],
             "analysis_duration_ms": None,
+            "analysis_timestamp_ms": None,
             "start_delay_mm_remaining": 0.0,
             "trigger_source": "manual",
         }
@@ -55,6 +143,7 @@ def _get_session_from_app(app) -> dict:
     session.setdefault("encoder_rpm", None)
     session.setdefault("encoder_speed_mps", None)
     session.setdefault("encoder_last_data", None)
+    session.setdefault("analysis_timestamp_ms", None)
     return session
 
 
@@ -229,6 +318,7 @@ def _update_session_once(session: dict, receiver_manager):
                         pts = np.column_stack([merged.points, merged.intensities])
                 except Exception:
                     pts = merged.points
+            pts = _apply_configured_preview_filters(pts)
             # Normalize RSSI to 0-100 if present
             if isinstance(pts, np.ndarray) and pts.shape[1] >= 4:
                 try:
@@ -244,8 +334,10 @@ def _update_session_once(session: dict, receiver_manager):
             # limit size for transport
             max_points = 20000
             if len(pts) > max_points:
-                idx = np.random.choice(len(pts), max_points, replace=False)
-                pts = pts[idx]
+                step = max(1, len(pts) // max_points)
+                pts = pts[::step]
+                if len(pts) > max_points:
+                    pts = pts[:max_points]
             session["last_points"] = pts.tolist()
 
             # Build 3D stack along Z based on traveled distance
@@ -262,23 +354,31 @@ def _update_session_once(session: dict, receiver_manager):
                     return
                 if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
                     profiles_to_add = int(delta // profiling_distance_mm)
-                    profile_points = np.array(pts, dtype=np.float32)
+                    profile_points = np.asarray(pts, dtype=np.float32)
                     accumulated = session.get("accumulated_points") or []
-                    for i in range(profiles_to_add):
-                        step_distance = last_profile_distance + profiling_distance_mm * (i + 1)
+                    if profiles_to_add == 1:
+                        step_distance = last_profile_distance + profiling_distance_mm
                         if profile_points.shape[1] >= 3:
-                            # Use data Y as motion axis (matches x/z scan plane in UI)
                             prof = profile_points.copy()
                             prof[:, 1] = step_distance
                         else:
                             prof = profile_points
                         accumulated.extend(prof.tolist())
+                    else:
+                        for i in range(profiles_to_add):
+                            step_distance = last_profile_distance + profiling_distance_mm * (i + 1)
+                            if profile_points.shape[1] >= 3:
+                                prof = profile_points.copy()
+                                # Use data Y as motion axis (matches x/z scan plane in UI)
+                                prof[:, 1] = step_distance
+                            else:
+                                prof = profile_points
+                            accumulated.extend(prof.tolist())
                     session["profiles_count"] = int(session.get("profiles_count", 0) + profiles_to_add)
                     # Cap accumulated size to avoid memory blow-up
                     max_accum = 200000
                     if len(accumulated) > max_accum:
-                        keep_idx = np.random.choice(len(accumulated), max_accum, replace=False)
-                        accumulated = [accumulated[i] for i in keep_idx]
+                        accumulated = accumulated[-max_accum:]
                     session["accumulated_points"] = accumulated
                     session["last_profile_distance_mm"] = last_profile_distance + profiling_distance_mm * profiles_to_add
     except Exception:
@@ -328,6 +428,7 @@ def _run_analysis_for_session(session: dict, app):
         profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
         analysis_cfg = device_manager.analysis_settings or {}
         analysis_app = str(analysis_cfg.get("active_app", "log") or "log")
+        session["analysis_timestamp_ms"] = int(time.time() * 1000)
         session["analysis_app"] = analysis_app
         if points:
             metrics_for_save = None
@@ -381,29 +482,19 @@ def _run_analysis_for_session(session: dict, app):
                 notifier = app.state.tcp_notifier
             except Exception:
                 notifier = None
-            if notifier and analysis_app == "log":
-                slices = metrics.get("slices") or []
-                if slices:
-                    first = slices[0]
-                    last = slices[-1]
-                    length_mm = (metrics.get("y_max_mm") - metrics.get("y_min_mm")) if metrics.get("y_min_mm") is not None else metrics.get("total_length_mm")
-                    values = [
-                        metrics.get("volume_m3"),
-                        length_mm,
-                        first.get("diameter_mm"),
-                        last.get("diameter_mm"),
-                        metrics.get("diameter_mm", {}).get("avg"),
-                        metrics.get("diameter_mm", {}).get("min"),
-                        metrics.get("diameter_mm", {}).get("max"),
-                    ]
-                    msg = "\x02" + ";".join(f"{v:.2f}" if isinstance(v, (int, float)) else "" for v in values) + "\x03"
-                    notifier.broadcast(msg)
+            output_cfg = dict(device_manager.output_settings or {})
+            if notifier and bool(output_cfg.get("enabled", False)):
+                values = _flatten_output_values(session, analysis_app, metrics_for_save or session.get("analysis_metrics"))
+                values = _apply_output_units(values, output_cfg)
+                payload = _format_output_payload(values, output_cfg)
+                notifier.broadcast(payload)
             try:
                 save_measurement({
                     "analysis_app": analysis_app,
                     "metrics": metrics_for_save or session.get("analysis_metrics"),
                     "original_points": points,
                     "augmented_points": session["analysis_points"],
+                    "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
                     "profiling_distance_mm": profiling_distance_mm,
                     "profiles_count": session.get("profiles_count", 0),
                     "distance_mm": session.get("distance_mm", 0.0),
@@ -416,10 +507,12 @@ def _run_analysis_for_session(session: dict, app):
             session["analysis_metrics"] = None
             session["analysis_points"] = []
             session["analysis_duration_ms"] = None
+            session["analysis_timestamp_ms"] = None
     except Exception:
         session["analysis_metrics"] = None
         session["analysis_points"] = []
         session["analysis_duration_ms"] = None
+        session["analysis_timestamp_ms"] = None
 
 
 def stop_trigger_session(app):
@@ -444,6 +537,127 @@ def _extract_segments(result):
         segments = result[0]
         return segments if isinstance(segments, list) else [segments]
     return result if isinstance(result, list) else [result]
+
+
+def _flatten_output_values(session: dict, analysis_app: str, metrics: dict | None) -> dict:
+    ts_ms = int(session.get("analysis_timestamp_ms") or int(time.time() * 1000))
+    dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+    out = {
+        "timestamp_ms": ts_ms,
+        "timestamp_iso": dt.isoformat(),
+        "analysis_app": analysis_app,
+        "distance_mm": float(session.get("distance_mm", 0.0) or 0.0),
+        "profiles_count": int(session.get("profiles_count", 0) or 0),
+    }
+    m = metrics or {}
+    if analysis_app == "log":
+        slices = m.get("slices") or []
+        first = slices[0] if slices else {}
+        last = slices[-1] if slices else {}
+        diam = m.get("diameter_mm") or {}
+        length_mm = m.get("total_length_mm")
+        if length_mm is None and m.get("y_min_mm") is not None and m.get("y_max_mm") is not None:
+            length_mm = float(m.get("y_max_mm")) - float(m.get("y_min_mm"))
+        out.update(
+            {
+                "volume_m3": m.get("volume_m3"),
+                "volume_mm3": m.get("volume_mm3"),
+                "length_mm": length_mm,
+                "diameter_start_mm": first.get("diameter_mm"),
+                "diameter_end_mm": last.get("diameter_mm"),
+                "diameter_avg_mm": diam.get("avg"),
+                "diameter_min_mm": diam.get("min"),
+                "diameter_max_mm": diam.get("max"),
+            }
+        )
+    elif analysis_app == "conveyor_object":
+        obj = m.get("object") or {}
+        bbox = obj.get("bbox_mm") or {}
+        out.update(
+            {
+                "object_points_count": obj.get("points_count"),
+                "object_bbox_length_mm": bbox.get("length"),
+                "object_bbox_width_mm": bbox.get("width"),
+                "object_bbox_height_mm": bbox.get("height"),
+                "object_bbox_volume_m3": obj.get("bbox_volume_m3"),
+            }
+        )
+    return out
+
+
+def _apply_output_units(values: dict, cfg: dict) -> dict:
+    out = dict(values or {})
+    length_unit = str(cfg.get("length_unit", "mm") or "mm").lower()
+    volume_unit = str(cfg.get("volume_unit", "m3") or "m3").lower()
+    if length_unit not in {"mm", "m"}:
+        length_unit = "mm"
+    if volume_unit not in {"m3", "l", "mm3"}:
+        volume_unit = "m3"
+
+    def _conv_len(mm_val):
+        if mm_val is None:
+            return None
+        try:
+            mm = float(mm_val)
+        except Exception:
+            return None
+        return mm / 1000.0 if length_unit == "m" else mm
+
+    def _conv_vol(m3_val):
+        if m3_val is None:
+            return None
+        try:
+            m3 = float(m3_val)
+        except Exception:
+            return None
+        if volume_unit == "l":
+            return m3 * 1000.0
+        if volume_unit == "mm3":
+            return m3 * 1_000_000_000.0
+        return m3
+
+    out["unit_length"] = length_unit
+    out["unit_volume"] = volume_unit
+    out["length"] = _conv_len(out.get("length_mm"))
+    out["diameter_start"] = _conv_len(out.get("diameter_start_mm"))
+    out["diameter_end"] = _conv_len(out.get("diameter_end_mm"))
+    out["diameter_avg"] = _conv_len(out.get("diameter_avg_mm"))
+    out["diameter_min"] = _conv_len(out.get("diameter_min_mm"))
+    out["diameter_max"] = _conv_len(out.get("diameter_max_mm"))
+    out["object_bbox_length"] = _conv_len(out.get("object_bbox_length_mm"))
+    out["object_bbox_width"] = _conv_len(out.get("object_bbox_width_mm"))
+    out["object_bbox_height"] = _conv_len(out.get("object_bbox_height_mm"))
+    out["volume"] = _conv_vol(out.get("volume_m3"))
+    out["object_bbox_volume"] = _conv_vol(out.get("object_bbox_volume_m3"))
+    return out
+
+
+def _format_output_payload(values: dict, cfg: dict) -> str | dict:
+    payload_mode = str(cfg.get("payload_mode", "ascii") or "ascii").lower()
+    selected = [str(v) for v in (cfg.get("selected_fields") or []) if str(v).strip()]
+    include_labels = bool(cfg.get("include_labels", False))
+    sep = str(cfg.get("separator", ";") or ";")
+    prefix = str(cfg.get("prefix", "") or "")
+    suffix = str(cfg.get("suffix", "") or "")
+    precision = int(max(0, min(8, int(cfg.get("float_precision", 2) or 2))))
+
+    if payload_mode == "json":
+        if selected:
+            return {k: values.get(k) for k in selected}
+        return dict(values)
+
+    keys = selected if selected else list(values.keys())
+    parts: list[str] = []
+    for key in keys:
+        val = values.get(key)
+        if isinstance(val, float):
+            txt = f"{val:.{precision}f}"
+        elif val is None:
+            txt = ""
+        else:
+            txt = str(val)
+        parts.append(f"{key}={txt}" if include_labels else txt)
+    return f"{prefix}{sep.join(parts)}{suffix}"
 
 
 @router.post("/start-listening")
@@ -471,6 +685,7 @@ async def start_listening(request: Request):
                 listen_ip,
                 device.port,
                 segments_per_scan=getattr(device, 'segments_per_scan', None),
+                format_type=getattr(device, 'format_type', 'compact'),
                 device_type=getattr(device, 'device_type', 'picoscan'),
                 sensor_ip=getattr(device, 'ip_address', None),
             )
@@ -514,6 +729,7 @@ async def analytics_results(request: Request):
         "metrics": session.get("analysis_metrics"),
         "has_points": bool(session.get("analysis_points")),
         "analysis_duration_ms": session.get("analysis_duration_ms"),
+        "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
     }
 
 
@@ -528,6 +744,7 @@ async def analytics_recompute(request: Request):
         "metrics": session.get("analysis_metrics"),
         "has_points": bool(session.get("analysis_points")),
         "analysis_duration_ms": session.get("analysis_duration_ms"),
+        "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
     }
 
 
@@ -696,7 +913,10 @@ async def receive_point_cloud_data(req: AcquisitionRequest, request: Request):
             raise HTTPException(status_code=500, detail="Receiver manager not initialized")
 
         point_clouds_to_merge = []
-        latest_clouds = receiver_manager.get_point_clouds(num_segments=req.num_segments or 1)
+        if hasattr(receiver_manager, "get_point_clouds_for_devices"):
+            latest_clouds = receiver_manager.get_point_clouds_for_devices(req.device_ids, num_segments=req.num_segments or 1)
+        else:
+            latest_clouds = receiver_manager.get_point_clouds(num_segments=req.num_segments or 1)
         for device_id in req.device_ids:
             device = device_manager.get_device(device_id)
             if not device:
@@ -710,11 +930,14 @@ async def receive_point_cloud_data(req: AcquisitionRequest, request: Request):
             raise HTTPException(status_code=400, detail="No data received - ensure Picoscan is sending UDP")
         
         merged = PointCloudProcessor.merge_point_clouds(point_clouds_to_merge)
-        stats = PointCloudProcessor.calculate_statistics(merged)
+        merged_points = _apply_configured_preview_filters(merged.points)
+        filtered_cloud = PointCloud(merged_points)
+        stats = PointCloudProcessor.calculate_statistics(filtered_cloud)
+        total_points = len(filtered_cloud)
         
         return {
             "message": f"Received data from {len(point_clouds_to_merge)} device(s)",
-            "total_points": len(merged),
+            "total_points": total_points,
             "devices": req.device_ids,
             "segments_per_device": req.num_segments,
             "statistics": stats
@@ -806,7 +1029,8 @@ async def test_receive(device_id: str, num_segments: int = 1):
             # Create temporary receiver
             receiver = PicoscanReceiver(
                 listen_ip="0.0.0.0",
-                listen_port=device.port
+                listen_port=device.port,
+                format_type=getattr(device, "format_type", "compact"),
             )
             # Start listening
             if not receiver.start_listening():
@@ -877,7 +1101,8 @@ async def live_preview(device_id: str, request: Request):
                 else:
                     receiver = PicoscanReceiver(
                         listen_ip="0.0.0.0",
-                        listen_port=device.port
+                        listen_port=device.port,
+                        format_type=getattr(device, "format_type", "compact"),
                     )
                     # Try to start listening
                     if not receiver.start_listening():

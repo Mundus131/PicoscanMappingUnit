@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, field_validator
+from typing import Dict, List, Optional
 
 class CalibrationData(BaseModel):
     translation: List[float]
@@ -24,6 +24,29 @@ class DeviceCreate(BaseModel):
     encoder_enabled: bool = False
     speed_profile: str = "fixed"
 
+    @field_validator("device_type")
+    @classmethod
+    def validate_device_type(cls, value: str) -> str:
+        v = (value or "picoscan").lower()
+        if v not in ("picoscan", "lms4000"):
+            raise ValueError("device_type must be 'picoscan' or 'lms4000'")
+        return v
+
+    @field_validator("protocol")
+    @classmethod
+    def normalize_protocol(cls, value: str | None) -> str | None:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("format_type")
+    @classmethod
+    def validate_format_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        v = value.lower()
+        if v not in ("compact", "msgpack", "lmdscandata"):
+            raise ValueError("format_type must be 'compact', 'msgpack' or 'lmdscandata'")
+        return v
+
 class DeviceUpdate(BaseModel):
     name: Optional[str] = None
     ip_address: Optional[str] = None
@@ -40,6 +63,31 @@ class DeviceUpdate(BaseModel):
     acquisition_mode: Optional[str] = None
     encoder_enabled: Optional[bool] = None
     speed_profile: Optional[str] = None
+
+    @field_validator("device_type")
+    @classmethod
+    def validate_device_type(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        v = value.lower()
+        if v not in ("picoscan", "lms4000"):
+            raise ValueError("device_type must be 'picoscan' or 'lms4000'")
+        return v
+
+    @field_validator("protocol")
+    @classmethod
+    def normalize_protocol(cls, value: Optional[str]) -> Optional[str]:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("format_type")
+    @classmethod
+    def validate_format_type(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        v = value.lower()
+        if v not in ("compact", "msgpack", "lmdscandata"):
+            raise ValueError("format_type must be 'compact', 'msgpack' or 'lmdscandata'")
+        return v
 
 class DeviceResponse(BaseModel):
     device_id: str
@@ -65,6 +113,7 @@ class AutoCalibrationRequest(BaseModel):
     reference_device_id: Optional[str] = None
     method: str = "icp"
     max_iterations: int = 50
+    save_result: bool = True
 
 class AutoCalibrationResult(BaseModel):
     device_id: str
@@ -75,7 +124,51 @@ class AutoCalibrationResult(BaseModel):
 
 class AutoCalibrationResponse(BaseModel):
     method: str
+    saved: bool = True
     results: List[AutoCalibrationResult]
+
+
+class AutoCalibrationApplyRequest(BaseModel):
+    results: List[AutoCalibrationResult]
+
+
+class CalibrationPreviewRequest(BaseModel):
+    device_ids: List[str]
+    max_points: int = 20000
+    calibration_overrides: Optional[Dict[str, CalibrationData]] = None
+    use_edge_filter: bool = False
+    edge_curvature_threshold: float = 0.08
+    use_voxel_denoise: bool = False
+    voxel_cell_mm: float = 8.0
+    voxel_min_points_per_cell: int = 3
+    voxel_keep_largest_component: bool = False
+    use_region_filter: bool = False
+    region_min_x_mm: float | None = None
+    region_max_x_mm: float | None = None
+    region_min_z_mm: float | None = None
+    region_max_z_mm: float | None = None
+    use_orthogonal_filter: bool = False
+    orthogonal_angle_tolerance_deg: float = 12.0
+    use_noise_filter: bool = False
+    noise_filter_k: int = 16
+    noise_filter_std_ratio: float = 1.2
+
+
+class PreviewFilterSettings(BaseModel):
+    use_edge_filter: bool = False
+    edge_curvature_threshold: float = 0.08
+    use_voxel_denoise: bool = False
+    voxel_cell_mm: float = 8.0
+    voxel_min_points_per_cell: int = 3
+    voxel_keep_largest_component: bool = False
+    use_region_filter: bool = False
+    region_rect_norm: List[float] = [0.2, 0.15, 0.8, 0.85]  # [x0, y0, x1, y1]
+    use_orthogonal_filter: bool = False
+    orthogonal_angle_tolerance_deg: float = 12.0
+    use_noise_filter: bool = False
+    noise_filter_k: int = 16
+    noise_filter_std_ratio: float = 1.2
+    visible_device_ids: Optional[List[str]] = None
 
 class ManualCalibrationRequest(BaseModel):
     device_id: str
@@ -87,6 +180,7 @@ class FrameSettings(BaseModel):
     width_m: float
     height_m: float
     origin_mode: str
+    clip_points_to_frame: bool = False
 
 class MotionSettings(BaseModel):
     mode: str  # "fixed" or "encoder"
@@ -111,6 +205,29 @@ class AnalysisSettings(BaseModel):
     conveyor_denoise_cell_mm: float | None = None
     conveyor_denoise_min_points_per_cell: int | None = None
     conveyor_keep_largest_component: bool | None = None
+
+class OutputSettings(BaseModel):
+    enabled: bool = False
+    connection_mode: str = "server"  # "server" | "client"
+    host: str = "0.0.0.0"
+    port: int = 2120
+    payload_mode: str = "ascii"  # "ascii" | "json"
+    separator: str = ";"
+    prefix: str = "\u0002"
+    suffix: str = "\u0003"
+    include_labels: bool = False
+    float_precision: int = 2
+    length_unit: str = "mm"  # "mm" | "m"
+    volume_unit: str = "m3"  # "m3" | "l" | "mm3"
+    selected_fields: List[str] = [
+        "timestamp_iso",
+        "analysis_app",
+        "volume",
+        "length",
+        "diameter_start",
+        "diameter_end",
+        "diameter_avg",
+    ]
 
 class TdcSettings(BaseModel):
     enabled: bool

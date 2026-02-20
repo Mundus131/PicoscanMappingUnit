@@ -35,8 +35,61 @@ interface LogMetrics {
   slices: LogSlice[];
 }
 
+interface OutputSettings {
+  enabled: boolean;
+  connection_mode: 'server' | 'client';
+  host: string;
+  port: number;
+  payload_mode: 'ascii' | 'json';
+  separator: string;
+  prefix: string;
+  suffix: string;
+  include_labels: boolean;
+  float_precision: number;
+  length_unit: 'mm' | 'm';
+  volume_unit: 'm3' | 'l' | 'mm3';
+  selected_fields: string[];
+}
+
 type AnalysisApp = 'log' | 'conveyor_object';
 type ConveyorLocalizationAlgorithm = 'object_cloud_bbox' | 'box_top_plane';
+
+const OUTPUT_FIELD_COMMON: Array<{ key: string; label: string }> = [
+  { key: 'timestamp_iso', label: 'Timestamp ISO' },
+  { key: 'timestamp_ms', label: 'Timestamp ms' },
+  { key: 'analysis_app', label: 'Analysis app' },
+  { key: 'distance_mm', label: 'Distance [mm]' },
+  { key: 'profiles_count', label: 'Profiles count' },
+  { key: 'unit_length', label: 'Unit length' },
+  { key: 'unit_volume', label: 'Unit volume' },
+];
+
+const OUTPUT_FIELD_LOG: Array<{ key: string; label: string }> = [
+  { key: 'volume', label: 'Volume (selected unit)' },
+  { key: 'length', label: 'Length (selected unit)' },
+  { key: 'diameter_start', label: 'Diameter start (selected unit)' },
+  { key: 'diameter_end', label: 'Diameter end (selected unit)' },
+  { key: 'diameter_avg', label: 'Diameter avg (selected unit)' },
+  { key: 'diameter_min', label: 'Diameter min (selected unit)' },
+  { key: 'diameter_max', label: 'Diameter max (selected unit)' },
+];
+
+const OUTPUT_FIELD_CONVEYOR: Array<{ key: string; label: string }> = [
+  { key: 'object_points_count', label: 'Object points count' },
+  { key: 'object_bbox_length', label: 'BBox length (selected unit)' },
+  { key: 'object_bbox_width', label: 'BBox width (selected unit)' },
+  { key: 'object_bbox_height', label: 'BBox height (selected unit)' },
+  { key: 'object_bbox_volume', label: 'BBox volume (selected unit)' },
+];
+
+const PREFIX_SUFFIX_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: 'None' },
+  { value: '\u0002', label: 'STX (0x02)' },
+  { value: '\u0003', label: 'ETX (0x03)' },
+  { value: '\n', label: 'LF (\\n)' },
+  { value: '\r\n', label: 'CRLF (\\r\\n)' },
+  { value: '|', label: 'Pipe (|)' },
+];
 
 interface ConveyorMetrics {
   analysis_app: 'conveyor_object';
@@ -304,6 +357,7 @@ export default function AnalyticsPage() {
   const [hoverPoint, setHoverPoint] = useState<number[] | null>(null);
   const [analysis, setAnalysis] = useState<LogMetrics | ConveyorMetrics | null>(null);
   const [analysisApp, setAnalysisApp] = useState<AnalysisApp>('log');
+  const [analysisTimestampMs, setAnalysisTimestampMs] = useState<number | null>(null);
   const [augmentedPoints, setAugmentedPoints] = useState<number[][]>([]);
   const [showAugmented, setShowAugmented] = useState(true);
   const [showOriginal, setShowOriginal] = useState(true);
@@ -327,9 +381,42 @@ export default function AnalyticsPage() {
   const [convKeepLargestComponent, setConvKeepLargestComponent] = useState(true);
   const [analysisSaving, setAnalysisSaving] = useState(false);
   const [analysisSavedAt, setAnalysisSavedAt] = useState<number | null>(null);
+  const [outputSaving, setOutputSaving] = useState(false);
+  const [outputSavedAt, setOutputSavedAt] = useState<number | null>(null);
+  const [outputSettings, setOutputSettings] = useState<OutputSettings>({
+    enabled: false,
+    connection_mode: 'server',
+    host: '0.0.0.0',
+    port: 2120,
+    payload_mode: 'ascii',
+    separator: ';',
+    prefix: '\u0002',
+    suffix: '\u0003',
+    include_labels: false,
+    float_precision: 2,
+    length_unit: 'mm',
+    volume_unit: 'm3',
+    selected_fields: ['timestamp_iso', 'analysis_app', 'volume', 'length', 'diameter_start', 'diameter_end', 'diameter_avg'],
+  });
   const [profilingDistance, setProfilingDistance] = useState<number>(10);
   const viewerRef = useRef<PointCloudThreeViewerHandle | null>(null);
   const fitOnceRef = useRef(false);
+  const lastAnalysisTsRef = useRef<number | null>(null);
+
+  const outputFieldOptions = useMemo(() => {
+    return analysisApp === 'conveyor_object'
+      ? [...OUTPUT_FIELD_COMMON, ...OUTPUT_FIELD_CONVEYOR]
+      : [...OUTPUT_FIELD_COMMON, ...OUTPUT_FIELD_LOG];
+  }, [analysisApp]);
+
+  const outputAllowedFieldSet = useMemo(() => new Set(outputFieldOptions.map((f) => f.key)), [outputFieldOptions]);
+
+  useEffect(() => {
+    setOutputSettings((prev) => ({
+      ...prev,
+      selected_fields: prev.selected_fields.filter((k) => outputAllowedFieldSet.has(k)),
+    }));
+  }, [outputAllowedFieldSet]);
 
   const fetchStatus = async () => {
     const res = await api.get('/acquisition/trigger/status');
@@ -374,6 +461,40 @@ export default function AnalyticsPage() {
     }
   };
 
+  const fetchOutputSettings = async () => {
+    try {
+      const res = await api.get('/calibration/output-settings');
+      const d = res.data || {};
+      setOutputSettings({
+        enabled: !!d.enabled,
+        connection_mode: d.connection_mode === 'client' ? 'client' : 'server',
+        host: String(d.host ?? '0.0.0.0'),
+        port: Number(d.port ?? 2120),
+        payload_mode: d.payload_mode === 'json' ? 'json' : 'ascii',
+        separator: String(d.separator ?? ';'),
+        prefix: String(d.prefix ?? '\u0002'),
+        suffix: String(d.suffix ?? '\u0003'),
+        include_labels: !!d.include_labels,
+        float_precision: Number(d.float_precision ?? 2),
+        length_unit: d.length_unit === 'm' ? 'm' : 'mm',
+        volume_unit: d.volume_unit === 'l' || d.volume_unit === 'mm3' ? d.volume_unit : 'm3',
+        selected_fields: Array.isArray(d.selected_fields) ? d.selected_fields.map((v: unknown) => String(v)) : [],
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSaveOutputSettings = async () => {
+    setOutputSaving(true);
+    try {
+      await api.put('/calibration/output-settings', outputSettings);
+      setOutputSavedAt(Date.now());
+    } finally {
+      setOutputSaving(false);
+    }
+  };
+
   const handleSaveAndRecomputeAnalysis = async () => {
     setAnalysisSaving(true);
     try {
@@ -394,7 +515,7 @@ export default function AnalyticsPage() {
         conveyor_keep_largest_component: convKeepLargestComponent,
       });
       await api.post('/acquisition/analytics/recompute');
-      await fetchAnalysis();
+      await fetchAnalysis({ forceCloud: true });
       await fetchLatest(fullCloud);
       setAnalysisSavedAt(Date.now());
     } finally {
@@ -426,12 +547,21 @@ export default function AnalyticsPage() {
     });
     fetchMotion();
     fetchAnalysisSettings();
-    fetchAnalysis();
+    fetchOutputSettings();
+    fetchAnalysis({ forceCloud: true });
     const interval = setInterval(() => {
       fetchStatus();
     }, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (status.recording) return;
+      void fetchAnalysis();
+    }, 1200);
+    return () => clearInterval(interval);
+  }, [status.recording]);
 
   useEffect(() => {
     if (points.length > 0 && !fitOnceRef.current) {
@@ -468,24 +598,30 @@ export default function AnalyticsPage() {
       await api.post('/acquisition/trigger/stop');
       await fetchStatus();
       await fetchLatest(true);
-      await fetchAnalysis();
+      await fetchAnalysis({ forceCloud: true });
     } finally {
       setLoading(false);
     }
   };
 
-  const fetchAnalysis = async () => {
+  const fetchAnalysis = async (opts?: { forceCloud?: boolean }) => {
     try {
       const res = await api.get('/acquisition/analytics/results');
       const responseApp = res.data?.analysis_app === 'conveyor_object' ? 'conveyor_object' : 'log';
       setAnalysisApp(responseApp);
       setAnalysis(res.data?.metrics || null);
-      if (res.data?.has_points) {
+      const ts = typeof res.data?.analysis_timestamp_ms === 'number' ? res.data.analysis_timestamp_ms : null;
+      const changed = ts !== null && ts !== lastAnalysisTsRef.current;
+      setAnalysisTimestampMs(ts);
+      if (ts !== null) {
+        lastAnalysisTsRef.current = ts;
+      }
+      if (res.data?.has_points && (opts?.forceCloud || changed)) {
         const pc = await api.get('/acquisition/analytics/augmented-cloud', {
           params: { max_points: 60000 },
         });
         setAugmentedPoints(pc.data?.points || []);
-      } else {
+      } else if (!res.data?.has_points) {
         setAugmentedPoints([]);
       }
       if (typeof res.data?.analysis_duration_ms === 'number') {
@@ -493,6 +629,7 @@ export default function AnalyticsPage() {
       }
     } catch {
       setAnalysis(null);
+      setAnalysisTimestampMs(null);
       setAugmentedPoints([]);
       setAnalysisDuration(null);
     }
@@ -798,6 +935,11 @@ export default function AnalyticsPage() {
                   Floor
                 </label>
               </div>
+              {analysisTimestampMs && (
+                <div className="absolute bottom-4 left-4 rounded-md bg-black/60 px-3 py-2 text-xs text-white">
+                  Analysis timestamp: {new Date(analysisTimestampMs).toLocaleString()}
+                </div>
+              )}
               {hoverPoint && (
                 <div className="absolute bottom-4 right-4 rounded-md bg-black/70 px-3 py-2 text-xs text-white">
                   <div className="font-semibold mb-1">Point data</div>
@@ -840,6 +982,182 @@ export default function AnalyticsPage() {
               <div className="mt-4 text-xs text-gray-500">
                 Last update: {status.last_update_ts ? new Date(status.last_update_ts * 1000).toLocaleTimeString() : ''}
               </div>
+            </div>
+
+            <div className="card">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold text-slate-900">Output Wizard</h2>
+                <button className="btn-secondary" onClick={handleSaveOutputSettings} disabled={outputSaving}>
+                  {outputSaving ? 'Saving...' : 'Save Output'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Configure how analysis frame is sent: connection mode, endpoint and payload fields/order.
+              </p>
+              <div className="mt-4 grid grid-cols-2 gap-4 text-sm">
+                <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
+                  <input
+                    type="checkbox"
+                    checked={outputSettings.enabled}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, enabled: e.target.checked }))}
+                  />
+                  Output enabled
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Connection mode</span>
+                  <select
+                    className="input"
+                    value={outputSettings.connection_mode}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, connection_mode: e.target.value as 'server' | 'client' }))}
+                  >
+                    <option value="server">Server (listen)</option>
+                    <option value="client">Client (connect)</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">{outputSettings.connection_mode === 'server' ? 'Listen IP' : 'Target IP / host'}</span>
+                  <input
+                    className="input"
+                    value={outputSettings.host}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, host: e.target.value }))}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">{outputSettings.connection_mode === 'server' ? 'Listen port' : 'Target port'}</span>
+                  <input
+                    className="input"
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={outputSettings.port}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, port: Number(e.target.value || 2120) }))}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Payload mode</span>
+                  <select
+                    className="input"
+                    value={outputSettings.payload_mode}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, payload_mode: e.target.value as 'ascii' | 'json' }))}
+                  >
+                    <option value="ascii">ASCII frame</option>
+                    <option value="json">JSON</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
+                  <input
+                    type="checkbox"
+                    checked={outputSettings.include_labels}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, include_labels: e.target.checked }))}
+                  />
+                  Include labels (`key=value`)
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Separator</span>
+                  <input
+                    className="input"
+                    value={outputSettings.separator}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, separator: e.target.value }))}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Prefix</span>
+                  <select
+                    className="input"
+                    value={outputSettings.prefix}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, prefix: e.target.value }))}
+                  >
+                    {PREFIX_SUFFIX_OPTIONS.map((o) => (
+                      <option key={`prefix-${o.label}`} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Suffix</span>
+                  <select
+                    className="input"
+                    value={outputSettings.suffix}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, suffix: e.target.value }))}
+                  >
+                    {PREFIX_SUFFIX_OPTIONS.map((o) => (
+                      <option key={`suffix-${o.label}`} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Float precision</span>
+                  <input
+                    className="input"
+                    type="number"
+                    min={0}
+                    max={8}
+                    value={outputSettings.float_precision}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, float_precision: Number(e.target.value || 2) }))}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Length unit</span>
+                  <select
+                    className="input"
+                    value={outputSettings.length_unit}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, length_unit: e.target.value as 'mm' | 'm' }))}
+                  >
+                    <option value="mm">mm</option>
+                    <option value="m">m</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Volume unit</span>
+                  <select
+                    className="input"
+                    value={outputSettings.volume_unit}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, volume_unit: e.target.value as 'm3' | 'l' | 'mm3' }))}
+                  >
+                    <option value="m3">m3</option>
+                    <option value="l">l</option>
+                    <option value="mm3">mm3</option>
+                  </select>
+                </label>
+              </div>
+              <div className="mt-4">
+                <div className="text-xs text-gray-500 mb-2">
+                  Frame fields and order ({analysisApp === 'conveyor_object' ? 'conveyor_object' : 'log'})
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {outputFieldOptions.map((f) => {
+                    const checked = outputSettings.selected_fields.includes(f.key);
+                    return (
+                      <label key={f.key} className="flex items-center gap-2 text-xs text-gray-600">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) =>
+                            setOutputSettings((prev) => ({
+                              ...prev,
+                              selected_fields: e.target.checked
+                                ? [...prev.selected_fields.filter((k) => k !== f.key), f.key]
+                                : prev.selected_fields.filter((k) => k !== f.key),
+                            }))
+                          }
+                        />
+                        {f.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-gray-600">
+                Current order: {outputSettings.selected_fields.join(' -> ') || '(none)'}
+              </div>
+              {outputSavedAt !== null && (
+                <div className="mt-2 text-xs text-emerald-600">
+                  Saved {new Date(outputSavedAt).toLocaleTimeString()}
+                </div>
+              )}
             </div>
 
             <div className="card">
@@ -991,7 +1309,7 @@ export default function AnalyticsPage() {
                     Run local analysis
                   </button>
                 )}
-                <button className="btn-secondary" onClick={fetchAnalysis} disabled={loading}>
+                <button className="btn-secondary" onClick={() => fetchAnalysis({ forceCloud: true })} disabled={loading}>
                   Fetch server analysis
                 </button>
                 <button className="btn-secondary" onClick={() => setAnalysis(null)}>

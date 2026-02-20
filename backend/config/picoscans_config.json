@@ -12,52 +12,13 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          1081.3091562297432,
-          0.0,
-          286.52937051848676
-        ],
-        "rotation_deg": [
-          0.0,
-          53.606382481564566,
-          180.0
-        ],
-        "scale": 1.0
-      },
-      "frame_corner": "top-right",
-      "frame_position": [
-        1.0813091562297432,
-        0.28652937051848676,
-        0.0
-      ],
-      "frame_rotation_deg": [
-        0.0,
-        0.0,
-        53.606382481564566
-      ],
-      "segments_per_scan": null,
-      "acquisition_mode": "continuous",
-      "encoder_enabled": false,
-      "speed_profile": "fixed"
-    },
-    {
-      "device_id": "LMS_1770807524479",
-      "name": "LM4000",
-      "ip_address": "192.168.0.2",
-      "port": 2111,
-      "device_type": "lms4000",
-      "protocol": "tcp",
-      "format_type": "lmdscandata",
-      "enabled": true,
-      "connection_status": "disconnected",
-      "calibration": {
-        "translation": [
           500.0,
           0.0,
-          1000.0
+          490.0
         ],
         "rotation_deg": [
           0.0,
-          90.0,
+          136.5,
           0.0
         ],
         "scale": 1.0
@@ -65,13 +26,52 @@
       "frame_corner": "top-right",
       "frame_position": [
         0.5,
-        1.0,
+        0.49,
         0.0
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        90.0
+        136.5
+      ],
+      "segments_per_scan": null,
+      "acquisition_mode": "continuous",
+      "encoder_enabled": false,
+      "speed_profile": "fixed"
+    },
+    {
+      "device_id": "picoscan_1771578538358",
+      "name": "Picoscan2",
+      "ip_address": "192.168.0.10",
+      "port": 2116,
+      "device_type": "picoscan",
+      "protocol": "udp",
+      "format_type": "compact",
+      "enabled": true,
+      "connection_status": "disconnected",
+      "calibration": {
+        "translation": [
+          139.04576088646655,
+          0.0,
+          555.3118285441329
+        ],
+        "rotation_deg": [
+          0.0,
+          67.32366314645719,
+          0.0
+        ],
+        "scale": 1.0
+      },
+      "frame_corner": "top-left",
+      "frame_position": [
+        0.13904576088646656,
+        0.555311828544133,
+        0.0
+      ],
+      "frame_rotation_deg": [
+        0.0,
+        0.0,
+        67.32366314645719
       ],
       "segments_per_scan": null,
       "acquisition_mode": "continuous",
@@ -87,9 +87,10 @@
     "missing_data_method": "kriging"
   },
   "frame_settings": {
-    "width_m": 1.0,
-    "height_m": 1.0,
-    "origin_mode": "bottom-left"
+    "width_m": 0.5,
+    "height_m": 0.6,
+    "origin_mode": "bottom-left",
+    "clip_points_to_frame": true
   },
   "motion_settings": {
     "mode": "encoder",
@@ -100,7 +101,7 @@
     "encoder_rps": 0.0
   },
   "analysis_settings": {
-    "active_app": "conveyor_object",
+    "active_app": "log",
     "log_window_profiles": 10,
     "log_min_points": 50,
     "conveyor_localization_algorithm": "object_cloud_bbox",
@@ -114,6 +115,25 @@
     "conveyor_denoise_cell_mm": 20.0,
     "conveyor_denoise_min_points_per_cell": 5,
     "conveyor_keep_largest_component": true
+  },
+  "output_settings": {
+    "enabled": true,
+    "connection_mode": "server",
+    "host": "0.0.0.0",
+    "port": 2120,
+    "payload_mode": "ascii",
+    "separator": ";",
+    "prefix": "\u0002",
+    "suffix": "\u0003",
+    "include_labels": false,
+    "float_precision": 2,
+    "length_unit": "mm",
+    "volume_unit": "mm3",
+    "selected_fields": [
+      "length",
+      "diameter_avg",
+      "volume"
+    ]
   },
   "tdc_settings": {
     "enabled": true,
@@ -132,6 +152,30 @@
     "start_delay_mm": 0.0,
     "stop_delay_mode": "distance",
     "stop_delay_ms": 0.0,
-    "stop_delay_mm": 200.0
+    "stop_delay_mm": 100.0
+  },
+  "preview_filter_settings": {
+    "use_edge_filter": false,
+    "edge_curvature_threshold": 0.08,
+    "use_voxel_denoise": true,
+    "voxel_cell_mm": 5.0,
+    "voxel_min_points_per_cell": 3,
+    "voxel_keep_largest_component": true,
+    "use_region_filter": false,
+    "region_rect_norm": [
+      0.2,
+      0.15,
+      0.8,
+      0.85
+    ],
+    "use_orthogonal_filter": false,
+    "orthogonal_angle_tolerance_deg": 12.0,
+    "use_noise_filter": true,
+    "noise_filter_k": 6,
+    "noise_filter_std_ratio": 2.2,
+    "visible_device_ids": [
+      "picoscan_1",
+      "picoscan_1771578538358"
+    ]
   }
 }

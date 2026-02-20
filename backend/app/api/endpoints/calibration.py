@@ -1,7 +1,20 @@
 import logging
 from fastapi import APIRouter, HTTPException, Request
 from app.core.device_manager import device_manager
-from app.schemas.device import AutoCalibrationRequest, AutoCalibrationResponse, AutoCalibrationResult, ManualCalibrationRequest, FrameSettings, MotionSettings, AnalysisSettings, TdcSettings
+from app.schemas.device import (
+    AutoCalibrationRequest,
+    AutoCalibrationResponse,
+    AutoCalibrationResult,
+    AutoCalibrationApplyRequest,
+    CalibrationPreviewRequest,
+    PreviewFilterSettings,
+    ManualCalibrationRequest,
+    FrameSettings,
+    MotionSettings,
+    AnalysisSettings,
+    OutputSettings,
+    TdcSettings,
+)
 import numpy as np
 from app.services.point_cloud_processor import PointCloudProcessor
 
@@ -36,6 +49,176 @@ def _euler_xyz_to_rotation_matrix_deg(r_deg: list[float]) -> np.ndarray:
 def _norm_deg(v: float) -> float:
     return ((float(v) + 180.0) % 360.0) - 180.0
 
+
+def _calibration_to_matrix(calibration: dict | None) -> np.ndarray:
+    cal = calibration or {}
+    t = cal.get("translation") or [0.0, 0.0, 0.0]
+    r = cal.get("rotation_deg") or [0.0, 0.0, 0.0]
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = _euler_xyz_to_rotation_matrix_deg([float(r[0]), float(r[1]), float(r[2])])
+    T[:3, 3] = np.array([float(t[0]), float(t[1]), float(t[2])], dtype=float)
+    return T
+
+
+def _initial_guess_from_device(device) -> np.ndarray:
+    """
+    Build ICP initial guess in data coordinates [mm].
+    Prefer calibration fields (already in data coords), fallback to frame fields with conversion.
+    """
+    cal = getattr(device, "calibration", {}) or {}
+    t = cal.get("translation")
+    r = cal.get("rotation_deg")
+    if not (isinstance(t, (list, tuple)) and len(t) >= 3):
+        fp = getattr(device, "frame_position", None) or [0.0, 0.0, 0.0]  # [x, y, z] in meters (frame coords)
+        # frame -> data mapping (inverse of _apply_calibration_to_device):
+        # frame_position = [t_x/1000, t_z/1000, t_y/1000]
+        t = [float(fp[0]) * 1000.0, float(fp[2]) * 1000.0, float(fp[1]) * 1000.0]
+    if not (isinstance(r, (list, tuple)) and len(r) >= 3):
+        fr = getattr(device, "frame_rotation_deg", None) or [0.0, 0.0, 0.0]  # yaw in index 2
+        # frame yaw (Z) maps to data yaw around Y
+        r = [0.0, float(fr[2]), 0.0]
+
+    init = np.eye(4, dtype=float)
+    init[:3, :3] = _euler_xyz_to_rotation_matrix_deg([float(r[0]), float(r[1]), float(r[2])])
+    init[:3, 3] = np.array([float(t[0]), float(t[1]), float(t[2])], dtype=float)
+    return init
+
+
+def _apply_calibration_to_device(device_id: str, calibration: dict):
+    device = device_manager.get_device(device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+    t = calibration.get("translation", [0.0, 0.0, 0.0])
+    r = calibration.get("rotation_deg", [0.0, 0.0, 0.0])
+    yaw = float(r[1] if len(r) > 1 else 0.0)
+    frame_position = [float(t[0]) / 1000.0, float(t[2]) / 1000.0, float(t[1]) / 1000.0]
+    frame_rotation_deg = [0.0, 0.0, yaw]
+    device_manager.update_device(
+        device_id,
+        {
+            "device_id": device_id,
+            "ip_address": device.ip_address,
+            "port": device.port,
+            "calibration": calibration,
+            "frame_position": frame_position,
+            "frame_rotation_deg": frame_rotation_deg,
+        },
+    )
+
+
+def _build_preview_response(
+    *,
+    request: Request,
+    device_ids: list[str],
+    max_points: int = 20000,
+    calibration_overrides: dict | None = None,
+    use_edge_filter: bool = False,
+    edge_curvature_threshold: float = 0.08,
+    use_voxel_denoise: bool = False,
+    voxel_cell_mm: float = 8.0,
+    voxel_min_points_per_cell: int = 3,
+    voxel_keep_largest_component: bool = False,
+    use_region_filter: bool = False,
+    region_min_x_mm: float | None = None,
+    region_max_x_mm: float | None = None,
+    region_min_z_mm: float | None = None,
+    region_max_z_mm: float | None = None,
+    use_orthogonal_filter: bool = False,
+    orthogonal_angle_tolerance_deg: float = 12.0,
+    use_noise_filter: bool = False,
+    noise_filter_k: int = 16,
+    noise_filter_std_ratio: float = 1.2,
+):
+    receiver_manager = request.app.state.receiver_manager
+    if receiver_manager is None:
+        raise HTTPException(status_code=500, detail="Receiver manager not initialized")
+
+    ids = [d for d in device_ids if d]
+    if not ids:
+        raise HTTPException(status_code=400, detail="device_ids is required")
+
+    if hasattr(receiver_manager, "get_point_clouds_for_devices"):
+        clouds = receiver_manager.get_point_clouds_for_devices(ids, num_segments=10)
+    else:
+        clouds = receiver_manager.get_point_clouds(num_segments=10)
+    point_clouds = []
+    for device_id in ids:
+        device = device_manager.get_device(device_id)
+        if not device:
+            raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+        pts = clouds.get(device_id)
+        if pts is None or len(pts) == 0:
+            continue
+        override = (calibration_overrides or {}).get(device_id)
+        calibration = override or device.calibration
+        point_clouds.append((pts, calibration))
+
+    if not point_clouds:
+        return {"points": [], "devices": ids, "total_points": 0}
+
+    merged = PointCloudProcessor.merge_point_clouds(point_clouds)
+    points = merged.points
+    if bool((device_manager.frame_settings or {}).get("clip_points_to_frame", False)):
+        points = PointCloudProcessor.clip_points_to_frame(points, device_manager.frame_settings or {})
+    if bool(use_region_filter):
+        if None not in (region_min_x_mm, region_max_x_mm, region_min_z_mm, region_max_z_mm):
+            points = PointCloudProcessor.filter_region_xz(
+                points,
+                min_x_mm=float(region_min_x_mm),
+                max_x_mm=float(region_max_x_mm),
+                min_z_mm=float(region_min_z_mm),
+                max_z_mm=float(region_max_z_mm),
+            )
+    if bool(use_voxel_denoise):
+        points = PointCloudProcessor.filter_voxel_density(
+            points,
+            cell_mm=float(voxel_cell_mm),
+            min_points_per_cell=int(voxel_min_points_per_cell),
+            keep_largest_component=bool(voxel_keep_largest_component),
+        )
+    if bool(use_orthogonal_filter):
+        points = PointCloudProcessor.filter_orthogonal_directions_xz(
+            points,
+            angle_tolerance_deg=float(orthogonal_angle_tolerance_deg),
+            k=10,
+        )
+    if bool(use_noise_filter):
+        points = PointCloudProcessor.filter_statistical_noise(
+            points,
+            k=int(noise_filter_k),
+            std_ratio=float(noise_filter_std_ratio),
+        )
+    if bool(use_edge_filter):
+        points = PointCloudProcessor.filter_edge_points(points, k=12, curvature_threshold=edge_curvature_threshold)
+
+    if max_points and len(points) > max_points:
+        step = max(1, len(points) // max_points)
+        points = points[::step]
+        if len(points) > max_points:
+            points = points[:max_points]
+
+    return {
+        "points": points.tolist(),
+        "devices": ids,
+        "total_points": int(len(points)),
+        "use_edge_filter": bool(use_edge_filter),
+        "edge_curvature_threshold": float(edge_curvature_threshold),
+        "use_voxel_denoise": bool(use_voxel_denoise),
+        "voxel_cell_mm": float(voxel_cell_mm),
+        "voxel_min_points_per_cell": int(voxel_min_points_per_cell),
+        "voxel_keep_largest_component": bool(voxel_keep_largest_component),
+        "use_region_filter": bool(use_region_filter),
+        "region_min_x_mm": float(region_min_x_mm) if region_min_x_mm is not None else None,
+        "region_max_x_mm": float(region_max_x_mm) if region_max_x_mm is not None else None,
+        "region_min_z_mm": float(region_min_z_mm) if region_min_z_mm is not None else None,
+        "region_max_z_mm": float(region_max_z_mm) if region_max_z_mm is not None else None,
+        "use_orthogonal_filter": bool(use_orthogonal_filter),
+        "orthogonal_angle_tolerance_deg": float(orthogonal_angle_tolerance_deg),
+        "use_noise_filter": bool(use_noise_filter),
+        "noise_filter_k": int(noise_filter_k),
+        "noise_filter_std_ratio": float(noise_filter_std_ratio),
+    }
+
 @router.post("/auto", response_model=AutoCalibrationResponse)
 async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
     """
@@ -55,7 +238,10 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
         raise HTTPException(status_code=400, detail="device_ids is required")
 
     # Acquire point clouds from receivers
-    point_clouds = receiver_manager.get_point_clouds(num_segments=10)
+    if hasattr(receiver_manager, "get_point_clouds_for_devices"):
+        point_clouds = receiver_manager.get_point_clouds_for_devices(req.device_ids, num_segments=10)
+    else:
+        point_clouds = receiver_manager.get_point_clouds(num_segments=10)
 
     # Determine reference device
     ref_id = (req.reference_device_id or (req.device_ids[0] if req.device_ids else None))
@@ -68,6 +254,10 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
     ref_points = point_clouds.get(ref_id)
     if ref_points is None or len(ref_points) < 50:
         raise HTTPException(status_code=400, detail=f"No point cloud data for reference device {ref_id}")
+    ref_device = device_manager.get_device(ref_id)
+    if not ref_device:
+        raise HTTPException(status_code=404, detail=f"Reference device {ref_id} not found")
+    ref_world_T = _calibration_to_matrix(getattr(ref_device, "calibration", {}) or {})
 
     def to_o3d(points: np.ndarray) -> o3d.geometry.PointCloud:
         pcd = o3d.geometry.PointCloud()
@@ -101,13 +291,11 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
 
         source = to_o3d(source_points)
 
-        # ICP registration with initial guess from frame placement
+        # ICP expects init in target(reference-raw) coordinates:
+        # source->target = inv(T_ref_world) @ T_src_world_init
         threshold = 200.0  # mm
-        init = np.eye(4)
-        init_t = device.frame_position or device.calibration.get("translation") or [0.0, 0.0, 0.0]
-        init_r = device.frame_rotation_deg or device.calibration.get("rotation_deg") or [0.0, 0.0, 0.0]
-        init[:3, :3] = _euler_xyz_to_rotation_matrix_deg(init_r)
-        init[:3, 3] = np.array(init_t, dtype=float)
+        src_world_init = _initial_guess_from_device(device)
+        init = np.linalg.inv(ref_world_T) @ src_world_init
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=req.max_iterations)
         reg = o3d.pipelines.registration.registration_icp(
             source,
@@ -118,9 +306,10 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
             criteria,
         )
 
-        T = reg.transformation
+        # Compose with reference calibration so results are in unified world frame.
+        T = ref_world_T @ reg.transformation
         R = T[:3, :3]
-        t = T[:3, 3].tolist()
+        t = [float(T[0, 3]), float(T[1, 3]), float(T[2, 3])]
         r_deg = _rotation_matrix_to_euler_xyz(R)
 
         # For LMS4000, apply additional +90 deg CCW yaw correction after ICP.
@@ -134,20 +323,8 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
             "rotation_deg": corrected_r_deg,
             "scale": 1.0,
         }
-        # Map data coords -> frame coords (frame X/Y plane, Z motion)
-        frame_position = [t[0] / 1000.0, t[2] / 1000.0, t[1] / 1000.0]
-        frame_rotation_deg = [0.0, 0.0, corrected_yaw]
-        device_manager.update_device(
-            device_id,
-            {
-                "device_id": device_id,
-                "ip_address": device.ip_address,
-                "port": device.port,
-                "calibration": calibration,
-                "frame_position": frame_position,
-                "frame_rotation_deg": frame_rotation_deg,
-            },
-        )
+        if bool(req.save_result):
+            _apply_calibration_to_device(device_id, calibration)
 
         results.append(
             AutoCalibrationResult(
@@ -159,46 +336,101 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
             )
         )
 
-    return AutoCalibrationResponse(method=req.method, results=results)
+    return AutoCalibrationResponse(method=req.method, saved=bool(req.save_result), results=results)
 
 
 @router.get("/preview")
 async def preview_calibrated(device_ids: str, request: Request, max_points: int = 20000):
-    """Return merged calibrated point cloud for preview."""
-    receiver_manager = request.app.state.receiver_manager
-    if receiver_manager is None:
-        raise HTTPException(status_code=500, detail="Receiver manager not initialized")
+    """Return merged calibrated point cloud for preview (saved calibration only)."""
+    return _build_preview_response(
+        request=request,
+        device_ids=[d for d in device_ids.split(",") if d],
+        max_points=max_points,
+    )
 
-    ids = [d for d in device_ids.split(',') if d]
-    if not ids:
-        raise HTTPException(status_code=400, detail="device_ids is required")
 
-    clouds = receiver_manager.get_point_clouds(num_segments=10)
-    point_clouds = []
-    for device_id in ids:
-        device = device_manager.get_device(device_id)
-        if not device:
-            raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
-        pts = clouds.get(device_id)
-        if pts is None or len(pts) == 0:
-            continue
-        point_clouds.append((pts, device.calibration))
+@router.post("/preview")
+async def preview_calibrated_with_overrides(req: CalibrationPreviewRequest, request: Request):
+    """Return merged calibrated point cloud for preview with optional temporary overrides."""
+    overrides = None
+    if req.calibration_overrides:
+        overrides = {
+            dev_id: {
+                "translation": cal.translation,
+                "rotation_deg": cal.rotation_deg,
+                "scale": cal.scale,
+            }
+            for dev_id, cal in req.calibration_overrides.items()
+        }
+    return _build_preview_response(
+        request=request,
+        device_ids=req.device_ids,
+        max_points=req.max_points,
+        calibration_overrides=overrides,
+        use_edge_filter=bool(req.use_edge_filter),
+        edge_curvature_threshold=float(req.edge_curvature_threshold),
+        use_voxel_denoise=bool(req.use_voxel_denoise),
+        voxel_cell_mm=float(req.voxel_cell_mm),
+        voxel_min_points_per_cell=int(req.voxel_min_points_per_cell),
+        voxel_keep_largest_component=bool(req.voxel_keep_largest_component),
+        use_region_filter=bool(req.use_region_filter),
+        region_min_x_mm=req.region_min_x_mm,
+        region_max_x_mm=req.region_max_x_mm,
+        region_min_z_mm=req.region_min_z_mm,
+        region_max_z_mm=req.region_max_z_mm,
+        use_orthogonal_filter=bool(req.use_orthogonal_filter),
+        orthogonal_angle_tolerance_deg=float(req.orthogonal_angle_tolerance_deg),
+        use_noise_filter=bool(req.use_noise_filter),
+        noise_filter_k=int(req.noise_filter_k),
+        noise_filter_std_ratio=float(req.noise_filter_std_ratio),
+    )
 
-    if not point_clouds:
-        return {"points": [], "devices": ids, "total_points": 0}
 
-    merged = PointCloudProcessor.merge_point_clouds(point_clouds)
-    points = merged.points
+@router.get("/preview-filter-settings")
+async def get_preview_filter_settings():
+    return device_manager.preview_filter_settings
 
-    if max_points and len(points) > max_points:
-        idx = np.random.choice(len(points), max_points, replace=False)
-        points = points[idx]
 
-    return {
-        "points": points.tolist(),
-        "devices": ids,
-        "total_points": int(len(points)),
+@router.put("/preview-filter-settings")
+async def update_preview_filter_settings(req: PreviewFilterSettings):
+    rect = list(req.region_rect_norm or [0.2, 0.15, 0.8, 0.85])
+    if len(rect) != 4:
+        rect = [0.2, 0.15, 0.8, 0.85]
+    rect = [float(max(0.0, min(1.0, v))) for v in rect]
+    device_manager.preview_filter_settings = {
+        "use_edge_filter": bool(req.use_edge_filter),
+        "edge_curvature_threshold": float(req.edge_curvature_threshold),
+        "use_voxel_denoise": bool(req.use_voxel_denoise),
+        "voxel_cell_mm": float(req.voxel_cell_mm),
+        "voxel_min_points_per_cell": int(req.voxel_min_points_per_cell),
+        "voxel_keep_largest_component": bool(req.voxel_keep_largest_component),
+        "use_region_filter": bool(req.use_region_filter),
+        "region_rect_norm": rect,
+        "use_orthogonal_filter": bool(req.use_orthogonal_filter),
+        "orthogonal_angle_tolerance_deg": float(req.orthogonal_angle_tolerance_deg),
+        "use_noise_filter": bool(req.use_noise_filter),
+        "noise_filter_k": int(req.noise_filter_k),
+        "noise_filter_std_ratio": float(req.noise_filter_std_ratio),
+        "visible_device_ids": list(req.visible_device_ids) if req.visible_device_ids is not None else None,
     }
+    device_manager._save_to_json()
+    return device_manager.preview_filter_settings
+
+
+@router.post("/apply-auto-results")
+async def apply_auto_calibration_results(req: AutoCalibrationApplyRequest):
+    if not req.results:
+        raise HTTPException(status_code=400, detail="results are required")
+    applied = []
+    for result in req.results:
+        calibration = {
+            "translation": result.translation,
+            "rotation_deg": result.rotation_deg,
+            "scale": result.scale,
+        }
+        _apply_calibration_to_device(result.device_id, calibration)
+        applied.append(result.device_id)
+    return {"applied": applied, "count": len(applied)}
 
 
 @router.post("/manual")
@@ -230,6 +462,7 @@ async def update_frame_settings(req: FrameSettings):
         "width_m": req.width_m,
         "height_m": req.height_m,
         "origin_mode": req.origin_mode,
+        "clip_points_to_frame": bool(req.clip_points_to_frame),
     }
     device_manager._save_to_json()
     return device_manager.frame_settings
@@ -262,6 +495,61 @@ async def get_tdc_settings():
 @router.get("/analysis-settings")
 async def get_analysis_settings():
     return device_manager.analysis_settings
+
+
+@router.get("/output-settings")
+async def get_output_settings():
+    return device_manager.output_settings
+
+
+@router.put("/output-settings")
+async def update_output_settings(req: OutputSettings, request: Request):
+    mode = (req.connection_mode or "server").strip().lower()
+    if mode not in {"server", "client"}:
+        mode = "server"
+    payload_mode = (req.payload_mode or "ascii").strip().lower()
+    if payload_mode not in {"ascii", "json"}:
+        payload_mode = "ascii"
+    selected_fields = [str(v) for v in (req.selected_fields or []) if str(v).strip()]
+    if not selected_fields:
+        selected_fields = [
+            "timestamp_iso",
+            "analysis_app",
+            "volume",
+            "length",
+            "diameter_start",
+            "diameter_end",
+            "diameter_avg",
+        ]
+    length_unit = str(req.length_unit or "mm").strip().lower()
+    if length_unit not in {"mm", "m"}:
+        length_unit = "mm"
+    volume_unit = str(req.volume_unit or "m3").strip().lower()
+    if volume_unit not in {"m3", "l", "mm3"}:
+        volume_unit = "m3"
+    device_manager.output_settings = {
+        "enabled": bool(req.enabled),
+        "connection_mode": mode,
+        "host": str(req.host or "0.0.0.0"),
+        "port": int(req.port),
+        "payload_mode": payload_mode,
+        "separator": str(req.separator or ";"),
+        "prefix": str(req.prefix or ""),
+        "suffix": str(req.suffix or ""),
+        "include_labels": bool(req.include_labels),
+        "float_precision": int(max(0, min(8, req.float_precision))),
+        "length_unit": length_unit,
+        "volume_unit": volume_unit,
+        "selected_fields": selected_fields,
+    }
+    device_manager._save_to_json()
+    try:
+        notifier = request.app.state.tcp_notifier
+    except Exception:
+        notifier = None
+    if notifier and hasattr(notifier, "configure"):
+        notifier.configure(device_manager.output_settings)
+    return device_manager.output_settings
 
 
 @router.put("/analysis-settings")

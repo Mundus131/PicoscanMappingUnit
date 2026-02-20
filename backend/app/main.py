@@ -23,6 +23,8 @@ class _ConsoleSanitizeFilter(logging.Filter):
         except Exception:
             return True
         cleaned = "".join(ch if 32 <= ord(ch) <= 126 else " " for ch in msg)
+        if not cleaned.strip():
+            return False
         record.msg = cleaned
         record.args = ()
         return True
@@ -80,7 +82,13 @@ async def startup_event():
     try:
         receiver_manager = PicoscanReceiverManager()
         app.state.receiver_manager = receiver_manager
-        notifier = TcpNotifier(port=2120)
+        out_cfg = dict(device_manager.output_settings or {})
+        notifier = TcpNotifier(
+            host=str(out_cfg.get("host", "0.0.0.0")),
+            port=int(out_cfg.get("port", 2120) or 2120),
+            mode=str(out_cfg.get("connection_mode", "server") or "server"),
+            enabled=bool(out_cfg.get("enabled", False)),
+        )
         notifier.start()
         app.state.tcp_notifier = notifier
         tdc_monitor = TdcTriggerMonitor(app)
@@ -102,6 +110,7 @@ async def startup_event():
             "analysis_metrics": None,
             "analysis_points": [],
             "analysis_duration_ms": None,
+            "analysis_timestamp_ms": None,
         }
         acquisition.ensure_encoder_monitor_started(app)
         
@@ -119,6 +128,7 @@ async def startup_event():
                     listen_ip,
                     device.port,
                     segments_per_scan=getattr(device, 'segments_per_scan', None),
+                    format_type=getattr(device, 'format_type', 'compact'),
                     device_type=getattr(device, 'device_type', 'picoscan'),
                     sensor_ip=getattr(device, 'ip_address', None),
                 )
