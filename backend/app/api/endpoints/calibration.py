@@ -50,6 +50,39 @@ def _norm_deg(v: float) -> float:
     return ((float(v) + 180.0) % 360.0) - 180.0
 
 
+def _ang_dist_deg(a: float, b: float) -> float:
+    return abs(_norm_deg(float(a) - float(b)))
+
+
+def _uses_lmd_stream(device) -> bool:
+    fmt = str(getattr(device, "format_type", "") or "").lower()
+    dtype = str(getattr(device, "device_type", "") or "").lower()
+    return fmt == "lmdscandata" or dtype == "lms4000"
+
+
+def _resolve_lmd_yaw(device, raw_yaw_deg: float, init_yaw_deg: float) -> float:
+    """
+    Resolve LMD yaw ambiguity.
+    Priority:
+    1) per-device configured lmd_yaw_correction_deg
+    2) best candidate nearest to initial guess (90/-90/180/0)
+    """
+    configured = getattr(device, "lmd_yaw_correction_deg", None)
+    if isinstance(configured, (int, float)):
+        return _norm_deg(float(raw_yaw_deg) + float(configured))
+
+    candidates = [90.0, -90.0, 180.0, 0.0]
+    best = None
+    best_err = None
+    for off in candidates:
+        y = _norm_deg(float(raw_yaw_deg) + off)
+        err = _ang_dist_deg(y, init_yaw_deg)
+        if best is None or err < float(best_err):
+            best = y
+            best_err = err
+    return float(best if best is not None else _norm_deg(raw_yaw_deg))
+
+
 def _calibration_to_matrix(calibration: dict | None) -> np.ndarray:
     cal = calibration or {}
     t = cal.get("translation") or [0.0, 0.0, 0.0]
@@ -291,31 +324,60 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
 
         source = to_o3d(source_points)
 
-        # ICP expects init in target(reference-raw) coordinates:
-        # source->target = inv(T_ref_world) @ T_src_world_init
         threshold = 200.0  # mm
         src_world_init = _initial_guess_from_device(device)
-        init = np.linalg.inv(ref_world_T) @ src_world_init
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=req.max_iterations)
-        reg = o3d.pipelines.registration.registration_icp(
-            source,
-            target,
-            threshold,
-            init,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria,
-        )
+        init_r = _rotation_matrix_to_euler_xyz(src_world_init[:3, :3])
+        init_yaw = float(init_r[1]) if len(init_r) > 1 else 0.0
+        yaw_hypotheses = [0.0, 90.0, -90.0, 180.0] if _uses_lmd_stream(device) else [0.0]
+
+        best_reg = None
+        best_offset = 0.0
+        best_metric = None
+        for yaw_off in yaw_hypotheses:
+            src_world_guess = np.array(src_world_init, copy=True)
+            guessed_r = [float(init_r[0]), _norm_deg(init_yaw + float(yaw_off)), float(init_r[2])]
+            src_world_guess[:3, :3] = _euler_xyz_to_rotation_matrix_deg(guessed_r)
+            # ICP expects init in target(reference-raw) coordinates:
+            # source->target = inv(T_ref_world) @ T_src_world_guess
+            init = np.linalg.inv(ref_world_T) @ src_world_guess
+            reg_try = o3d.pipelines.registration.registration_icp(
+                source,
+                target,
+                threshold,
+                init,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                criteria,
+            )
+            fitness = float(getattr(reg_try, "fitness", 0.0) or 0.0)
+            rmse = float(getattr(reg_try, "inlier_rmse", 1e9) or 1e9)
+            # Primary: maximize fitness, secondary: minimize RMSE.
+            metric = (fitness, -rmse)
+            if best_metric is None or metric > best_metric:
+                best_metric = metric
+                best_reg = reg_try
+                best_offset = float(yaw_off)
+
+        if best_reg is None:
+            raise HTTPException(status_code=500, detail=f"ICP failed for device {device_id}")
+        reg = best_reg
 
         # Compose with reference calibration so results are in unified world frame.
         T = ref_world_T @ reg.transformation
         R = T[:3, :3]
         t = [float(T[0, 3]), float(T[1, 3]), float(T[2, 3])]
         r_deg = _rotation_matrix_to_euler_xyz(R)
-
-        # For LMS4000, apply additional +90 deg CCW yaw correction after ICP.
-        # This keeps receiver geometry raw and puts mounting correction in calibration.
-        yaw_correction_deg = 90.0 if str(getattr(device, "device_type", "")).lower() == "lms4000" else 0.0
-        corrected_yaw = _norm_deg(float(r_deg[1]) + yaw_correction_deg)
+        corrected_yaw = _norm_deg(float(r_deg[1]))
+        logger.debug(
+            "Auto-calibration ICP hypothesis for %s: init_yaw=%.2f chosen_offset=%.2f corrected=%.2f fitness=%.4f rmse=%.4f lmd=%s",
+            device_id,
+            float(init_yaw),
+            float(best_offset),
+            float(corrected_yaw),
+            float(getattr(reg, "fitness", 0.0) or 0.0),
+            float(getattr(reg, "inlier_rmse", 0.0) or 0.0),
+            bool(_uses_lmd_stream(device)),
+        )
         corrected_r_deg = [float(r_deg[0]), corrected_yaw, float(r_deg[2])]
 
         calibration = {
@@ -494,7 +556,12 @@ async def get_tdc_settings():
 
 @router.get("/analysis-settings")
 async def get_analysis_settings():
-    return device_manager.analysis_settings
+    current = dict(device_manager.analysis_settings or {})
+    active_app = str(current.get("active_app", "log") or "log").strip().lower()
+    if active_app not in {"log", "none"}:
+        active_app = "log"
+    current["active_app"] = active_app
+    return current
 
 
 @router.get("/output-settings")
@@ -504,9 +571,7 @@ async def get_output_settings():
 
 @router.put("/output-settings")
 async def update_output_settings(req: OutputSettings, request: Request):
-    mode = (req.connection_mode or "server").strip().lower()
-    if mode not in {"server", "client"}:
-        mode = "server"
+    mode = "server"
     payload_mode = (req.payload_mode or "ascii").strip().lower()
     if payload_mode not in {"ascii", "json"}:
         payload_mode = "ascii"
@@ -527,11 +592,40 @@ async def update_output_settings(req: OutputSettings, request: Request):
     volume_unit = str(req.volume_unit or "m3").strip().lower()
     if volume_unit not in {"m3", "l", "mm3"}:
         volume_unit = "m3"
+    frame_items_raw = req.output_frame_items or []
+    frame_items: list[dict] = []
+    for item in frame_items_raw:
+        if not isinstance(item, dict):
+            continue
+        itype = str(item.get("type", "field") or "field").strip().lower()
+        if itype == "marker":
+            marker_value = str(item.get("value", "") or item.get("text", "") or "")
+            marker_label = str(item.get("label", "") or "")
+            frame_items.append({"type": "marker", "value": marker_value, "label": marker_label})
+            continue
+        if itype == "text":
+            txt = str(item.get("text", "") or "")
+            frame_items.append({"type": "text", "text": txt})
+            continue
+        key = str(item.get("key", "") or "").strip()
+        if not key:
+            continue
+        label = str(item.get("label", "") or "")
+        try:
+            precision = int(item.get("precision", req.float_precision))
+        except Exception:
+            precision = int(req.float_precision)
+        precision = int(max(0, min(8, precision)))
+        frame_items.append({"type": "field", "key": key, "label": label, "precision": precision})
+
+    if not frame_items:
+        frame_items = [{"type": "field", "key": f, "label": ""} for f in selected_fields]
+
     device_manager.output_settings = {
         "enabled": bool(req.enabled),
         "connection_mode": mode,
         "host": str(req.host or "0.0.0.0"),
-        "port": int(req.port),
+        "port": 2120,
         "payload_mode": payload_mode,
         "separator": str(req.separator or ";"),
         "prefix": str(req.prefix or ""),
@@ -541,6 +635,7 @@ async def update_output_settings(req: OutputSettings, request: Request):
         "length_unit": length_unit,
         "volume_unit": volume_unit,
         "selected_fields": selected_fields,
+        "output_frame_items": frame_items,
     }
     device_manager._save_to_json()
     try:
@@ -555,8 +650,8 @@ async def update_output_settings(req: OutputSettings, request: Request):
 @router.put("/analysis-settings")
 async def update_analysis_settings(req: AnalysisSettings):
     current = dict(device_manager.analysis_settings or {})
-    active_app = (req.active_app or "log").strip()
-    if active_app not in {"log", "conveyor_object"}:
+    active_app = str(req.active_app or "log").strip().lower()
+    if active_app not in {"log", "none"}:
         active_app = "log"
     loc_algo = (
         req.conveyor_localization_algorithm

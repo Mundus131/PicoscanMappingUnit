@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  backend:
+    image: picocan-backend:arm64
+    container_name: picocan-backend
+    restart: unless-stopped
+    dns:
+      - 192.168.0.1
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - LOG_LEVEL=INFO
+      # Zmien na adres UI na Twoim serwerze, np:
+      # ["http://192.168.0.100:3000","http://localhost:3000"]
+      - CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000","http://192.168.0.100:3000"]
+    ports:
+      - "8000:8000/tcp"
+      - "2120:2120/tcp"
+      - "2115:2115/udp"
+      - "2116:2116/udp"
+      - "2117:2117/udp"
+      - "2118:2118/udp"
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+      # opcjonalnie: trwala konfiguracja skanerow z hosta
+      # - ./backend/config/picoscans_config.json:/app/config/picoscans_config.json
+    networks:
+      - picocan_net
+
+  frontend:
+    image: picocan-frontend:arm64
+    container_name: picocan-frontend
+    restart: unless-stopped
+    dns:
+      - 192.168.0.1
+      - 1.1.1.1
+      - 8.8.8.8
+    ports:
+      - "3000:3000/tcp"
+    depends_on:
+      - backend
+    networks:
+      - picocan_net
+
+networks:
+  picocan_net:
+    driver: bridge
+
+volumes:
+  backend_logs:
+  backend_data:

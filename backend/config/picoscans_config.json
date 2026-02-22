@@ -1,8 +1,8 @@
 {
   "devices": [
     {
-      "device_id": "picoscan_1",
-      "name": "Picoscan123",
+      "device_id": "picoscan_1771697652515",
+      "name": "Pico tr",
       "ip_address": "192.168.0.1",
       "port": 2115,
       "device_type": "picoscan",
@@ -12,36 +12,37 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          500.0,
+          1300.0,
           0.0,
-          490.0
+          700.0
         ],
         "rotation_deg": [
           0.0,
-          136.5,
+          135.0,
           0.0
         ],
         "scale": 1.0
       },
       "frame_corner": "top-right",
       "frame_position": [
-        0.5,
-        0.49,
+        1.3,
+        0.7,
         0.0
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        136.5
+        135.0
       ],
       "segments_per_scan": null,
       "acquisition_mode": "continuous",
       "encoder_enabled": false,
-      "speed_profile": "fixed"
+      "speed_profile": "fixed",
+      "lmd_yaw_correction_deg": null
     },
     {
-      "device_id": "picoscan_1771578538358",
-      "name": "Picoscan2",
+      "device_id": "picoscan_1771697913920",
+      "name": "pic tl",
       "ip_address": "192.168.0.10",
       "port": 2116,
       "device_type": "picoscan",
@@ -51,32 +52,33 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          139.04576088646655,
+          326.828842677852,
           0.0,
-          555.3118285441329
+          788.5966167784112
         ],
         "rotation_deg": [
           0.0,
-          67.32366314645719,
+          54.80019802403257,
           0.0
         ],
         "scale": 1.0
       },
       "frame_corner": "top-left",
       "frame_position": [
-        0.13904576088646656,
-        0.555311828544133,
+        0.326828842677852,
+        0.7885966167784112,
         0.0
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        67.32366314645719
+        54.80019802403257
       ],
       "segments_per_scan": null,
       "acquisition_mode": "continuous",
       "encoder_enabled": false,
-      "speed_profile": "fixed"
+      "speed_profile": "fixed",
+      "lmd_yaw_correction_deg": null
     }
   ],
   "point_cloud_settings": {
@@ -84,29 +86,31 @@
     "voxel_size": 5.0,
     "max_points": 1000000,
     "interpolate_missing_data": true,
-    "missing_data_method": "kriging"
+    "missing_data_method": "kriging",
+    "require_complete_frames": false,
+    "incomplete_frame_timeout_s": 0.35
   },
   "frame_settings": {
-    "width_m": 0.5,
-    "height_m": 0.6,
+    "width_m": 1.3,
+    "height_m": 0.7,
     "origin_mode": "bottom-left",
     "clip_points_to_frame": true
   },
   "motion_settings": {
     "mode": "encoder",
     "fixed_speed_mps": null,
-    "profiling_distance_mm": 1.0,
+    "profiling_distance_mm": 10.0,
     "encoder_wheel_mode": "circumference",
     "encoder_wheel_value_mm": 200.0,
     "encoder_rps": 0.0
   },
   "analysis_settings": {
     "active_app": "log",
-    "log_window_profiles": 10,
-    "log_min_points": 50,
-    "conveyor_localization_algorithm": "object_cloud_bbox",
+    "log_window_profiles": 5,
+    "log_min_points": 30,
+    "conveyor_localization_algorithm": "box_top_plane",
     "conveyor_plane_quantile": 0.4,
-    "conveyor_plane_inlier_mm": 2.0,
+    "conveyor_plane_inlier_mm": 1.0,
     "conveyor_object_min_height_mm": 8.0,
     "conveyor_object_max_points": 60000,
     "conveyor_top_plane_quantile": 0.88,
@@ -122,17 +126,61 @@
     "host": "0.0.0.0",
     "port": 2120,
     "payload_mode": "ascii",
-    "separator": ";",
-    "prefix": "\u0002",
-    "suffix": "\u0003",
+    "separator": "|",
+    "prefix": "",
+    "suffix": "",
     "include_labels": false,
     "float_precision": 2,
     "length_unit": "mm",
     "volume_unit": "mm3",
     "selected_fields": [
-      "length",
-      "diameter_avg",
+      "timestamp_iso",
+      "analysis_app",
+      "length_mm",
+      "diameter_avg_mm",
       "volume"
+    ],
+    "output_frame_items": [
+      {
+        "type": "marker",
+        "value": "\u0002",
+        "label": "STX (0x02)"
+      },
+      {
+        "type": "field",
+        "key": "timestamp_iso",
+        "label": "Timestamp ISO",
+        "precision": 0
+      },
+      {
+        "type": "field",
+        "key": "analysis_app",
+        "label": "Analysis app",
+        "precision": 0
+      },
+      {
+        "type": "field",
+        "key": "length_mm",
+        "label": "Length (selected unit)",
+        "precision": 0
+      },
+      {
+        "type": "field",
+        "key": "diameter_avg_mm",
+        "label": "Diameter avg (selected unit)",
+        "precision": 0
+      },
+      {
+        "type": "field",
+        "key": "volume",
+        "label": "Volume (selected unit)",
+        "precision": 0
+      },
+      {
+        "type": "marker",
+        "value": "\u0003",
+        "label": "ETX (0x03)"
+      }
     ]
   },
   "tdc_settings": {
@@ -143,7 +191,7 @@
     "password": "Welcome1!",
     "realm": "admin",
     "trigger_input": "DI_A",
-    "poll_interval_ms": 200,
+    "poll_interval_ms": 100,
     "token_refresh_interval_s": 300,
     "grpc_timeout_s": 5.0,
     "encoder_port": "1",
@@ -152,14 +200,14 @@
     "start_delay_mm": 0.0,
     "stop_delay_mode": "distance",
     "stop_delay_ms": 0.0,
-    "stop_delay_mm": 100.0
+    "stop_delay_mm": 0.0
   },
   "preview_filter_settings": {
     "use_edge_filter": false,
     "edge_curvature_threshold": 0.08,
-    "use_voxel_denoise": true,
+    "use_voxel_denoise": false,
     "voxel_cell_mm": 5.0,
-    "voxel_min_points_per_cell": 3,
+    "voxel_min_points_per_cell": 1,
     "voxel_keep_largest_component": true,
     "use_region_filter": false,
     "region_rect_norm": [
@@ -170,12 +218,12 @@
     ],
     "use_orthogonal_filter": false,
     "orthogonal_angle_tolerance_deg": 12.0,
-    "use_noise_filter": true,
+    "use_noise_filter": false,
     "noise_filter_k": 6,
     "noise_filter_std_ratio": 2.2,
     "visible_device_ids": [
-      "picoscan_1",
-      "picoscan_1771578538358"
+      "picoscan_1771697652515",
+      "picoscan_1771697913920"
     ]
   }
 }

@@ -1,3 +1,7 @@
+@import '@synergy-design-system/tokens/themes/light.css';
+@import '@synergy-design-system/components/index.css';
+@import '@synergy-design-system/styles/index.css';
+@import '@synergy-design-system/fonts/src/sick-intl/font.css';
 @import "tailwindcss";
 
 @layer base {
@@ -58,15 +62,29 @@
 }
 
 @layer components {
+  .shell,
   .app-shell {
     min-height: 100vh;
     background: linear-gradient(180deg, #e8ecef 0%, #e2e6ea 100%);
   }
 
+  .dark .shell,
   .dark .app-shell {
     background: linear-gradient(180deg, #11181e 0%, #0f151a 100%);
   }
 
+  .appshell-main {
+    display: flex;
+    min-height: calc(100vh - var(--header-height));
+  }
+
+  .appshell-content {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: auto;
+  }
+
+  .header,
   .shell-header {
     position: sticky;
     top: 0;
@@ -93,11 +111,20 @@
     color: var(--text-muted);
   }
 
+  .appshell-rail,
   .shell-sidebar {
-    width: 270px;
-    border-right: 1px solid var(--surface-border);
+    width: 72px;
+    flex: 0 0 72px;
+    transition: width 0.2s ease, flex-basis 0.2s ease, transform 0.2s ease;
+    border-right: 0;
     background: #6b7984;
     color: #edf3f7;
+    z-index: 35;
+  }
+
+  .appshell-rail.rail-open {
+    width: 280px;
+    flex-basis: 280px;
   }
 
   .sidebar-brand {
@@ -138,6 +165,46 @@
     opacity: 0.85;
   }
 
+  .rail-labels {
+    opacity: 0;
+    transition: opacity 0.16s ease;
+    pointer-events: none;
+  }
+
+  .appshell-rail.rail-open .rail-labels,
+  .appshell-rail.rail-open .sidebar-brand-text {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .appshell-rail:not(.rail-open) .sidebar-brand-text {
+    display: none;
+  }
+
+  .appshell-rail:not(.rail-open) .sidebar-nav-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: fit-content;
+    margin-inline: auto;
+    padding: 6px;
+    border-radius: 10px;
+  }
+
+  .appshell-rail:not(.rail-open) .sidebar-nav-link.active {
+    padding: 6px;
+  }
+
+  .appshell-rail:not(.rail-open) .sidebar-nav-meta,
+  .appshell-rail:not(.rail-open) .sidebar-label,
+  .appshell-rail:not(.rail-open) .theme-panel {
+    display: none;
+  }
+
+  .appshell-rail:not(.rail-open) .rail-labels {
+    display: none;
+  }
+
   .content-wrap {
     width: 100%;
     max-width: 1540px;
@@ -154,6 +221,10 @@
     box-shadow: 0 8px 20px rgba(24, 36, 45, 0.08);
   }
 
+  .table-container {
+    overflow-x: auto;
+  }
+
   .card {
     padding: 16px;
   }
@@ -166,6 +237,10 @@
 
   .card-body {
     padding: 16px;
+  }
+
+  .viewer-panel-height {
+    height: clamp(360px, 68vh, 760px);
   }
 
   .btn,
@@ -341,6 +416,46 @@
     background-image: linear-gradient(180deg, #ffffff 0%, #f7f9fb 100%);
   }
 
+  .syn-like-select {
+    width: 100%;
+    border: 1px solid #b8c5cf;
+    border-radius: 10px;
+    padding: 8px 34px 8px 11px;
+    min-height: 36px;
+    background-image:
+      linear-gradient(180deg, #ffffff 0%, #f7f9fb 100%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23516b7d' d='M5 6 0 0h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat, no-repeat;
+    background-position: 0 0, calc(100% - 12px) 50%;
+    background-size: auto, 10px 6px;
+    color: var(--text);
+    appearance: none;
+    cursor: pointer;
+  }
+
+  .syn-like-select:focus {
+    outline: none;
+    border-color: #2a8dce;
+    box-shadow: 0 0 0 3px rgba(34, 133, 200, 0.2);
+  }
+
+  .syn-like-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #314654;
+    user-select: none;
+    cursor: pointer;
+  }
+
+  .syn-like-check > input[type='checkbox'] {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: #0b78c2;
+  }
+
   .table-header,
   .table-row {
     padding: 10px 14px;
@@ -381,6 +496,21 @@
     height: 8px;
     border-radius: 999px;
     background: #2ea24f;
+  }
+
+  .rail-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(16, 24, 32, 0.35);
+    z-index: 30;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+  }
+
+  .rail-backdrop.show {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .theme-panel {
@@ -500,6 +630,125 @@
     color: #d6e0e7;
   }
 
+  .dark .syn-like-select {
+    border-color: #465967;
+    color: #d6e0e7;
+    background-image:
+      linear-gradient(180deg, #202b34 0%, #1a232b 100%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23b8c6d1' d='M5 6 0 0h10z'/%3E%3C/svg%3E");
+  }
+
+  .dark .syn-like-check {
+    color: #d0dbe3;
+  }
+
+  .syn-like-btn {
+    align-items: center;
+    appearance: none;
+    background: var(--syn-color-neutral-0, #fff);
+    border: 1px solid var(--syn-color-neutral-400, #c8ced4);
+    border-radius: var(--syn-border-radius-medium, 10px);
+    color: var(--syn-color-neutral-1000, #1f2b33);
+    cursor: pointer;
+    display: inline-flex;
+    font: var(--syn-body-small-bold, 600 13px/1.2 "SICK Intl", "Segoe UI", sans-serif);
+    gap: 8px;
+    justify-content: center;
+    min-height: 36px;
+    padding: 8px 14px;
+    transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease, transform .1s ease;
+  }
+
+  .syn-like-btn:hover {
+    background: var(--syn-color-neutral-100, #f4f6f8);
+    border-color: var(--syn-color-neutral-500, #aeb7c0);
+    transform: translateY(-1px);
+  }
+
+  .syn-like-btn:focus-visible {
+    box-shadow: 0 0 0 3px rgba(11, 120, 194, .25);
+    outline: none;
+  }
+
+  .syn-like-btn:disabled {
+    cursor: not-allowed;
+    opacity: .55;
+    transform: none;
+  }
+
+  .syn-like-btn--small {
+    min-height: 30px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+  }
+
+  .syn-like-btn--filled {
+    background: var(--syn-color-primary-600, #0b78c2);
+    border-color: var(--syn-color-primary-700, #0869aa);
+    color: #fff;
+  }
+
+  .syn-like-btn--filled:hover {
+    background: var(--syn-color-primary-700, #0869aa);
+    border-color: var(--syn-color-primary-800, #075a92);
+  }
+
+  .syn-like-btn--success {
+    background: #1f8a4d;
+    border-color: #166d3c;
+    color: #fff;
+  }
+
+  .syn-like-btn--success:hover {
+    background: #166d3c;
+    border-color: #125b33;
+  }
+
+  .syn-like-btn--danger {
+    background: #c93d3d;
+    border-color: #a83636;
+    color: #fff;
+  }
+
+  .syn-like-btn--danger:hover {
+    background: #b33636;
+    border-color: #9a2f2f;
+  }
+
+  .syn-like-check > input[type='checkbox'] {
+    appearance: none;
+    -webkit-appearance: none;
+    background: #fff;
+    border: 1px solid #7f93a2;
+    border-radius: 4px;
+    height: 16px;
+    position: relative;
+    width: 16px;
+  }
+
+  .syn-like-check > input[type='checkbox']:checked {
+    background: var(--syn-color-primary-600, #0b78c2);
+    border-color: var(--syn-color-primary-700, #0869aa);
+  }
+
+  .syn-like-check > input[type='checkbox']:checked::after {
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    content: "";
+    height: 8px;
+    left: 5px;
+    position: absolute;
+    top: 2px;
+    transform: rotate(45deg);
+    width: 4px;
+  }
+
+  .syn-like-check > input[type='checkbox']:focus-visible {
+    box-shadow: 0 0 0 3px rgba(11, 120, 194, .25);
+    outline: none;
+  }
+
   .dark select.input {
     background-image:
       linear-gradient(180deg, #202b34 0%, #1a232b 100%),
@@ -594,6 +843,39 @@
     border-color: #8f4e4e;
     background: #3b2121;
   }
+
+  syn-card.app-card {
+    display: block;
+    border: 1px solid var(--surface-border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 8px 20px rgba(24, 36, 45, 0.08);
+  }
+
+  syn-card.app-card h3,
+  syn-card.app-card h2 {
+    margin: 0 0 var(--syn-spacing-x-small) !important;
+    font: var(--syn-body-medium-bold) !important;
+  }
+
+  syn-card.app-card footer[slot='footer'] {
+    align-items: center;
+    color: var(--text-muted);
+    display: flex;
+    gap: var(--syn-spacing-x-small);
+  }
+
+  syn-card.app-card footer[slot='footer'] small {
+    font: var(--syn-body-x-small-regular);
+  }
+
+  syn-card.app-card footer[slot='footer'] nav {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    gap: var(--syn-spacing-x-small);
+    justify-content: flex-end;
+  }
 }
 
 @layer utilities {
@@ -614,41 +896,156 @@
 }
 
 @media (max-width: 1024px) {
-  .shell-sidebar {
+  .appshell-rail {
     width: 86px;
+    flex-basis: 86px;
   }
 
-  .sidebar-nav-link {
-    grid-template-columns: 1fr;
-    justify-items: center;
-    text-align: center;
+  .appshell-rail:not(.rail-open) .sidebar-nav-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: fit-content;
+    margin-inline: auto;
+    padding: 6px;
   }
 
-  .sidebar-nav-meta,
-  .sidebar-label,
-  .sidebar-brand-text {
+  .appshell-rail:not(.rail-open) .sidebar-nav-meta,
+  .appshell-rail:not(.rail-open) .sidebar-label,
+  .appshell-rail:not(.rail-open) .sidebar-brand-text {
+    display: none;
+  }
+
+  .appshell-rail:not(.rail-open) .rail-labels {
     display: none;
   }
 }
 
 @media (max-width: 820px) {
+  .shell,
   .app-shell {
     display: block;
   }
 
-  .shell-sidebar {
-    width: 100%;
-    border-right: 0;
-    border-bottom: 1px solid var(--surface-border);
+  .appshell-main {
+    display: block;
+    min-height: auto;
+  }
+
+  .appshell-content {
+    overflow: visible;
+  }
+
+  .appshell-rail {
+    position: fixed;
+    left: 0;
+    top: var(--header-height);
+    bottom: 0;
+    width: 280px;
+    flex-basis: 280px;
+    transform: translateX(-100%);
+    box-shadow: 0 12px 26px rgba(0, 0, 0, 0.25);
+  }
+
+  .appshell-rail.rail-open {
+    transform: translateX(0);
   }
 
   .content-wrap {
     padding: 14px;
   }
 
+  .header,
   .shell-header {
     height: auto;
     align-items: flex-start;
     flex-direction: column;
+    gap: 10px;
+    padding: 10px 12px;
+  }
+
+  .shell-title {
+    font-size: 1.05rem;
+  }
+
+  .shell-subtitle {
+    font-size: 0.7rem;
+  }
+
+  .sidebar-brand {
+    padding: 10px 12px;
+  }
+
+  .appshell-rail .sidebar-brand-text,
+  .appshell-rail .rail-labels {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .appshell-rail .sidebar-label,
+  .appshell-rail .sidebar-nav-meta {
+    display: block;
   }
 }
+
+/* Fallback: keep Synergy elements visible even if custom elements are not yet defined. */
+syn-card:not(:defined),
+syn-menu:not(:defined),
+syn-menu-item:not(:defined),
+syn-dropdown:not(:defined) {
+  opacity: 1 !important;
+  display: block !important;
+}
+
+syn-button:not(:defined),
+syn-checkbox:not(:defined),
+syn-icon:not(:defined),
+syn-divider:not(:defined) {
+  opacity: 1 !important;
+  display: inline-flex !important;
+}
+
+/* Keep icon + label aligned in one line for Synergy buttons. */
+syn-button::part(base) {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+syn-button::part(label) {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  white-space: nowrap;
+}
+
+syn-button svg {
+  display: inline-block;
+  flex: 0 0 auto;
+  vertical-align: middle;
+}
+
+.btn-inline-content::part(base) {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+/* Dropdown trigger caret visibility (Synergy fallback) */
+syn-dropdown > syn-button[slot='trigger']::part(base) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+syn-dropdown > syn-button[slot='trigger']::part(caret) {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Hard fallback when caret part is not rendered by the component build */
+syn-dropdown > syn-button[slot='trigger'] {
+  position: relative;
+}
+

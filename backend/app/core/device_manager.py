@@ -20,12 +20,7 @@ class PicoscanDevice:
         self.device_type = (device_config.get("device_type") or "picoscan").lower()
         self.protocol = str(device_config.get("protocol") or ("tcp" if self.device_type == "lms4000" else "udp")).lower()
         fmt = str(device_config.get("format_type") or ("lmdscandata" if self.device_type == "lms4000" else "compact")).lower()
-        if self.device_type == "lms4000":
-            self.protocol = "tcp"
-            self.format_type = "lmdscandata"
-        else:
-            self.protocol = "udp"
-            self.format_type = fmt if fmt in ("compact", "msgpack") else "compact"
+        self._normalize_transport(fmt)
         self.enabled = device_config.get("enabled", True)
         # Number of segments that make up a full scan for this device
         # If None, system-wide/default value will be used
@@ -37,7 +32,23 @@ class PicoscanDevice:
         self.acquisition_mode = device_config.get("acquisition_mode", "continuous")
         self.encoder_enabled = device_config.get("encoder_enabled", False)
         self.speed_profile = device_config.get("speed_profile", "fixed")
+        # Optional fixed yaw correction for LMD stream calibration disambiguation.
+        self.lmd_yaw_correction_deg = device_config.get("lmd_yaw_correction_deg")
         self.connection_status = "disconnected"
+
+    def _normalize_transport(self, format_type_hint: str | None = None) -> None:
+        """Normalize protocol/format to a valid transport combination."""
+        fmt = str(format_type_hint or self.format_type or "compact").lower()
+        if self.device_type == "lms4000":
+            self.protocol = "tcp"
+            self.format_type = "lmdscandata"
+            return
+
+        if fmt not in ("compact", "msgpack", "lmdscandata"):
+            fmt = "compact"
+        self.format_type = fmt
+        # picoscan: compact/msgpack over UDP, lmdscandata over TCP
+        self.protocol = "tcp" if self.format_type == "lmdscandata" else "udp"
         
     def __repr__(self):
         return f"PicoscanDevice({self.device_id}, {self.connection_status})"
@@ -60,7 +71,8 @@ class PicoscanDevice:
             "segments_per_scan": self.segments_per_scan,
             "acquisition_mode": self.acquisition_mode,
             "encoder_enabled": self.encoder_enabled,
-            "speed_profile": self.speed_profile
+            "speed_profile": self.speed_profile,
+            "lmd_yaw_correction_deg": self.lmd_yaw_correction_deg,
         }
 
 
@@ -100,6 +112,10 @@ class DeviceManager:
             # Ensure sensible default for segments_per_scan
             if "segments_per_scan" not in self.point_cloud_settings:
                 self.point_cloud_settings["segments_per_scan"] = 10
+            if "require_complete_frames" not in self.point_cloud_settings:
+                self.point_cloud_settings["require_complete_frames"] = True
+            if "incomplete_frame_timeout_s" not in self.point_cloud_settings:
+                self.point_cloud_settings["incomplete_frame_timeout_s"] = 0.35
             if "width_m" not in self.frame_settings:
                 self.frame_settings["width_m"] = 2.0
             if "height_m" not in self.frame_settings:
@@ -123,6 +139,10 @@ class DeviceManager:
             # Analysis defaults
             if "active_app" not in self.analysis_settings:
                 self.analysis_settings["active_app"] = "log"
+            active_app = str(self.analysis_settings.get("active_app", "log") or "log").strip().lower()
+            if active_app not in {"log", "none"}:
+                active_app = "log"
+            self.analysis_settings["active_app"] = active_app
             if "log_window_profiles" not in self.analysis_settings:
                 self.analysis_settings["log_window_profiles"] = 10
             if "log_min_points" not in self.analysis_settings:
@@ -154,10 +174,14 @@ class DeviceManager:
                 self.output_settings["enabled"] = False
             if "connection_mode" not in self.output_settings:
                 self.output_settings["connection_mode"] = "server"
+            # Output transport is fixed: TCP server mode.
+            self.output_settings["connection_mode"] = "server"
             if "host" not in self.output_settings:
                 self.output_settings["host"] = "0.0.0.0"
             if "port" not in self.output_settings:
                 self.output_settings["port"] = 2120
+            # Output transport is fixed: TCP port 2120.
+            self.output_settings["port"] = 2120
             if "payload_mode" not in self.output_settings:
                 self.output_settings["payload_mode"] = "ascii"
             if "separator" not in self.output_settings:
@@ -183,6 +207,11 @@ class DeviceManager:
                     "diameter_start",
                     "diameter_end",
                     "diameter_avg",
+                ]
+            if "output_frame_items" not in self.output_settings:
+                self.output_settings["output_frame_items"] = [
+                    {"type": "field", "key": k, "label": ""}
+                    for k in self.output_settings.get("selected_fields", [])
                 ]
             # TDC defaults
             if "enabled" not in self.tdc_settings:
@@ -315,13 +344,7 @@ class DeviceManager:
                 device.protocol = str(device_config.get("protocol")).lower()
             if "format_type" in device_config and device_config.get("format_type"):
                 device.format_type = str(device_config.get("format_type")).lower()
-            if device.device_type == "lms4000":
-                device.protocol = "tcp"
-                device.format_type = "lmdscandata"
-            else:
-                device.protocol = "udp"
-                if device.format_type not in ("compact", "msgpack"):
-                    device.format_type = "compact"
+            device._normalize_transport(device.format_type)
             device.enabled = device_config.get("enabled", device.enabled)
             # Allow updating segments_per_scan per-device
             if "segments_per_scan" in device_config:
@@ -336,6 +359,8 @@ class DeviceManager:
             device.acquisition_mode = device_config.get("acquisition_mode", device.acquisition_mode)
             device.encoder_enabled = device_config.get("encoder_enabled", device.encoder_enabled)
             device.speed_profile = device_config.get("speed_profile", device.speed_profile)
+            if "lmd_yaw_correction_deg" in device_config:
+                device.lmd_yaw_correction_deg = device_config.get("lmd_yaw_correction_deg")
             
             self._save_to_json()
             logger.info(f"Updated device: {device_id}")

@@ -91,7 +91,7 @@ export default function PointCloudViewer({
         </div>
       </div>
 
-      <div style={{ height: 'calc(100% - 40px)', minHeight: '400px' }}>
+      <div style={{ height: 'calc(100% - 40px)', minHeight: 'clamp(260px, 45vh, 400px)' }}>
         {loading ? (
           <div className="h-full w-full rounded-lg bg-gray-100 shimmer" />
         ) : statistics ? (

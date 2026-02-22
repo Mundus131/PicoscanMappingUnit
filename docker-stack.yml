@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  backend:
+    image: picocan-backend:arm64
+    dns:
+      - 192.168.0.1
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - LOG_LEVEL=INFO
+      # Update this value on target server, e.g.:
+      # ["http://192.168.0.100:3000","http://localhost:3000"]
+      - CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000","http://192.168.0.100:3000"]
+    ports:
+      - target: 8000
+        published: 8000
+        protocol: tcp
+        mode: host
+      - target: 2120
+        published: 2120
+        protocol: tcp
+        mode: host
+      - target: 2115
+        published: 2115
+        protocol: udp
+        mode: host
+      - target: 2116
+        published: 2116
+        protocol: udp
+        mode: host
+      - target: 2117
+        published: 2117
+        protocol: udp
+        mode: host
+      - target: 2118
+        published: 2118
+        protocol: udp
+        mode: host
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+      # Optional: persist/edit scanner config on host
+      # - ./backend/config/picoscans_config.json:/app/config/picoscans_config.json
+    networks:
+      - picocan_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
+  frontend:
+    image: picocan-frontend:arm64
+    dns:
+      - 192.168.0.1
+      - 1.1.1.1
+      - 8.8.8.8
+    ports:
+      - target: 3000
+        published: 3000
+        protocol: tcp
+        mode: host
+    networks:
+      - picocan_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
+networks:
+  picocan_net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  backend_logs:
+  backend_data:

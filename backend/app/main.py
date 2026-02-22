@@ -79,21 +79,10 @@ app.include_router(system.router, prefix="/api/v1/system", tags=["System"])
 @app.on_event("startup")
 async def startup_event():
     """Auto-start UDP listening on application startup"""
+    receiver_manager = PicoscanReceiverManager()
+    app.state.receiver_manager = receiver_manager
     try:
-        receiver_manager = PicoscanReceiverManager()
-        app.state.receiver_manager = receiver_manager
-        out_cfg = dict(device_manager.output_settings or {})
-        notifier = TcpNotifier(
-            host=str(out_cfg.get("host", "0.0.0.0")),
-            port=int(out_cfg.get("port", 2120) or 2120),
-            mode=str(out_cfg.get("connection_mode", "server") or "server"),
-            enabled=bool(out_cfg.get("enabled", False)),
-        )
-        notifier.start()
-        app.state.tcp_notifier = notifier
-        tdc_monitor = TdcTriggerMonitor(app)
-        tdc_monitor.start()
-        app.state.tdc_monitor = tdc_monitor
+        # Initialize acquisition session first, even if optional services fail.
         app.state.acquisition_session = {
             "recording": False,
             "distance_mm": 0.0,
@@ -114,16 +103,12 @@ async def startup_event():
         }
         acquisition.ensure_encoder_monitor_started(app)
         
-        # Auto-start listening for all enabled devices
+        # Auto-start listening for all enabled devices.
         enabled_devices = [d for d in device_manager.get_all_devices() if d.enabled]
         if enabled_devices:
             for device in enabled_devices:
-                # Bind on all interfaces (0.0.0.0). Binding to a specific
-                # device IP (e.g. 192.168.x.x) can fail on Windows if that
-                # address is not assigned to a local interface (WinError 10049).
                 listen_ip = "0.0.0.0"
-                # Pass per-device segments_per_scan if configured
-                receiver_manager.start_listening(
+                ok = receiver_manager.start_listening(
                     device.device_id,
                     listen_ip,
                     device.port,
@@ -132,8 +117,39 @@ async def startup_event():
                     device_type=getattr(device, 'device_type', 'picoscan'),
                     sensor_ip=getattr(device, 'ip_address', None),
                 )
+                if not ok:
+                    logger.warning(
+                        "Startup listener failed for %s on %s:%s",
+                        device.device_id,
+                        listen_ip,
+                        device.port,
+                    )
+
+        # Keep listeners synchronized with device availability/config in background.
+        receiver_manager.start_auto_recovery(device_manager.get_all_devices, interval_s=2.0)
     except Exception as e:
-        logger.error(f"Error during startup: {e}")
+        logger.error(f"Error during core startup (receiver/session): {e}")
+
+    # Optional services: failures here must not block scanner listeners.
+    try:
+        out_cfg = dict(device_manager.output_settings or {})
+        notifier = TcpNotifier(
+            host=str(out_cfg.get("host", "0.0.0.0")),
+            port=int(out_cfg.get("port", 2120) or 2120),
+            mode=str(out_cfg.get("connection_mode", "server") or "server"),
+            enabled=bool(out_cfg.get("enabled", False)),
+        )
+        notifier.start()
+        app.state.tcp_notifier = notifier
+    except Exception as e:
+        logger.error(f"Error starting TCP notifier: {e}")
+
+    try:
+        tdc_monitor = TdcTriggerMonitor(app)
+        tdc_monitor.start()
+        app.state.tdc_monitor = tdc_monitor
+    except Exception as e:
+        logger.error(f"Error starting TDC monitor: {e}")
 
 
 @app.on_event("shutdown")
@@ -141,6 +157,7 @@ async def shutdown_event():
     """Clean up on shutdown"""
     try:
         if app.state.receiver_manager:
+            app.state.receiver_manager.stop_auto_recovery()
             for device_id in list(app.state.receiver_manager.receivers.keys()):
                 app.state.receiver_manager.stop_listening(device_id)
         if app.state.tcp_notifier:

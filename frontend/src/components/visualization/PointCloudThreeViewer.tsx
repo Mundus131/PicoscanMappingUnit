@@ -145,7 +145,8 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
 
     const container = containerRef.current;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(isDark ? 0x0b1220 : 0xf9fafb);
+    // Stronger contrast in light theme to make clouds stand out from the scene.
+    scene.background = new THREE.Color(isDark ? 0x0b1220 : 0xd9e0e8);
     sceneRef.current = scene;
 
     let camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
@@ -365,7 +366,6 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       scene.add(gridGroup);
     }
     let gridXZRef: THREE.GridHelper | null = null;
-    let gridYZRef: THREE.GridHelper | null = null;
     if (showGrid && view === '3d') {
       const gridGroup = new THREE.Group();
       gridGroup.renderOrder = 1;
@@ -375,58 +375,15 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       const divisions = Math.max(2, Math.round(size / gridStep));
       const makeGrid = (colorMajor: number, colorMinor: number) => {
         const g = new THREE.GridHelper(size, divisions, colorMajor, colorMinor);
-        g.material.opacity = isDark ? 0.3 : 0.4;
+        g.material.opacity = isDark ? 0.18 : 0.11;
         g.material.transparent = true;
         return g;
       };
-      const gridXZ = makeGrid(isDark ? 0x334155 : 0xcbd5f5, isDark ? 0x1f2937 : 0xe5e7eb);
-      const gridXY = makeGrid(isDark ? 0x334155 : 0xcbd5f5, isDark ? 0x1f2937 : 0xe5e7eb);
-      const gridYZ = makeGrid(isDark ? 0x334155 : 0xcbd5f5, isDark ? 0x1f2937 : 0xe5e7eb);
+      const gridXZ = makeGrid(isDark ? 0x334155 : 0xa8b6c6, isDark ? 0x1f2937 : 0xc7d1dc);
       gridXZ.rotation.set(0, 0, 0);
       gridXZ.position.set(0, -1, 0);
-      gridXY.rotation.set(Math.PI / 2, 0, 0);
-      gridYZ.rotation.set(0, 0, Math.PI / 2);
       gridXZRef = gridXZ;
-      gridYZRef = gridYZ;
-      gridGroup.add(gridXZ, gridXY, gridYZ);
-
-      const createTextSprite = (text: string, color = '#94a3b8') => {
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        const size = 256;
-        canvas.width = size;
-        canvas.height = size;
-        if (ctx) {
-          ctx.clearRect(0, 0, size, size);
-          ctx.font = '36px Arial';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillStyle = isDark ? 'rgba(15,23,42,0.8)' : 'rgba(255,255,255,0.85)';
-          ctx.fillRect(10, 90, size - 20, 60);
-          ctx.fillStyle = color;
-          ctx.fillText(text, size / 2, size / 2);
-        }
-        const texture = new THREE.CanvasTexture(canvas);
-        const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
-        const sprite = new THREE.Sprite(material);
-        sprite.scale.set(420, 140, 1);
-        sprite.renderOrder = 2;
-        return sprite;
-      };
-
-      const step = gridStep;
-      for (let x = -size / 2; x <= size / 2; x += step) {
-        if (x === 0) continue;
-        const label = createTextSprite((x / 1000).toFixed(1), isDark ? '#94a3b8' : '#6b7280');
-        label.position.set(x, 0, -size / 2);
-        gridGroup.add(label);
-      }
-      for (let z = -size / 2; z <= size / 2; z += step) {
-        if (z === 0) continue;
-        const label = createTextSprite((z / 1000).toFixed(1), isDark ? '#94a3b8' : '#6b7280');
-        label.position.set(-size / 2, 0, z);
-        gridGroup.add(label);
-      }
+      gridGroup.add(gridXZ);
 
       scene.add(gridGroup);
     }
@@ -482,7 +439,7 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
         map: tex,
         color: 0xffffff,
         transparent: true,
-        opacity: 1,
+        opacity: isDark ? 0.75 : 0.52,
         side: THREE.DoubleSide,
         depthWrite: false,
       });
@@ -491,9 +448,8 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
       floor.position.set(0.2, 0, 0);
       floor.renderOrder = 3;
       scene.add(floor);
-      // Hide grid on the floor plane
+      // Hide line grid under checkerboard floor.
       if (gridXZRef) gridXZRef.visible = false;
-      if (gridYZRef) gridYZRef.visible = false;
     }
 
     if (showFrame && frameSizeMm) {
@@ -954,12 +910,15 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
     }
 
     const material = new THREE.PointsMaterial({
-      size: view === '3d' ? 6 : 14,
+      size: view === '3d' ? 9 : 14,
       vertexColors: true,
       sizeAttenuation: view !== '3d',
       map: circleTextureRef.current ?? undefined,
       transparent: true,
       alphaTest: 0.5,
+      opacity: 1.0,
+      toneMapped: false,
+      depthWrite: false,
     });
 
     const pts = new THREE.Points(geometry, material);
@@ -1089,25 +1048,47 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
   return (
     <div style={{ width, height, position: 'relative' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+      {view === '3d' && (
+        <button
+          className="btn-secondary px-3 py-1.5"
+          onClick={resetView}
+          title="Reset view"
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            zIndex: 20,
+            lineHeight: 1,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          Home
+        </button>
+      )}
       {showAxisWidget && view === '3d' && (
         <div
           style={{
             position: 'absolute',
-            left: 12,
-            bottom: 12,
-            width: 160,
-            height: 180,
+            left: 14,
+            bottom: 14,
+            width: 132,
+            height: 132,
             display: 'flex',
-            flexDirection: 'column',
             alignItems: 'center',
             justifyContent: 'center',
-            gap: 8,
-            padding: 4,
-            background: 'transparent',
+            padding: 6,
+            borderRadius: 12,
+            border: isDark ? '1px solid rgba(71,85,105,0.8)' : '1px solid rgba(148,163,184,0.9)',
+            background: isDark ? 'rgba(15,23,42,0.65)' : 'rgba(255,255,255,0.72)',
+            boxShadow: isDark
+              ? '0 6px 18px rgba(2,6,23,0.4)'
+              : '0 6px 16px rgba(15,23,42,0.15)',
+            backdropFilter: 'blur(2px)',
+            zIndex: 20,
           }}
         >
-          <div style={{ position: 'relative', width: 120, height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <svg ref={axisWidgetRef} width={120} height={120} style={{ display: 'block' }}>
+          <div style={{ position: 'relative', width: 112, height: 112, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <svg ref={axisWidgetRef} width={112} height={112} style={{ display: 'block' }}>
               <defs>
                 <marker id="arrow-x" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto" markerUnits="strokeWidth">
                   <path d="M0,0 L8,4 L0,8 Z" fill="#ef4444" />
@@ -1129,20 +1110,20 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
                 <line ref={(el) => { axisLineRefs.current.z = el; }} stroke="#3b82f6" strokeWidth="2.5" markerEnd="url(#arrow-z)" />
               </g>
               <g onClick={() => setViewAxis('x')} style={{ cursor: 'pointer' }}>
-                <circle ref={(el) => { axisHitRefs.current.x = el; }} cx={0} cy={0} r={14} fill="transparent" />
+                <circle ref={(el) => { axisHitRefs.current.x = el; }} cx={0} cy={0} r={18} fill="transparent" />
               </g>
               <g onClick={() => setViewAxis('y')} style={{ cursor: 'pointer' }}>
-                <circle ref={(el) => { axisHitRefs.current.y = el; }} cx={0} cy={0} r={14} fill="transparent" />
+                <circle ref={(el) => { axisHitRefs.current.y = el; }} cx={0} cy={0} r={18} fill="transparent" />
               </g>
               <g onClick={() => setViewAxis('z')} style={{ cursor: 'pointer' }}>
-                <circle ref={(el) => { axisHitRefs.current.z = el; }} cx={0} cy={0} r={14} fill="transparent" />
+                <circle ref={(el) => { axisHitRefs.current.z = el; }} cx={0} cy={0} r={18} fill="transparent" />
               </g>
-              <text ref={(el) => { axisLabelRefs.current.x = el; }} fontSize="11" fill="#ef4444" onClick={() => setViewAxis('x')} style={{ cursor: 'pointer' }}>X</text>
-              <text ref={(el) => { axisLabelRefs.current.y = el; }} fontSize="11" fill="#22c55e" onClick={() => setViewAxis('y')} style={{ cursor: 'pointer' }}>Y</text>
-              <text ref={(el) => { axisLabelRefs.current.z = el; }} fontSize="11" fill="#3b82f6" onClick={() => setViewAxis('z')} style={{ cursor: 'pointer' }}>Z</text>
+              <circle cx={56} cy={56} r={2.5} fill={isDark ? '#cbd5e1' : '#334155'} />
+              <text ref={(el) => { axisLabelRefs.current.x = el; }} fontSize="12" fill="#ef4444" onClick={() => setViewAxis('x')} style={{ cursor: 'pointer', fontWeight: 700 }}>X</text>
+              <text ref={(el) => { axisLabelRefs.current.y = el; }} fontSize="12" fill="#22c55e" onClick={() => setViewAxis('y')} style={{ cursor: 'pointer', fontWeight: 700 }}>Y</text>
+              <text ref={(el) => { axisLabelRefs.current.z = el; }} fontSize="12" fill="#3b82f6" onClick={() => setViewAxis('z')} style={{ cursor: 'pointer', fontWeight: 700 }}>Z</text>
             </svg>
           </div>
-          <button className="btn-secondary px-2 py-1" onClick={resetView} title="Reset view">⌂</button>
         </div>
       )}
     </div>
@@ -1150,3 +1131,4 @@ const PointCloudThreeViewer = React.forwardRef<PointCloudThreeViewerHandle, Poin
 });
 
 export default PointCloudThreeViewer;
+

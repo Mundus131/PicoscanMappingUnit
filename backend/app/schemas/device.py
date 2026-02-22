@@ -1,5 +1,5 @@
 from pydantic import BaseModel, field_validator
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 class CalibrationData(BaseModel):
     translation: List[float]
@@ -23,6 +23,7 @@ class DeviceCreate(BaseModel):
     acquisition_mode: str = "continuous"
     encoder_enabled: bool = False
     speed_profile: str = "fixed"
+    lmd_yaw_correction_deg: float | None = None
 
     @field_validator("device_type")
     @classmethod
@@ -63,6 +64,7 @@ class DeviceUpdate(BaseModel):
     acquisition_mode: Optional[str] = None
     encoder_enabled: Optional[bool] = None
     speed_profile: Optional[str] = None
+    lmd_yaw_correction_deg: Optional[float] = None
 
     @field_validator("device_type")
     @classmethod
@@ -107,6 +109,7 @@ class DeviceResponse(BaseModel):
     acquisition_mode: str
     encoder_enabled: bool
     speed_profile: str
+    lmd_yaw_correction_deg: float | None = None
 
 class AutoCalibrationRequest(BaseModel):
     device_ids: List[str]
@@ -191,7 +194,7 @@ class MotionSettings(BaseModel):
     encoder_rps: float | None = None
 
 class AnalysisSettings(BaseModel):
-    active_app: str  # "log" | "conveyor_object"
+    active_app: str  # "none" | "log"
     log_window_profiles: int | None = None
     log_min_points: int | None = None
     conveyor_localization_algorithm: str | None = None  # "object_cloud_bbox" | "box_top_plane"
@@ -228,6 +231,7 @@ class OutputSettings(BaseModel):
         "diameter_end",
         "diameter_avg",
     ]
+    output_frame_items: List[Dict[str, Any]] = []
 
 class TdcSettings(BaseModel):
     enabled: bool

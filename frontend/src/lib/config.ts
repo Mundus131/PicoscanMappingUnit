@@ -2,7 +2,24 @@
  * Configuration
  */
 
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+function resolveApiBaseUrl(): string {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (envUrl && envUrl.trim().length > 0) {
+    return envUrl.trim();
+  }
+
+  // Runtime fallback for deployments where frontend and backend are on the same host.
+  // Example: UI opened at http://192.168.0.100:3000 -> API http://192.168.0.100:8000/api/v1
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const protocol = window.location.protocol || 'http:';
+    const host = window.location.hostname;
+    return `${protocol}//${host}:8000/api/v1`;
+  }
+
+  return 'http://localhost:8000/api/v1';
+}
+
+export const API_BASE_URL = resolveApiBaseUrl();
 
 export const API_ENDPOINTS = {
   // Devices

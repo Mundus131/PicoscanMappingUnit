@@ -4,7 +4,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
-import { Play, Square, RefreshCw, Wand2 } from 'lucide-react';
+import { SynInteropButton, SynInteropDropdown } from '@/components/synergy/SynInterop';
+import { Play, Square, RefreshCw, Wand2, Plus, Trash2, ArrowUp, ArrowDown, X } from 'lucide-react';
 
 interface TriggerStatus {
   recording: boolean;
@@ -49,9 +50,27 @@ interface OutputSettings {
   length_unit: 'mm' | 'm';
   volume_unit: 'm3' | 'l' | 'mm3';
   selected_fields: string[];
+  output_frame_items?: OutputFrameItem[];
 }
 
-type AnalysisApp = 'log' | 'conveyor_object';
+interface OutputFrameItem {
+  type: 'field' | 'text' | 'marker';
+  key?: string;
+  label?: string;
+  text?: string;
+  value?: string;
+  precision?: number;
+}
+
+interface OutputPreviewResponse {
+  source: 'session' | 'history' | string;
+  analysis_app: string;
+  has_metrics: boolean;
+  payload: string | Record<string, unknown>;
+  timestamp_ms?: number | null;
+}
+
+type AnalysisApp = 'none' | 'log' | 'conveyor_object';
 type ConveyorLocalizationAlgorithm = 'object_cloud_bbox' | 'box_top_plane';
 
 const OUTPUT_FIELD_COMMON: Array<{ key: string; label: string }> = [
@@ -74,21 +93,41 @@ const OUTPUT_FIELD_LOG: Array<{ key: string; label: string }> = [
   { key: 'diameter_max', label: 'Diameter max (selected unit)' },
 ];
 
-const OUTPUT_FIELD_CONVEYOR: Array<{ key: string; label: string }> = [
-  { key: 'object_points_count', label: 'Object points count' },
-  { key: 'object_bbox_length', label: 'BBox length (selected unit)' },
-  { key: 'object_bbox_width', label: 'BBox width (selected unit)' },
-  { key: 'object_bbox_height', label: 'BBox height (selected unit)' },
-  { key: 'object_bbox_volume', label: 'BBox volume (selected unit)' },
+const LENGTH_BASE_KEYS = new Set([
+  'length',
+  'diameter_start',
+  'diameter_end',
+  'diameter_avg',
+  'diameter_min',
+  'diameter_max',
+  'object_bbox_length',
+  'object_bbox_width',
+  'object_bbox_height',
+]);
+
+const VOLUME_BASE_KEYS = new Set([
+  'volume',
+  'object_bbox_volume',
+]);
+
+type OutputUnitChoice = 'default' | 'mm' | 'm' | 'm3' | 'l' | 'mm3';
+
+const OUTPUT_SEPARATOR_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: ';', label: '; semicolon' },
+  { value: ',', label: ', comma' },
+  { value: '|', label: '| pipe' },
+  { value: '\t', label: 'TAB (\\t)' },
+  { value: ' ', label: 'SPACE' },
 ];
 
-const PREFIX_SUFFIX_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: '', label: 'None' },
+const OUTPUT_MARKER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: '\u0002', label: 'STX (0x02)' },
   { value: '\u0003', label: 'ETX (0x03)' },
+  { value: '\r', label: 'CR (\\r)' },
   { value: '\n', label: 'LF (\\n)' },
   { value: '\r\n', label: 'CRLF (\\r\\n)' },
-  { value: '|', label: 'Pipe (|)' },
+  { value: '\t', label: 'TAB (\\t)' },
+  { value: '|', label: 'Pipe |' },
 ];
 
 interface ConveyorMetrics {
@@ -144,37 +183,40 @@ function mapPointToViewer(point: number[]): number[] {
   return mapped;
 }
 
-function buildAabbAnnotations(
-  minX: number,
-  maxX: number,
-  minY: number,
-  maxY: number,
-  minZ: number,
-  maxZ: number
-): { start: [number, number, number]; end: [number, number, number]; color?: number; label?: string; noArrow?: boolean }[] {
-  const p000: [number, number, number] = [minX, minY, minZ];
-  const p001: [number, number, number] = [minX, minY, maxZ];
-  const p010: [number, number, number] = [minX, maxY, minZ];
-  const p011: [number, number, number] = [minX, maxY, maxZ];
-  const p100: [number, number, number] = [maxX, minY, minZ];
-  const p101: [number, number, number] = [maxX, minY, maxZ];
-  const p110: [number, number, number] = [maxX, maxY, minZ];
-  const p111: [number, number, number] = [maxX, maxY, maxZ];
+function resolveFieldKeyWithUnit(baseKey: string, unit: OutputUnitChoice): string {
+  if (LENGTH_BASE_KEYS.has(baseKey)) {
+    if (unit === 'mm') return `${baseKey}_mm`;
+    if (unit === 'm') return `${baseKey}_m`;
+    return baseKey;
+  }
+  if (VOLUME_BASE_KEYS.has(baseKey)) {
+    if (unit === 'm3') return `${baseKey}_m3`;
+    if (unit === 'l') return `${baseKey}_l`;
+    if (unit === 'mm3') return `${baseKey}_mm3`;
+    return baseKey;
+  }
+  return baseKey;
+}
 
-  const edges: Array<[[number, number, number], [number, number, number]]> = [
-    [p000, p001], [p000, p010], [p000, p100],
-    [p111, p110], [p111, p101], [p111, p011],
-    [p001, p011], [p001, p101],
-    [p010, p011], [p010, p110],
-    [p100, p101], [p100, p110],
-  ];
+function humanizeFrameItem(item: OutputFrameItem): string {
+  if (item.type === 'text') return item.text || '(text)';
+  if (item.type === 'marker') {
+    const preset = OUTPUT_MARKER_OPTIONS.find((m) => m.value === (item.value || ''));
+    return preset?.label || item.value || '(marker)';
+  }
+  const lbl = (item.label || '').trim();
+  if (lbl) return lbl;
+  return item.key || '(field)';
+}
 
-  return edges.map((e) => ({
-    start: e[0],
-    end: e[1],
-    color: 0x22c55e,
-    noArrow: true,
-  }));
+function visualizeControlChars(input: string): string {
+  return String(input || '')
+    .replace(/\u0002/g, '[STX]')
+    .replace(/\u0003/g, '[ETX]')
+    .replace(/\r\n/g, '[CRLF]')
+    .replace(/\r/g, '[CR]')
+    .replace(/\n/g, '[LF]')
+    .replace(/\t/g, '[TAB]');
 }
 
 function solve3x3(a: number[][], b: number[]): number[] | null {
@@ -364,8 +406,6 @@ export default function AnalyticsPage() {
   const [colorBySource, setColorBySource] = useState(true);
   const [analysisDuration, setAnalysisDuration] = useState<number | null>(null);
   const [colorMode, setColorMode] = useState<'rssi' | 'x' | 'y' | 'z'>('rssi');
-  const [showFloor, setShowFloor] = useState(true);
-  const [showConveyorBbox, setShowConveyorBbox] = useState(true);
   const [windowProfiles, setWindowProfiles] = useState(10);
   const [minPoints, setMinPoints] = useState(50);
   const [convPlaneQuantile, setConvPlaneQuantile] = useState(0.35);
@@ -383,6 +423,14 @@ export default function AnalyticsPage() {
   const [analysisSavedAt, setAnalysisSavedAt] = useState<number | null>(null);
   const [outputSaving, setOutputSaving] = useState(false);
   const [outputSavedAt, setOutputSavedAt] = useState<number | null>(null);
+  const [outputWizardOpen, setOutputWizardOpen] = useState(false);
+  const [outputFieldToAdd, setOutputFieldToAdd] = useState<string>('timestamp_iso');
+  const [outputFieldUnit, setOutputFieldUnit] = useState<OutputUnitChoice>('default');
+  const [outputFieldPrecision, setOutputFieldPrecision] = useState<string>('2');
+  const [outputCustomText, setOutputCustomText] = useState('');
+  const [outputMarkerPreset, setOutputMarkerPreset] = useState<string>('\u0002');
+  const [outputMarkerCustom, setOutputMarkerCustom] = useState('');
+  const [outputServerPreview, setOutputServerPreview] = useState<OutputPreviewResponse | null>(null);
   const [outputSettings, setOutputSettings] = useState<OutputSettings>({
     enabled: false,
     connection_mode: 'server',
@@ -390,13 +438,14 @@ export default function AnalyticsPage() {
     port: 2120,
     payload_mode: 'ascii',
     separator: ';',
-    prefix: '\u0002',
-    suffix: '\u0003',
+    prefix: '',
+    suffix: '',
     include_labels: false,
     float_precision: 2,
     length_unit: 'mm',
     volume_unit: 'm3',
     selected_fields: ['timestamp_iso', 'analysis_app', 'volume', 'length', 'diameter_start', 'diameter_end', 'diameter_avg'],
+    output_frame_items: [],
   });
   const [profilingDistance, setProfilingDistance] = useState<number>(10);
   const viewerRef = useRef<PointCloudThreeViewerHandle | null>(null);
@@ -404,19 +453,52 @@ export default function AnalyticsPage() {
   const lastAnalysisTsRef = useRef<number | null>(null);
 
   const outputFieldOptions = useMemo(() => {
-    return analysisApp === 'conveyor_object'
-      ? [...OUTPUT_FIELD_COMMON, ...OUTPUT_FIELD_CONVEYOR]
-      : [...OUTPUT_FIELD_COMMON, ...OUTPUT_FIELD_LOG];
+    if (analysisApp === 'log') {
+      return [...OUTPUT_FIELD_COMMON, ...OUTPUT_FIELD_LOG];
+    }
+    return [...OUTPUT_FIELD_COMMON];
   }, [analysisApp]);
 
-  const outputAllowedFieldSet = useMemo(() => new Set(outputFieldOptions.map((f) => f.key)), [outputFieldOptions]);
+  const outputAllowedFieldSet = useMemo(() => {
+    const keys = new Set<string>(outputFieldOptions.map((f) => f.key));
+    for (const f of outputFieldOptions) {
+      if (LENGTH_BASE_KEYS.has(f.key)) {
+        keys.add(`${f.key}_mm`);
+        keys.add(`${f.key}_m`);
+      }
+      if (VOLUME_BASE_KEYS.has(f.key)) {
+        keys.add(`${f.key}_m3`);
+        keys.add(`${f.key}_l`);
+        keys.add(`${f.key}_mm3`);
+      }
+    }
+    return keys;
+  }, [outputFieldOptions]);
 
   useEffect(() => {
     setOutputSettings((prev) => ({
       ...prev,
       selected_fields: prev.selected_fields.filter((k) => outputAllowedFieldSet.has(k)),
+      output_frame_items: (prev.output_frame_items || []).filter((it) => {
+        if (it.type === 'text') return true;
+        if (it.type === 'marker') return true;
+        return !!it.key && outputAllowedFieldSet.has(it.key);
+      }),
     }));
   }, [outputAllowedFieldSet]);
+
+  useEffect(() => {
+    setOutputSettings((prev) => {
+      const frameFields = (prev.output_frame_items || [])
+        .filter((it) => it.type === 'field' && !!it.key)
+        .map((it) => String(it.key));
+      if (frameFields.length === 0) return prev;
+      if (frameFields.length === prev.selected_fields.length && frameFields.every((v, i) => v === prev.selected_fields[i])) {
+        return prev;
+      }
+      return { ...prev, selected_fields: frameFields };
+    });
+  }, [outputSettings.output_frame_items]);
 
   const fetchStatus = async () => {
     const res = await api.get('/acquisition/trigger/status');
@@ -440,8 +522,8 @@ export default function AnalyticsPage() {
   const fetchAnalysisSettings = async () => {
     try {
       const res = await api.get('/calibration/analysis-settings');
-      const app = res.data?.active_app === 'conveyor_object' ? 'conveyor_object' : 'log';
-      setAnalysisApp(app);
+      const app = String(res.data?.active_app || 'log').toLowerCase();
+      setAnalysisApp(app === 'none' ? 'none' : 'log');
       if (typeof res.data?.log_window_profiles === 'number') setWindowProfiles(res.data.log_window_profiles);
       if (typeof res.data?.log_min_points === 'number') setMinPoints(res.data.log_min_points);
       if (typeof res.data?.conveyor_plane_quantile === 'number') setConvPlaneQuantile(res.data.conveyor_plane_quantile);
@@ -467,18 +549,34 @@ export default function AnalyticsPage() {
       const d = res.data || {};
       setOutputSettings({
         enabled: !!d.enabled,
-        connection_mode: d.connection_mode === 'client' ? 'client' : 'server',
+        connection_mode: 'server',
         host: String(d.host ?? '0.0.0.0'),
-        port: Number(d.port ?? 2120),
+        port: 2120,
         payload_mode: d.payload_mode === 'json' ? 'json' : 'ascii',
         separator: String(d.separator ?? ';'),
-        prefix: String(d.prefix ?? '\u0002'),
-        suffix: String(d.suffix ?? '\u0003'),
+        prefix: '',
+        suffix: '',
         include_labels: !!d.include_labels,
         float_precision: Number(d.float_precision ?? 2),
         length_unit: d.length_unit === 'm' ? 'm' : 'mm',
         volume_unit: d.volume_unit === 'l' || d.volume_unit === 'mm3' ? d.volume_unit : 'm3',
         selected_fields: Array.isArray(d.selected_fields) ? d.selected_fields.map((v: unknown) => String(v)) : [],
+        output_frame_items: Array.isArray(d.output_frame_items)
+          ? d.output_frame_items
+              .map((it: unknown) => {
+                const item = (it || {}) as Record<string, unknown>;
+                const type = item.type === 'text' ? 'text' : item.type === 'marker' ? 'marker' : 'field';
+                return {
+                  type,
+                  key: typeof item.key === 'string' ? item.key : undefined,
+                  label: typeof item.label === 'string' ? item.label : undefined,
+                  text: typeof item.text === 'string' ? item.text : undefined,
+                  value: typeof item.value === 'string' ? item.value : undefined,
+                  precision: typeof item.precision === 'number' ? item.precision : undefined,
+                } as OutputFrameItem;
+              })
+              .filter((it: OutputFrameItem) => (it.type === 'text' ? true : it.type === 'marker' ? true : !!it.key))
+          : [],
       });
     } catch {
       // ignore
@@ -488,18 +586,98 @@ export default function AnalyticsPage() {
   const handleSaveOutputSettings = async () => {
     setOutputSaving(true);
     try {
-      await api.put('/calibration/output-settings', outputSettings);
+      const frameItems = (outputSettings.output_frame_items || []).filter((it) => {
+        if (it.type === 'text') return typeof it.text === 'string';
+        if (it.type === 'marker') return typeof it.value === 'string' || typeof it.text === 'string';
+        return typeof it.key === 'string' && it.key.length > 0;
+      });
+      await api.put('/calibration/output-settings', {
+        ...outputSettings,
+        connection_mode: 'server',
+        port: 2120,
+        payload_mode: 'ascii',
+        include_labels: false,
+        prefix: '',
+        suffix: '',
+        output_frame_items: frameItems,
+      });
       setOutputSavedAt(Date.now());
+      await fetchOutputPreview();
     } finally {
       setOutputSaving(false);
     }
+  };
+
+  const fetchOutputPreview = async () => {
+    try {
+      const res = await api.get('/acquisition/analytics/output-preview');
+      setOutputServerPreview(res.data as OutputPreviewResponse);
+    } catch {
+      setOutputServerPreview(null);
+    }
+  };
+
+  const addFieldToFrame = () => {
+    const resolvedKey = resolveFieldKeyWithUnit(outputFieldToAdd, outputFieldUnit);
+    const label = outputFieldOptions.find((f) => f.key === outputFieldToAdd)?.label || outputFieldToAdd;
+    const parsedPrecision = Number(outputFieldPrecision);
+    const precision = Number.isFinite(parsedPrecision) ? Math.max(0, Math.min(8, parsedPrecision)) : 2;
+    setOutputSettings((prev) => ({
+      ...prev,
+      output_frame_items: [...(prev.output_frame_items || []), { type: 'field', key: resolvedKey, label, precision }],
+    }));
+  };
+
+  const addTextToFrame = () => {
+    const txt = outputCustomText;
+    setOutputSettings((prev) => ({
+      ...prev,
+      output_frame_items: [...(prev.output_frame_items || []), { type: 'text', text: txt }],
+    }));
+    setOutputCustomText('');
+  };
+
+  const addMarkerToFrame = (value: string, label?: string) => {
+    setOutputSettings((prev) => ({
+      ...prev,
+      output_frame_items: [...(prev.output_frame_items || []), { type: 'marker', value, label }],
+    }));
+  };
+
+  const setFrameItemPrecision = (idx: number, nextPrecision: number) => {
+    setOutputSettings((prev) => {
+      const arr = [...(prev.output_frame_items || [])];
+      const item = arr[idx];
+      if (!item || item.type !== 'field') return prev;
+      arr[idx] = { ...item, precision: Math.max(0, Math.min(8, nextPrecision)) };
+      return { ...prev, output_frame_items: arr };
+    });
+  };
+
+  const moveFrameItem = (idx: number, direction: -1 | 1) => {
+    setOutputSettings((prev) => {
+      const arr = [...(prev.output_frame_items || [])];
+      const next = idx + direction;
+      if (next < 0 || next >= arr.length) return prev;
+      const tmp = arr[idx];
+      arr[idx] = arr[next];
+      arr[next] = tmp;
+      return { ...prev, output_frame_items: arr };
+    });
+  };
+
+  const removeFrameItem = (idx: number) => {
+    setOutputSettings((prev) => ({
+      ...prev,
+      output_frame_items: (prev.output_frame_items || []).filter((_, i) => i !== idx),
+    }));
   };
 
   const handleSaveAndRecomputeAnalysis = async () => {
     setAnalysisSaving(true);
     try {
       await api.put('/calibration/analysis-settings', {
-        active_app: analysisApp,
+        active_app: analysisApp === 'none' ? 'none' : 'log',
         log_window_profiles: windowProfiles,
         log_min_points: minPoints,
         conveyor_plane_quantile: convPlaneQuantile,
@@ -548,12 +726,18 @@ export default function AnalyticsPage() {
     fetchMotion();
     fetchAnalysisSettings();
     fetchOutputSettings();
+    fetchOutputPreview();
     fetchAnalysis({ forceCloud: true });
     const interval = setInterval(() => {
       fetchStatus();
     }, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (!outputWizardOpen) return;
+    void fetchOutputPreview();
+  }, [outputWizardOpen]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -572,10 +756,6 @@ export default function AnalyticsPage() {
       }, 150);
     }
   }, [points, viewerKey]);
-
-  useEffect(() => {
-    setViewerKey((v) => v + 1);
-  }, [showFloor]);
 
   const handleStart = async () => {
     setLoading(true);
@@ -604,11 +784,9 @@ export default function AnalyticsPage() {
     }
   };
 
-  const fetchAnalysis = async (opts?: { forceCloud?: boolean }) => {
+  const fetchAnalysis = async (opts?: { forceCloud?: boolean; full?: boolean }) => {
     try {
       const res = await api.get('/acquisition/analytics/results');
-      const responseApp = res.data?.analysis_app === 'conveyor_object' ? 'conveyor_object' : 'log';
-      setAnalysisApp(responseApp);
       setAnalysis(res.data?.metrics || null);
       const ts = typeof res.data?.analysis_timestamp_ms === 'number' ? res.data.analysis_timestamp_ms : null;
       const changed = ts !== null && ts !== lastAnalysisTsRef.current;
@@ -617,8 +795,9 @@ export default function AnalyticsPage() {
         lastAnalysisTsRef.current = ts;
       }
       if (res.data?.has_points && (opts?.forceCloud || changed)) {
+        const wantFull = !!opts?.full;
         const pc = await api.get('/acquisition/analytics/augmented-cloud', {
-          params: { max_points: 60000 },
+          params: { max_points: wantFull ? 0 : 60000 },
         });
         setAugmentedPoints(pc.data?.points || []);
       } else if (!res.data?.has_points) {
@@ -706,6 +885,58 @@ export default function AnalyticsPage() {
 
   const logAnalysis = useMemo(() => (isLogMetrics(analysis) ? analysis : null), [analysis]);
   const conveyorAnalysis = useMemo(() => (isConveyorMetrics(analysis) ? analysis : null), [analysis]);
+  const colorModeLabel = colorMode.toUpperCase();
+  const outputFramePreviewRaw = useMemo(() => {
+    const items = outputSettings.output_frame_items || [];
+    if (items.length === 0) return '(empty frame)';
+    const sep = outputSettings.separator || ';';
+    const parts = items.map((it) => {
+      if (it.type === 'text') return { type: 'text', txt: it.text || '' };
+      if (it.type === 'marker') return { type: 'marker', txt: it.value || it.text || '' };
+      return { type: 'field', txt: it.label || it.key || '' };
+    });
+    const body: string[] = [];
+    for (let i = 0; i < parts.length; i += 1) {
+      const curr = parts[i];
+      if (i > 0) {
+        const prev = parts[i - 1];
+        const prevIsLeadingMarker = i - 1 === 0 && prev.type === 'marker';
+        const currIsTrailingMarker = i === parts.length - 1 && curr.type === 'marker';
+        if (!prevIsLeadingMarker && !currIsTrailingMarker) {
+          body.push(sep);
+        }
+      }
+      body.push(curr.txt);
+    }
+    return `${outputSettings.prefix || ''}${body.join('')}${outputSettings.suffix || ''}`;
+  }, [outputSettings.output_frame_items, outputSettings.separator, outputSettings.prefix, outputSettings.suffix]);
+  const outputFramePreviewReadable = useMemo(
+    () => visualizeControlChars(outputFramePreviewRaw),
+    [outputFramePreviewRaw]
+  );
+  const outputFieldDropdownOptions = useMemo(
+    () => outputFieldOptions.map((f) => ({ value: f.key, label: f.label })),
+    [outputFieldOptions]
+  );
+  const outputUnitDropdownOptions = useMemo(() => {
+    const options: Array<{ value: string; label: string }> = [{ value: 'default', label: 'default' }];
+    if (LENGTH_BASE_KEYS.has(outputFieldToAdd)) {
+      options.push({ value: 'mm', label: 'mm' }, { value: 'm', label: 'm' });
+    }
+    if (VOLUME_BASE_KEYS.has(outputFieldToAdd)) {
+      options.push({ value: 'm3', label: 'm3' }, { value: 'l', label: 'l' }, { value: 'mm3', label: 'mm3' });
+    }
+    return options;
+  }, [outputFieldToAdd]);
+  const outputPrecisionDropdownOptions = useMemo(
+    () => Array.from({ length: 9 }, (_, i) => ({ value: String(i), label: `${i}` })),
+    []
+  );
+  useEffect(() => {
+    if (!outputUnitDropdownOptions.some((o) => o.value === outputFieldUnit)) {
+      setOutputFieldUnit('default');
+    }
+  }, [outputUnitDropdownOptions, outputFieldUnit]);
 
   const edgeDiameters = useMemo(() => {
     if (!logAnalysis || !logAnalysis.slices || logAnalysis.slices.length === 0) return null;
@@ -739,26 +970,6 @@ export default function AnalyticsPage() {
   }, [transformedOriginalPoints]);
 
   const annotations = useMemo(() => {
-    if (analysisApp === 'conveyor_object') {
-      if (!showConveyorBbox) return [];
-      if (!transformedAugmentedPoints || transformedAugmentedPoints.length < 3) return [];
-      let minX = Infinity;
-      let minY = Infinity;
-      let minZ = Infinity;
-      let maxX = -Infinity;
-      let maxY = -Infinity;
-      let maxZ = -Infinity;
-      for (const p of transformedAugmentedPoints) {
-        if (p[0] < minX) minX = p[0];
-        if (p[1] < minY) minY = p[1];
-        if (p[2] < minZ) minZ = p[2];
-        if (p[0] > maxX) maxX = p[0];
-        if (p[1] > maxY) maxY = p[1];
-        if (p[2] > maxZ) maxZ = p[2];
-      }
-      return buildAabbAnnotations(minX, maxX, minY, maxY, minZ, maxZ);
-    }
-
     if (analysisApp !== 'log') return [];
     if (!yStats || !bounds) return [];
     const xRef = bounds.maxX + (bounds.maxX - bounds.minX) * 0.12;
@@ -797,45 +1008,45 @@ export default function AnalyticsPage() {
       });
     }
     return ann;
-  }, [analysisApp, yStats, bounds, edgeDiameters, transformedAugmentedPoints, showConveyorBbox]);
+  }, [analysisApp, yStats, bounds, edgeDiameters]);
 
   return (
     <Layout>
       <div className="space-y-6">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">Analytics</h1>
             <p className="text-sm text-gray-500 mt-1">
-              Active app: {analysisApp === 'conveyor_object' ? 'Conveyor object measurement' : 'Log measurement'}
+              Active app: {analysisApp === 'none' ? 'None (acquisition only)' : 'Log measurement'}
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <button className="btn-secondary" onClick={() => { fetchStatus(); fetchLatest(); }}>
+          <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
+            <syn-button onClick={() => { fetchStatus(); fetchLatest(); }}>
               <RefreshCw className="h-4 w-4" />
               Refresh
-            </button>
+            </syn-button>
             {status.recording ? (
-              <button className="btn-danger" onClick={handleStop} disabled={loading}>
+              <syn-button variant="danger" onClick={handleStop} disabled={loading}>
                 <Square className="h-4 w-4" />
                 Stop
-              </button>
+              </syn-button>
             ) : (
-              <button className="btn-success" onClick={handleStart} disabled={loading}>
+              <syn-button variant="success" onClick={handleStart} disabled={loading}>
                 <Play className="h-4 w-4" />
                 Start
-              </button>
+              </syn-button>
             )}
           </div>
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-[1.35fr_0.65fr] gap-6">
-          <div className="card">
-            <div className="flex items-center justify-between">
+          <syn-card className="app-card">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="text-xl font-semibold text-slate-900">Latest 3D Capture</h2>
                 <p className="text-xs text-gray-500">Last registered point cloud (unified frame)</p>
               </div>
-              <div className="flex items-center gap-2 text-xs text-gray-500">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
                 <span>{status.points_count} points</span>
                 {augmentedPoints.length > 0 && (
                   <label className="flex items-center gap-2 text-[11px] text-gray-500">
@@ -847,50 +1058,22 @@ export default function AnalyticsPage() {
                     Augmented
                   </label>
                 )}
-                <label className="flex items-center gap-2 text-[11px] text-gray-500">
-                  <input
-                    type="checkbox"
-                    checked={showOriginal}
-                    onChange={(e) => setShowOriginal(e.target.checked)}
-                  />
-                  Original
-                </label>
-                <label className="flex items-center gap-2 text-[11px] text-gray-500">
-                  <input
-                    type="checkbox"
-                    checked={colorBySource}
-                    onChange={(e) => setColorBySource(e.target.checked)}
-                  />
-                  Color by source
-                </label>
-                <label className="flex items-center gap-2 text-[11px] text-gray-500">
-                  <input
-                    type="checkbox"
-                    checked={fullCloud}
-                    onChange={(e) => setFullCloud(e.target.checked)}
-                  />
-                  Full cloud
-                </label>
-                {analysisApp === 'conveyor_object' && (
-                  <label className="flex items-center gap-2 text-[11px] text-gray-500">
-                    <input
-                      type="checkbox"
-                      checked={showConveyorBbox}
-                      onChange={(e) => setShowConveyorBbox(e.target.checked)}
-                    />
-                    Show BBox
-                  </label>
-                )}
-                <button
-                  className="btn-secondary px-2 py-1"
-                  onClick={() => fetchLatest(true)}
+                  <syn-checkbox checked={showOriginal} onClick={() => setShowOriginal((v) => !v)}>Original</syn-checkbox>
+                  <syn-checkbox checked={colorBySource} onClick={() => setColorBySource((v) => !v)}>Color by source</syn-checkbox>
+                  <syn-checkbox checked={fullCloud} onClick={() => setFullCloud((v) => !v)}>Full cloud</syn-checkbox>
+                <SynInteropButton
+                  size="small"
+                  onPress={async () => {
+                    await fetchLatest(true);
+                    await fetchAnalysis({ forceCloud: true, full: true });
+                  }}
                   disabled={loading || status.recording}
                 >
                   Load full
-                </button>
+                </SynInteropButton>
               </div>
             </div>
-            <div className="mt-4 relative" style={{ height: 760 }}>
+            <div className="viewer-panel-height mt-4 relative">
                 <PointCloudThreeViewer
                   key={viewerKey}
                   ref={viewerRef}
@@ -909,31 +1092,19 @@ export default function AnalyticsPage() {
                 onHoverPoint={setHoverPoint}
                 showOriginAxes
                 originAxisSize={1000}
-                showFloor={showFloor}
+                showFloor={false}
               />
-              <div className="absolute top-4 left-4 flex items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white">
+              <div className="absolute left-3 top-3 flex max-w-[calc(100%-88px)] items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white sm:left-4 sm:top-4">
                 <span className="text-gray-200">Color</span>
-                <select
-                  className="bg-transparent text-white text-xs outline-none"
-                  style={{ backgroundColor: 'rgba(15,23,42,0.9)' }}
-                  value={colorMode}
-                  onChange={(e) => setColorMode(e.target.value as typeof colorMode)}
-                >
-                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="rssi">RSSI</option>
-                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="x">X</option>
-                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="y">Y</option>
-                  <option style={{ backgroundColor: '#0f172a', color: '#e2e8f0' }} value="z">Z</option>
-                </select>
-              </div>
-              <div className="absolute top-4 right-4 flex items-center gap-2 rounded-md bg-black/40 px-2 py-1 text-xs text-white">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={showFloor}
-                    onChange={(e) => setShowFloor(e.target.checked)}
-                  />
-                  Floor
-                </label>
+                <syn-dropdown>
+                  <syn-button slot="trigger" size="small" caret="">{colorModeLabel}</syn-button>
+                  <syn-menu style={{ minWidth: 160 }}>
+                    <syn-menu-item onClick={() => setColorMode('rssi')}>RSSI</syn-menu-item>
+                    <syn-menu-item onClick={() => setColorMode('x')}>X</syn-menu-item>
+                    <syn-menu-item onClick={() => setColorMode('y')}>Y</syn-menu-item>
+                    <syn-menu-item onClick={() => setColorMode('z')}>Z</syn-menu-item>
+                  </syn-menu>
+                </syn-dropdown>
               </div>
               {analysisTimestampMs && (
                 <div className="absolute bottom-4 left-4 rounded-md bg-black/60 px-3 py-2 text-xs text-white">
@@ -951,12 +1122,15 @@ export default function AnalyticsPage() {
                 </div>
               )}
             </div>
-          </div>
+            <footer slot="footer">
+              <small>Viewer of latest acquisition cloud and overlays.</small>
+            </footer>
+          </syn-card>
 
           <div className="space-y-6">
-            <div className="card">
+            <syn-card className="app-card">
               <h2 className="text-xl font-semibold text-slate-900">Live Metrics</h2>
-              <div className="mt-4 grid grid-cols-2 gap-4">
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
                   <p className="text-xs text-gray-500">Recording</p>
                   <p className="text-2xl font-semibold text-slate-900">{status.recording ? 'ON' : 'OFF'}</p>
@@ -982,199 +1156,57 @@ export default function AnalyticsPage() {
               <div className="mt-4 text-xs text-gray-500">
                 Last update: {status.last_update_ts ? new Date(status.last_update_ts * 1000).toLocaleTimeString() : ''}
               </div>
-            </div>
+              <footer slot="footer">
+                <small>Live telemetry from trigger-driven acquisition.</small>
+              </footer>
+            </syn-card>
 
-            <div className="card">
+            <syn-card className="app-card">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-semibold text-slate-900">Output Wizard</h2>
-                <button className="btn-secondary" onClick={handleSaveOutputSettings} disabled={outputSaving}>
-                  {outputSaving ? 'Saving...' : 'Save Output'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <SynInteropButton className="btn-inline-content" onPress={() => setOutputWizardOpen(true)}>
+                    <span className="inline-flex items-center gap-2 whitespace-nowrap">
+                      <Wand2 className="h-4 w-4" />
+                      Open Builder
+                    </span>
+                  </SynInteropButton>
+                </div>
               </div>
               <p className="text-xs text-gray-500 mt-1">
-                Configure how analysis frame is sent: connection mode, endpoint and payload fields/order.
+                Konfiguracja outputu jest dostępna tylko w Builderze.
               </p>
-              <div className="mt-4 grid grid-cols-2 gap-4 text-sm">
-                <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
-                  <input
-                    type="checkbox"
-                    checked={outputSettings.enabled}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, enabled: e.target.checked }))}
-                  />
-                  Output enabled
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Connection mode</span>
-                  <select
-                    className="input"
-                    value={outputSettings.connection_mode}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, connection_mode: e.target.value as 'server' | 'client' }))}
-                  >
-                    <option value="server">Server (listen)</option>
-                    <option value="client">Client (connect)</option>
-                  </select>
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">{outputSettings.connection_mode === 'server' ? 'Listen IP' : 'Target IP / host'}</span>
-                  <input
-                    className="input"
-                    value={outputSettings.host}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, host: e.target.value }))}
-                  />
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">{outputSettings.connection_mode === 'server' ? 'Listen port' : 'Target port'}</span>
-                  <input
-                    className="input"
-                    type="number"
-                    min={1}
-                    max={65535}
-                    value={outputSettings.port}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, port: Number(e.target.value || 2120) }))}
-                  />
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Payload mode</span>
-                  <select
-                    className="input"
-                    value={outputSettings.payload_mode}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, payload_mode: e.target.value as 'ascii' | 'json' }))}
-                  >
-                    <option value="ascii">ASCII frame</option>
-                    <option value="json">JSON</option>
-                  </select>
-                </label>
-                <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
-                  <input
-                    type="checkbox"
-                    checked={outputSettings.include_labels}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, include_labels: e.target.checked }))}
-                  />
-                  Include labels (`key=value`)
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Separator</span>
-                  <input
-                    className="input"
-                    value={outputSettings.separator}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, separator: e.target.value }))}
-                  />
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Prefix</span>
-                  <select
-                    className="input"
-                    value={outputSettings.prefix}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, prefix: e.target.value }))}
-                  >
-                    {PREFIX_SUFFIX_OPTIONS.map((o) => (
-                      <option key={`prefix-${o.label}`} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Suffix</span>
-                  <select
-                    className="input"
-                    value={outputSettings.suffix}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, suffix: e.target.value }))}
-                  >
-                    {PREFIX_SUFFIX_OPTIONS.map((o) => (
-                      <option key={`suffix-${o.label}`} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Float precision</span>
-                  <input
-                    className="input"
-                    type="number"
-                    min={0}
-                    max={8}
-                    value={outputSettings.float_precision}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, float_precision: Number(e.target.value || 2) }))}
-                  />
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Length unit</span>
-                  <select
-                    className="input"
-                    value={outputSettings.length_unit}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, length_unit: e.target.value as 'mm' | 'm' }))}
-                  >
-                    <option value="mm">mm</option>
-                    <option value="m">m</option>
-                  </select>
-                </label>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Volume unit</span>
-                  <select
-                    className="input"
-                    value={outputSettings.volume_unit}
-                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, volume_unit: e.target.value as 'm3' | 'l' | 'mm3' }))}
-                  >
-                    <option value="m3">m3</option>
-                    <option value="l">l</option>
-                    <option value="mm3">mm3</option>
-                  </select>
-                </label>
-              </div>
-              <div className="mt-4">
-                <div className="text-xs text-gray-500 mb-2">
-                  Frame fields and order ({analysisApp === 'conveyor_object' ? 'conveyor_object' : 'log'})
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {outputFieldOptions.map((f) => {
-                    const checked = outputSettings.selected_fields.includes(f.key);
-                    return (
-                      <label key={f.key} className="flex items-center gap-2 text-xs text-gray-600">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={(e) =>
-                            setOutputSettings((prev) => ({
-                              ...prev,
-                              selected_fields: e.target.checked
-                                ? [...prev.selected_fields.filter((k) => k !== f.key), f.key]
-                                : prev.selected_fields.filter((k) => k !== f.key),
-                            }))
-                          }
-                        />
-                        {f.label}
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-gray-600">
-                Current order: {outputSettings.selected_fields.join(' -> ') || '(none)'}
+              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-gray-600 break-all">
+                Frame preview: {outputFramePreviewReadable}
               </div>
               {outputSavedAt !== null && (
                 <div className="mt-2 text-xs text-emerald-600">
                   Saved {new Date(outputSavedAt).toLocaleTimeString()}
                 </div>
               )}
-            </div>
+              <footer slot="footer">
+                <small>Configure protocol and payload fields for external integration.</small>
+              </footer>
+            </syn-card>
 
-            <div className="card">
+            <syn-card className="app-card">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-semibold text-slate-900">Analysis Results</h2>
-                <button
-                  className="btn-secondary"
+                <syn-button
                   onClick={handleSaveAndRecomputeAnalysis}
                   disabled={analysisSaving || status.recording}
                   title={status.recording ? 'Stop acquisition before recompute' : ''}
                 >
                   {analysisSaving ? 'Saving...' : 'Save & Recompute'}
-                </button>
+                </syn-button>
               </div>
               {analysisApp === 'log' ? (
                 <p className="text-xs text-gray-500 mt-1">
                   Fits a circle to each window on the X/Z plane. Length is along Y.
+                </p>
+              ) : analysisApp === 'none' ? (
+                <p className="text-xs text-gray-500 mt-1">
+                  Analysis disabled. Acquisition cloud only.
                 </p>
               ) : (
                 <p className="text-xs text-gray-500 mt-1">
@@ -1183,12 +1215,12 @@ export default function AnalyticsPage() {
               )}
 
               {analysisApp === 'log' && (
-                <div className="mt-4 grid grid-cols-2 gap-4 text-sm">
+                <div className="mt-4 grid grid-cols-1 gap-4 text-sm sm:grid-cols-2">
                   <label className="flex flex-col gap-1">
                     <span className="text-xs text-gray-500">Active app</span>
                     <select className="input" value={analysisApp} onChange={(e) => setAnalysisApp(e.target.value as AnalysisApp)}>
+                      <option value="none">None (acquisition only)</option>
                       <option value="log">Log measurement</option>
-                      <option value="conveyor_object">Conveyor object</option>
                     </select>
                   </label>
                   <label className="flex flex-col gap-1">
@@ -1215,7 +1247,7 @@ export default function AnalyticsPage() {
               )}
 
               {analysisApp === 'conveyor_object' && (
-                <div className="mt-4 grid grid-cols-2 gap-4 text-sm">
+                <div className="mt-4 grid grid-cols-1 gap-4 text-sm sm:grid-cols-2">
                   <label className="flex flex-col gap-1">
                     <span className="text-xs text-gray-500">Active app</span>
                     <select className="input" value={analysisApp} onChange={(e) => setAnalysisApp(e.target.value as AnalysisApp)}>
@@ -1286,11 +1318,11 @@ export default function AnalyticsPage() {
                     </>
                   )}
                   <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
-                    <input type="checkbox" checked={convDenoiseEnabled} onChange={(e) => setConvDenoiseEnabled(e.target.checked)} />
+                    <syn-checkbox checked={convDenoiseEnabled} onClick={() => setConvDenoiseEnabled((v) => !v)} />
                     Denoise enabled
                   </label>
                   <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
-                    <input type="checkbox" checked={convKeepLargestComponent} onChange={(e) => setConvKeepLargestComponent(e.target.checked)} />
+                    <syn-checkbox checked={convKeepLargestComponent} onClick={() => setConvKeepLargestComponent((v) => !v)} />
                     Keep largest component
                   </label>
                 </div>
@@ -1302,19 +1334,19 @@ export default function AnalyticsPage() {
                 </div>
               )}
 
-              <div className="mt-4 flex gap-2">
+              <div className="mt-4 flex flex-wrap gap-2">
                 {analysisApp === 'log' && (
-                  <button className="btn-primary" onClick={handleAnalyze} disabled={loading || status.recording}>
+                  <syn-button variant="filled" onClick={handleAnalyze} disabled={loading || status.recording}>
                     <Wand2 className="h-4 w-4" />
                     Run local analysis
-                  </button>
+                  </syn-button>
                 )}
-                <button className="btn-secondary" onClick={() => fetchAnalysis({ forceCloud: true })} disabled={loading}>
+                <syn-button onClick={() => fetchAnalysis({ forceCloud: true })} disabled={loading}>
                   Fetch server analysis
-                </button>
-                <button className="btn-secondary" onClick={() => setAnalysis(null)}>
+                </syn-button>
+                <syn-button onClick={() => setAnalysis(null)}>
                   Clear
-                </button>
+                </syn-button>
               </div>
 
               {analysisDuration !== null && (
@@ -1323,7 +1355,7 @@ export default function AnalyticsPage() {
 
               {logAnalysis && (
                 <div className="mt-4 space-y-3 text-sm text-gray-500">
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div>
                       <div className="text-xs text-gray-400">Slices</div>
                       <div className="text-lg font-semibold text-slate-900">{logAnalysis.total_slices}</div>
@@ -1375,7 +1407,7 @@ export default function AnalyticsPage() {
 
               {conveyorAnalysis && (
                 <div className="mt-4 space-y-3 text-sm text-gray-500">
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div>
                       <div className="text-xs text-gray-400">Localization</div>
                       <div className="text-lg font-semibold text-slate-900">
@@ -1435,9 +1467,218 @@ export default function AnalyticsPage() {
                   </div>
                 </div>
               )}
-            </div>
+              <footer slot="footer">
+                <small>Use recompute after settings changes to keep outputs in sync.</small>
+              </footer>
+            </syn-card>
           </div>
         </div>
+
+        {outputWizardOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-black/45 backdrop-blur-sm" onClick={() => setOutputWizardOpen(false)} />
+            <syn-card className="app-card relative w-[min(920px,96vw)] max-h-[92vh] overflow-auto">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-semibold text-slate-900">Output Frame Builder</h3>
+                <div className="flex items-center gap-2">
+                  <SynInteropButton className="btn-inline-content" onPress={handleSaveOutputSettings} disabled={outputSaving}>
+                    {outputSaving ? 'Saving...' : 'Save Output'}
+                  </SynInteropButton>
+                  <syn-button size="small" onClick={() => setOutputWizardOpen(false)} aria-label="Close builder">
+                    <X className="h-4 w-4" />
+                  </syn-button>
+                </div>
+              </div>
+              <p className="mt-1 text-xs text-gray-500">
+                Build custom output frame by adding fields and your own text. Connection is fixed to TCP server on port 2120.
+              </p>
+
+              <div className="mt-4 grid grid-cols-1 gap-4 text-sm sm:grid-cols-2">
+                <label className="flex items-center gap-2 text-xs text-gray-500 mt-6">
+                  <syn-checkbox
+                    checked={outputSettings.enabled}
+                    onClick={() => setOutputSettings((prev) => ({ ...prev, enabled: !prev.enabled }))}
+                  >
+                    Output enabled
+                  </syn-checkbox>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Listen IP</span>
+                  <input
+                    className="input"
+                    value={outputSettings.host}
+                    onChange={(e) => setOutputSettings((prev) => ({ ...prev, host: e.target.value }))}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-500">Separator (global)</span>
+                  <SynInteropDropdown
+                    value={outputSettings.separator}
+                    options={OUTPUT_SEPARATOR_OPTIONS}
+                    onChange={(next) => setOutputSettings((prev) => ({ ...prev, separator: next }))}
+                    className="w-full"
+                  />
+                </label>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-[1.2fr_0.6fr_0.35fr_auto]">
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Parameter</div>
+                  <SynInteropDropdown
+                    value={outputFieldToAdd}
+                    options={outputFieldDropdownOptions}
+                    onChange={(next) => setOutputFieldToAdd(next)}
+                    className="w-full"
+                  />
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Unit formatting</div>
+                  <SynInteropDropdown
+                    value={outputFieldUnit}
+                    options={outputUnitDropdownOptions}
+                    onChange={(next) => setOutputFieldUnit(next as OutputUnitChoice)}
+                    className="w-full"
+                  />
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Precision</div>
+                  <SynInteropDropdown
+                    value={outputFieldPrecision}
+                    options={outputPrecisionDropdownOptions}
+                    onChange={(next) => setOutputFieldPrecision(next)}
+                    className="w-full"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <syn-button onClick={addFieldToFrame}>
+                    <Plus className="h-4 w-4" />
+                    Add field
+                  </syn-button>
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto]">
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Custom text</div>
+                  <input
+                    className="input"
+                    value={outputCustomText}
+                    placeholder="np. MACHINE=LINE_A"
+                    onChange={(e) => setOutputCustomText(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-end">
+                  <syn-button onClick={addTextToFrame}>
+                    <Plus className="h-4 w-4" />
+                    Add text
+                  </syn-button>
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-[1fr_1fr_auto_auto]">
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Special marker (preset)</div>
+                  <SynInteropDropdown
+                    value={outputMarkerPreset}
+                    options={OUTPUT_MARKER_OPTIONS}
+                    onChange={(next) => setOutputMarkerPreset(next)}
+                    className="w-full"
+                  />
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Custom marker</div>
+                  <input
+                    className="input"
+                    value={outputMarkerCustom}
+                    placeholder="np. # lub @@"
+                    onChange={(e) => setOutputMarkerCustom(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-end">
+                  <syn-button onClick={() => addMarkerToFrame(outputMarkerPreset, OUTPUT_MARKER_OPTIONS.find((m) => m.value === outputMarkerPreset)?.label || '')}>
+                    Add preset marker
+                  </syn-button>
+                </div>
+                <div className="flex items-end">
+                  <syn-button onClick={() => { if (outputMarkerCustom.length > 0) { addMarkerToFrame(outputMarkerCustom, 'Custom marker'); setOutputMarkerCustom(''); } }}>
+                    <Plus className="h-4 w-4" />
+                    Add custom marker
+                  </syn-button>
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-md border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs font-semibold text-slate-700">Frame items order</div>
+                <div className="mt-2 space-y-2">
+                  {(outputSettings.output_frame_items || []).map((item, idx) => (
+                    <div key={`frame-item-${idx}`} className="flex items-center justify-between rounded border border-slate-200 bg-white px-2 py-1.5 text-xs">
+                      <div className="min-w-0 truncate">
+                        {humanizeFrameItem(item)}
+                        {item.type === 'field' && (
+                          <span className="ml-2 text-[10px] text-slate-500">p:{typeof item.precision === 'number' ? item.precision : 2}</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {item.type === 'field' && (
+                          <div className="w-20">
+                            <SynInteropDropdown
+                              value={String(typeof item.precision === 'number' ? item.precision : 2)}
+                              options={outputPrecisionDropdownOptions}
+                              onChange={(next) => setFrameItemPrecision(idx, Number(next))}
+                            />
+                          </div>
+                        )}
+                        <syn-button size="small" onClick={() => moveFrameItem(idx, -1)} disabled={idx === 0}>
+                          <ArrowUp className="h-3.5 w-3.5" />
+                        </syn-button>
+                        <syn-button size="small" onClick={() => moveFrameItem(idx, 1)} disabled={idx === (outputSettings.output_frame_items || []).length - 1}>
+                          <ArrowDown className="h-3.5 w-3.5" />
+                        </syn-button>
+                        <syn-button variant="danger" size="small" onClick={() => removeFrameItem(idx)}>
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </syn-button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="text-xs font-semibold text-slate-700 mb-1">Frame preview (readable)</div>
+                <div className="rounded border border-slate-200 bg-white p-3 text-sm font-mono text-slate-800 break-all min-h-[56px]">
+                  {outputFramePreviewReadable}
+                </div>
+                <div className="mt-2 text-[11px] text-slate-500">Raw</div>
+                <div className="rounded border border-slate-200 bg-white p-2 text-xs font-mono text-slate-700 break-all min-h-[40px]">
+                  {outputFramePreviewRaw}
+                </div>
+              </div>
+
+              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="text-xs font-semibold text-slate-700 mb-1">Last data example from system</div>
+                <div className="rounded border border-slate-200 bg-white p-3 text-sm font-mono text-slate-800 break-all min-h-[56px]">
+                  {outputServerPreview
+                    ? visualizeControlChars(
+                        typeof outputServerPreview.payload === 'string'
+                          ? outputServerPreview.payload
+                          : JSON.stringify(outputServerPreview.payload)
+                      )
+                    : '(no preview data)'}
+                </div>
+                {outputServerPreview && (
+                  <div className="mt-1 text-[11px] text-slate-500">
+                    source: {outputServerPreview.source} | app: {outputServerPreview.analysis_app} | ts:{' '}
+                    {outputServerPreview.timestamp_ms ? new Date(outputServerPreview.timestamp_ms).toLocaleString() : '-'}
+                  </div>
+                )}
+              </div>
+
+              <footer slot="footer">
+                <small>Use Save Output to persist this frame and apply it to TCP output.</small>
+              </footer>
+            </syn-card>
+          </div>
+        )}
       </div>
     </Layout>
   );

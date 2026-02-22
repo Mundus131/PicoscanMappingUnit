@@ -5,7 +5,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
-import { Plus, Edit, Trash2, X, Wand2 } from 'lucide-react';
+import { SynInteropButton, SynInteropCheckbox, SynInteropDropdown, SynInteropSwitch } from '@/components/synergy/SynInterop';
+import { Plus, Edit, RefreshCw, Trash2, X, Wand2 } from 'lucide-react';
 
 interface Device {
   device_id: string;
@@ -34,7 +35,7 @@ interface AcquisitionLiveStatus {
 }
 
 type TriggerInputName = 'DI_A' | 'DI_B' | 'DI_C' | 'DI_D' | 'DIO_A' | 'DIO_B' | 'DIO_C' | 'DIO_D';
-type AnalysisApp = 'log' | 'conveyor_object';
+type AnalysisApp = 'none' | 'log' | 'conveyor_object';
 
 const TRIGGER_INPUT_OPTIONS: TriggerInputName[] = ['DI_A', 'DI_B', 'DI_C', 'DI_D', 'DIO_A', 'DIO_B', 'DIO_C', 'DIO_D'];
 
@@ -152,6 +153,7 @@ export default function CalibrationPage() {
   const [analysisSaving, setAnalysisSaving] = useState(false);
   const [analysisSavedAt, setAnalysisSavedAt] = useState<number | null>(null);
   const [pingMap, setPingMap] = useState<Record<string, boolean | null>>({});
+  const [restartingMap, setRestartingMap] = useState<Record<string, boolean>>({});
   const [tdcEnabled, setTdcEnabled] = useState(false);
   const [tdcIp, setTdcIp] = useState('192.168.0.100');
   const [tdcPort, setTdcPort] = useState(8081);
@@ -353,7 +355,9 @@ export default function CalibrationPage() {
 
   const loadDevices = async () => {
     const res = await api.get('/devices/');
-    setDevices(res.data || []);
+    const loaded = res.data || [];
+    setDevices(loaded);
+    return loaded;
   };
 
   const getLiveAdjustmentFromDevice = (device: Device): LiveAdjustment => {
@@ -524,7 +528,8 @@ export default function CalibrationPage() {
     try {
       const res = await api.get('/calibration/analysis-settings');
       if (res.data) {
-        setAnalysisApp(res.data.active_app === 'conveyor_object' ? 'conveyor_object' : 'log');
+        const active = String(res.data.active_app || 'log').toLowerCase();
+        setAnalysisApp(active === 'none' ? 'none' : 'log');
         if (typeof res.data.log_window_profiles === 'number') setLogWindowProfiles(res.data.log_window_profiles);
         if (typeof res.data.log_min_points === 'number') setLogMinPoints(res.data.log_min_points);
         if (typeof res.data.conveyor_plane_quantile === 'number') setConvPlaneQuantile(res.data.conveyor_plane_quantile);
@@ -767,15 +772,17 @@ export default function CalibrationPage() {
     setSelectedIds(initial);
   }, [devices, selectedIds]);
 
+  const calibrationTargetIds = previewVisibleIds.length > 0 ? previewVisibleIds : selectedIds;
+
   useEffect(() => {
-    if (selectedIds.length === 0) {
+    if (calibrationTargetIds.length === 0) {
       setReferenceDeviceId('');
       return;
     }
-    if (!referenceDeviceId || !selectedIds.includes(referenceDeviceId)) {
-      setReferenceDeviceId(selectedIds[0]);
+    if (!referenceDeviceId || !calibrationTargetIds.includes(referenceDeviceId)) {
+      setReferenceDeviceId(calibrationTargetIds[0]);
     }
-  }, [selectedIds, referenceDeviceId]);
+  }, [calibrationTargetIds, referenceDeviceId]);
 
   useEffect(() => {
     if (!previewActive || previewVisibleIds.length === 0) return;
@@ -873,15 +880,19 @@ export default function CalibrationPage() {
   useEffect(() => {
     if (!previewActive) return;
     if (previewVisibleIds.length > 0) return;
-    if (selectedIds.length > 0) {
-      setPreviewVisibleIds(selectedIds);
-      return;
-    }
     const enabled = devices.filter((d) => d.enabled).map((d) => d.device_id);
     if (enabled.length > 0) {
       setPreviewVisibleIds(enabled);
     }
-  }, [previewActive, previewVisibleIds, selectedIds, devices]);
+  }, [previewActive, previewVisibleIds, devices]);
+
+  useEffect(() => {
+    if (!previewActive) return;
+    const enabled = devices.filter((d) => d.enabled).map((d) => d.device_id);
+    if (enabled.length > 0) {
+      setPreviewVisibleIds(enabled);
+    }
+  }, [previewActive, devices]);
 
   useEffect(() => {
     return () => {
@@ -979,6 +990,22 @@ export default function CalibrationPage() {
     }
   };
 
+  const handleRestartListener = async (deviceId: string) => {
+    setRestartingMap((prev) => ({ ...prev, [deviceId]: true }));
+    try {
+      await api.post(`/devices/${deviceId}/restart-listener`);
+      const loaded = await loadDevices();
+      const ids = (loaded || []).map((d: Device) => d.device_id);
+      if (ids.length > 0) {
+        await refreshPing(ids);
+      }
+    } catch (error) {
+      console.error(`Failed to restart listener for ${deviceId}:`, error);
+    } finally {
+      setRestartingMap((prev) => ({ ...prev, [deviceId]: false }));
+    }
+  };
+
   const openDetails = (device: Device) => {
     setDetailsDevice(device);
     setIsDetailsOpen(true);
@@ -990,16 +1017,16 @@ export default function CalibrationPage() {
   };
 
   const runAutoCalibration = async (options?: { referenceDeviceId?: string; saveResult?: boolean }) => {
-    if (selectedIds.length === 0) return;
+    if (calibrationTargetIds.length === 0) return;
     const resolvedReference = options?.referenceDeviceId ?? referenceDeviceId;
     const saveResult = options?.saveResult ?? autoCalibSaveResult;
-    const ref = resolvedReference && selectedIds.includes(resolvedReference)
+    const ref = resolvedReference && calibrationTargetIds.includes(resolvedReference)
       ? resolvedReference
-      : selectedIds[0];
+      : calibrationTargetIds[0];
     setLoading(true);
     try {
       const res = await api.post('/calibration/auto', {
-        device_ids: selectedIds,
+        device_ids: calibrationTargetIds,
         reference_device_id: ref,
         method: 'icp',
         max_iterations: 50,
@@ -1114,17 +1141,20 @@ export default function CalibrationPage() {
     window.addEventListener('mouseup', onUp);
   };
 
+  const enabledPreviewDevices = devices.filter((d) => d.enabled);
+  const referenceOptions = devices.filter((d) => calibrationTargetIds.includes(d.device_id));
+  const previewScannerOptions = devices.filter((d) => previewVisibleIds.includes(d.device_id));
+
   return (
     <Layout>
       <div className="space-y-6">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">System Configurator</h1>
             <p className="text-sm text-gray-500 mt-1">Universal acquisition layout for multi-device systems</p>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              className="btn-secondary"
+          <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
+            <syn-button
               onClick={async () => {
                 if (!confirm('Restart backend now?')) return;
                 try {
@@ -1135,17 +1165,17 @@ export default function CalibrationPage() {
               }}
             >
               Restart Backend
-            </button>
-            <button className="btn-primary" onClick={() => handleOpenModal()}>
+            </syn-button>
+            <syn-button variant="filled" onClick={() => handleOpenModal()}>
               <Plus size={16} />
               Add Device
-            </button>
+            </syn-button>
           </div>
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
           <div className="space-y-6">
-            <div className="card">
+            <syn-card className="app-card">
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold text-slate-900">Frame Layout</h2>
               <div className="text-xs text-gray-500">Gantry with corner-mounted LiDARs</div>
@@ -1194,29 +1224,14 @@ export default function CalibrationPage() {
               </div>
             </div>
             <div className="mt-3 flex justify-end">
-              <button className="btn-secondary" onClick={handleSaveFrameSettings} disabled={frameSaving}>
+              <syn-button onClick={() => { void handleSaveFrameSettings(); }} disabled={frameSaving}>
                 {frameSaving ? 'Saving...' : 'Save Frame Settings'}
-              </button>
+              </syn-button>
             </div>
             <div className="mt-3 flex items-center gap-2">
-              <label htmlFor="clip_points_to_frame" className="synergy-toggle">
-                <input
-                  id="clip_points_to_frame"
-                  className="synergy-toggle-input"
-                  type="checkbox"
-                  checked={clipPointsToFrame}
-                  onChange={(e) => handleToggleClipPoints(e.target.checked)}
-                />
-                <span className={`synergy-toggle-track ${clipPointsToFrame ? 'is-on' : ''}`} aria-hidden="true">
-                  <span className="synergy-toggle-thumb" />
-                </span>
-                <span className="synergy-toggle-label text-xs text-gray-600">
-                  Auto-filter points outside frame (X/Z)
-                </span>
-                <span className={`synergy-toggle-state ${clipPointsToFrame ? 'is-on' : ''}`}>
-                  {clipPointsToFrame ? 'ON' : 'OFF'}
-                </span>
-              </label>
+              <syn-switch checked={clipPointsToFrame} onClick={() => handleToggleClipPoints(!clipPointsToFrame)}>
+                Auto-filter points outside frame (X/Z)
+              </syn-switch>
             </div>
             {frameSaveError && (
               <div className="mt-2 text-xs text-red-600">{frameSaveError}</div>
@@ -1324,17 +1339,20 @@ export default function CalibrationPage() {
                 Suggested coordinate system: X to the right, Y up, Z out of plane.
               </div>
             </div>
-          </div>
+              <footer slot="footer">
+                <small>Frame geometry and clipping behavior for unified acquisition space.</small>
+              </footer>
+            </syn-card>
 
-          <div className="card">
+          <syn-card className="app-card">
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-xl font-semibold text-slate-900">Motion Mode</h2>
                 <p className="text-xs text-gray-500 mt-1">Fixed speed or encoder-driven operation</p>
               </div>
-              <button className="btn-secondary" onClick={handleSaveMotionSettings} disabled={motionSaving}>
+              <syn-button onClick={handleSaveMotionSettings} disabled={motionSaving}>
                 {motionSaving ? 'Saving...' : 'Save Motion Settings'}
-              </button>
+              </syn-button>
             </div>
             <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
@@ -1425,24 +1443,27 @@ export default function CalibrationPage() {
                 Saved {new Date(motionSavedAt).toLocaleTimeString()}
               </div>
             )}
-          </div>
+              <footer slot="footer">
+                <small>Configure fixed-speed or encoder-driven profile spacing.</small>
+              </footer>
+            </syn-card>
 
-          <div className="card">
+          <syn-card className="app-card">
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-xl font-semibold text-slate-900">Analysis App</h2>
                 <p className="text-xs text-gray-500 mt-1">Select active post-acquisition analysis pipeline</p>
               </div>
-              <button className="btn-secondary" onClick={handleSaveAnalysisSettings} disabled={analysisSaving}>
+              <syn-button onClick={handleSaveAnalysisSettings} disabled={analysisSaving}>
                 {analysisSaving ? 'Saving...' : 'Save Analysis Settings'}
-              </button>
+              </syn-button>
             </div>
             <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
                 <label className="text-xs text-gray-600">Active application</label>
                 <select className="input mt-1" value={analysisApp} onChange={(e) => setAnalysisApp(e.target.value as AnalysisApp)}>
+                  <option value="none">None (acquisition only)</option>
                   <option value="log">Log measurement</option>
-                  <option value="conveyor_object">Conveyor object measurement</option>
                 </select>
               </div>
               {analysisApp === 'log' ? (
@@ -1456,6 +1477,10 @@ export default function CalibrationPage() {
                     <input className="input mt-1" type="number" min={10} value={logMinPoints} onChange={(e) => setLogMinPoints(parseInt(e.target.value || '10'))} />
                   </div>
                 </>
+              ) : analysisApp === 'none' ? (
+                <div className="flex items-end text-xs text-gray-500">
+                  No post-acquisition analysis. System stores only acquisition cloud.
+                </div>
               ) : (
                 <>
                   <div>
@@ -1482,17 +1507,20 @@ export default function CalibrationPage() {
                 Saved {new Date(analysisSavedAt).toLocaleTimeString()}
               </div>
             )}
-          </div>
+              <footer slot="footer">
+                <small>Select analysis pipeline defaults used after acquisition stop.</small>
+              </footer>
+            </syn-card>
 
-          <div className="card">
+          <syn-card className="app-card">
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-xl font-semibold text-slate-900">Digital Trigger (TDC)</h2>
                 <p className="text-xs text-gray-500 mt-1">Start/stop acquisition based on digital input edges</p>
               </div>
-              <button className="btn-secondary" onClick={handleSaveTdcSettings} disabled={tdcSaving}>
+              <syn-button onClick={handleSaveTdcSettings} disabled={tdcSaving}>
                 {tdcSaving ? 'Saving...' : 'Save TDC Settings'}
-              </button>
+              </syn-button>
             </div>
             <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="flex items-center gap-2">
@@ -1697,11 +1725,14 @@ export default function CalibrationPage() {
                 </div>
               </div>
             )}
-          </div>
+              <footer slot="footer">
+                <small>Digital trigger and encoder integration with TDC service.</small>
+              </footer>
+            </syn-card>
 
         </div>
 
-          <div className="card">
+          <syn-card className="app-card">
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold text-slate-900">Devices</h2>
               <span className="text-xs text-gray-500">{devices.length} devices</span>
@@ -1713,7 +1744,7 @@ export default function CalibrationPage() {
                   <div className="table-container">
                     <div
                       className="table-header text-xs font-semibold text-gray-600"
-                      style={{ display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.7fr 0.9fr 0.9fr 0.7fr', columnGap: '0.5rem', alignItems: 'center' }}
+                      style={{ display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.7fr 0.9fr 0.9fr 0.7fr', columnGap: '0.5rem', alignItems: 'center', minWidth: '760px' }}
                     >
                       <div>Name</div>
                       <div>IP</div>
@@ -1728,7 +1759,7 @@ export default function CalibrationPage() {
                         <div
                           key={device.device_id}
                           className="table-row"
-                          style={{ display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.7fr 0.9fr 0.9fr 0.7fr', columnGap: '0.5rem', alignItems: 'center' }}
+                          style={{ display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.7fr 0.9fr 0.9fr 0.7fr', columnGap: '0.5rem', alignItems: 'center', minWidth: '760px' }}
                         >
                           <div className="min-w-0">
                             <div className="font-medium text-slate-900 truncate">{device.name || device.device_id}</div>
@@ -1746,12 +1777,20 @@ export default function CalibrationPage() {
                             {ping === undefined ? 'checking' : ping ? 'reachable' : 'no ping'}
                           </div>
                           <div className="flex gap-2 justify-end">
-                            <button className="btn-secondary btn-sm btn-icon" onClick={() => handleOpenModal(device)} aria-label="Edit">
+                            <syn-button
+                              size="small"
+                              onClick={() => handleRestartListener(device.device_id)}
+                              aria-label="Restart listener"
+                              disabled={!!restartingMap[device.device_id]}
+                            >
+                              <RefreshCw size={14} />
+                            </syn-button>
+                            <syn-button size="small" onClick={() => handleOpenModal(device)} aria-label="Edit">
                               <Edit size={14} />
-                            </button>
-                            <button className="btn-danger btn-sm btn-icon" onClick={() => handleDeleteDevice(device.device_id)} aria-label="Delete">
+                            </syn-button>
+                            <syn-button variant="danger" size="small" onClick={() => handleDeleteDevice(device.device_id)} aria-label="Delete">
                               <Trash2 size={14} />
-                            </button>
+                            </syn-button>
                           </div>
                         </div>
                       );
@@ -1761,83 +1800,26 @@ export default function CalibrationPage() {
               </div>
 
             <div className="mt-4">
-              <label className="text-xs text-gray-600">Select devices for preview</label>
-              <select
-                className="input mt-1"
-                multiple
-                value={selectedIds}
-                onChange={(e) => {
-                  const opts = Array.from(e.target.selectedOptions).map((o) => o.value);
-                  setSelectedIds(opts);
-                }}
-              >
-                {devices.map((d) => (
-                  <option key={d.device_id} value={d.device_id}>
-                    {d.name || d.device_id}
-                  </option>
-                ))}
-              </select>
-              <div className="mt-3 flex gap-2">
-                <div className="min-w-[220px]">
-                  <label className="text-xs text-gray-600">Reference device</label>
-                  <select
-                    className="input mt-1"
-                    value={referenceDeviceId}
-                    onChange={(e) => setReferenceDeviceId(e.target.value)}
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="text-xs font-semibold text-slate-700">Live Preview</div>
+                <div className="mt-1 text-[11px] text-slate-600">
+                  Preview zawsze startuje ze wszystkimi aktywnymi skanerami.
+                </div>
+                <div className="mt-2">
+                  <SynInteropButton
+                    variant={previewActive ? 'danger' : 'filled'}
+                    onPress={() => setPreviewActive((v) => !v)}
+                    disabled={enabledPreviewDevices.length === 0}
                   >
-                    {devices
-                      .filter((d) => selectedIds.includes(d.device_id))
-                      .map((d) => (
-                        <option key={d.device_id} value={d.device_id}>
-                          {d.name || d.device_id}
-                        </option>
-                      ))}
-                  </select>
+                    {previewActive ? 'Stop Live Preview' : 'Start Live Preview'}
+                  </SynInteropButton>
                 </div>
-                <button className="btn-primary" onClick={runAutoCalibration} disabled={loading || selectedIds.length === 0}>
-                  <Wand2 size={14} />
-                  Auto-Calibration (ICP)
-                </button>
-                <button
-                  className="btn-secondary"
-                  onClick={() => setPreviewActive((v) => !v)}
-                  disabled={selectedIds.length === 0}
-                >
-                  {previewActive ? 'Stop Preview' : 'Live Preview'}
-                </button>
               </div>
-              {autoResult && (
-                <div className="mt-3 text-xs text-gray-600 bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-800 rounded-lg p-3">
-                  <div className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Auto-calibration result</div>
-                  <div className="text-[11px] text-gray-500 mb-3">
-                    Mode: {autoResult.saved === false ? 'Preview only (not saved)' : 'Saved to device calibration'}
-                  </div>
-                  <div className="grid grid-cols-1 gap-2">
-                    {(autoResult.results || []).map((r: AutoCalibrationResultItem) => {
-                      const framePos = toFramePositionFromCalibration(r.translation);
-                      return (
-                        <div key={r.device_id} className="bg-white/70 dark:bg-gray-900/60 rounded-md px-3 py-2 border border-gray-200 dark:border-gray-800">
-                          <div className="flex items-center justify-between">
-                            <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">{r.device_id}</div>
-                            <div className="text-xs text-gray-500">score: {typeof r.score === 'number' ? r.score.toFixed(3) : '-'}</div>
-                          </div>
-                          <div className="mt-1 text-xs text-gray-500">
-                            t[mm]: {r.translation?.map((v: number) => v.toFixed(2)).join(', ') || '-'}
-                          </div>
-                          <div className="text-xs text-gray-500">
-                            r[deg]: {r.rotation_deg?.map((v: number) => v.toFixed(3)).join(', ') || '-'}
-                          </div>
-                          <div className="text-xs text-gray-500">
-                            frame[m]: x={framePos.x.toFixed(4)}, y={framePos.y.toFixed(4)}, z={framePos.z.toFixed(4)} | yaw={Number(r.rotation_deg?.[1] ?? 0).toFixed(3)} deg
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
             </div>
-          </div>
+            <footer slot="footer">
+              <small>Device registry. Auto-calibration is available only in Live Preview.</small>
+            </footer>
+          </syn-card>
         </div>
 
         {previewActive && (
@@ -1906,15 +1888,15 @@ export default function CalibrationPage() {
                   )}
                 </div>
                 <div className="h-full overflow-auto border border-gray-200 rounded-lg p-3 bg-white/70">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                     <div className="text-sm font-semibold text-slate-800">Live Device Placement</div>
-                    <div className="flex items-center gap-1">
-                      <button className="btn-secondary btn-sm" onClick={loadPreviewFilterSettings} type="button">
+                    <div className="flex flex-wrap items-center gap-1">
+                      <SynInteropButton size="small" onPress={loadPreviewFilterSettings}>
                         Reload Config
-                      </button>
-                      <button className="btn-success btn-sm" onClick={handleSavePreviewFilterSettings} disabled={previewFilterSaving} type="button">
+                      </SynInteropButton>
+                      <SynInteropButton size="small" variant="success" onPress={handleSavePreviewFilterSettings} disabled={previewFilterSaving}>
                         {previewFilterSaving ? 'Saving...' : 'Save Filter Config'}
-                      </button>
+                      </SynInteropButton>
                     </div>
                   </div>
                   <p className="text-xs text-gray-500 mt-1">
@@ -1926,116 +1908,90 @@ export default function CalibrationPage() {
                     </div>
                   )}
                   <div className="mt-3 rounded-lg border border-gray-200 bg-white px-2.5 py-2">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                       <label className="text-xs text-gray-600">Visible scanners (preview)</label>
-                      <div className="flex items-center gap-1">
-                        <button
-                          className="btn-secondary btn-sm"
-                          onClick={() => setPreviewVisibleIds(devices.filter((d) => d.enabled).map((d) => d.device_id))}
-                          type="button"
+                      <div className="flex flex-wrap items-center gap-1">
+                        <SynInteropButton
+                          size="small"
+                          onPress={() => setPreviewVisibleIds(enabledPreviewDevices.map((d) => d.device_id))}
                         >
                           All
-                        </button>
-                        <button
-                          className="btn-secondary btn-sm"
-                          onClick={() => setPreviewVisibleIds(selectedIds)}
-                          type="button"
+                        </SynInteropButton>
+                        <SynInteropButton
+                          size="small"
+                          onPress={() => setPreviewVisibleIds([])}
                         >
-                          Selected
-                        </button>
+                          None
+                        </SynInteropButton>
                       </div>
                     </div>
-                    <select
-                      className="input mt-1"
-                      multiple
-                      value={previewVisibleIds}
-                      onChange={(e) => {
-                        const opts = Array.from(e.target.selectedOptions).map((o) => o.value);
-                        setPreviewVisibleIds(opts);
-                      }}
-                    >
-                      {devices
-                        .filter((d) => d.enabled)
-                        .map((d) => (
-                          <option key={`preview-visible-${d.device_id}`} value={d.device_id}>
+                    <div className="mt-2 grid grid-cols-1 gap-1">
+                      {enabledPreviewDevices.map((d) => {
+                        const checked = previewVisibleIds.includes(d.device_id);
+                        return (
+                          <label key={`preview-visible-${d.device_id}`} className="syn-like-check">
+                            <SynInteropCheckbox
+                              checked={checked}
+                              onToggle={() =>
+                                setPreviewVisibleIds((prev) =>
+                                  checked ? prev.filter((id) => id !== d.device_id) : [...prev, d.device_id]
+                                )
+                              }
+                            >
+                              {' '}
+                            </SynInteropCheckbox>
                             {d.name || d.device_id}
-                          </option>
-                        ))}
-                    </select>
+                          </label>
+                        );
+                      })}
+                    </div>
                   </div>
                   <div className="mt-3 rounded-lg border border-gray-200 bg-white px-2.5 py-2 space-y-2.5">
                     <div className="text-xs font-semibold text-gray-700">Auto-calibration (ICP)</div>
                     <div>
                       <label className="text-xs text-gray-600">Reference device</label>
-                      <select
-                        className="input mt-1"
-                        value={referenceDeviceId}
-                        onChange={(e) => setReferenceDeviceId(e.target.value)}
-                      >
-                        {devices
-                          .filter((d) => selectedIds.includes(d.device_id))
-                          .map((d) => (
-                            <option key={d.device_id} value={d.device_id}>
-                              {d.name || d.device_id}
-                            </option>
-                          ))}
-                      </select>
+                      <div className="mt-1">
+                        <SynInteropDropdown
+                          value={referenceDeviceId}
+                          onChange={setReferenceDeviceId}
+                          options={referenceOptions.map((d) => ({
+                            value: d.device_id,
+                            label: d.name || d.device_id,
+                          }))}
+                          placeholder="Choose reference"
+                        />
+                      </div>
                     </div>
-                    <label htmlFor="auto_calib_save_result_preview" className="synergy-toggle">
-                      <input
-                        id="auto_calib_save_result_preview"
-                        className="synergy-toggle-input"
-                        type="checkbox"
-                        checked={autoCalibSaveResult}
-                        onChange={(e) => setAutoCalibSaveResult(e.target.checked)}
-                      />
-                      <span className={`synergy-toggle-track ${autoCalibSaveResult ? 'is-on' : ''}`} aria-hidden="true">
-                        <span className="synergy-toggle-thumb" />
-                      </span>
-                      <span className="synergy-toggle-label text-xs text-gray-700">
-                        Save calibration after run
-                      </span>
-                      <span className={`synergy-toggle-state ${autoCalibSaveResult ? 'is-on' : ''}`}>
-                        {autoCalibSaveResult ? 'ON' : 'OFF'}
-                      </span>
-                    </label>
-                    <button
-                      className="btn-primary w-full"
-                      onClick={() => runAutoCalibration({ referenceDeviceId, saveResult: autoCalibSaveResult })}
-                      disabled={loading || selectedIds.length === 0}
+                    <SynInteropSwitch checked={autoCalibSaveResult} onToggle={setAutoCalibSaveResult}>
+                      Save calibration after run
+                    </SynInteropSwitch>
+                    <SynInteropButton
+                      variant="filled"
+                      className="w-full"
+                      onPress={() => runAutoCalibration({ referenceDeviceId, saveResult: autoCalibSaveResult })}
+                      disabled={loading || calibrationTargetIds.length === 0}
                     >
                       <Wand2 size={14} />
                       {loading ? 'Calibrating...' : 'Run Auto-Calibration'}
-                    </button>
-                    <label htmlFor="preview_auto_calibration_toggle" className="synergy-toggle">
-                      <input
-                        id="preview_auto_calibration_toggle"
-                        className="synergy-toggle-input"
-                        type="checkbox"
-                        checked={previewAutoCalibrationEnabled}
-                        onChange={(e) => setPreviewAutoCalibrationEnabled(e.target.checked)}
-                        disabled={!autoResult || (autoResult.results || []).length === 0}
-                      />
-                      <span className={`synergy-toggle-track ${previewAutoCalibrationEnabled ? 'is-on' : ''}`} aria-hidden="true">
-                        <span className="synergy-toggle-thumb" />
-                      </span>
-                      <span className="synergy-toggle-label text-xs text-gray-700">
-                        Preview auto-calibration result
-                      </span>
-                      <span className={`synergy-toggle-state ${previewAutoCalibrationEnabled ? 'is-on' : ''}`}>
-                        {previewAutoCalibrationEnabled ? 'ON' : 'OFF'}
-                      </span>
-                    </label>
+                    </SynInteropButton>
+                    <SynInteropSwitch
+                      checked={previewAutoCalibrationEnabled}
+                      onToggle={setPreviewAutoCalibrationEnabled}
+                      disabled={!autoResult || (autoResult.results || []).length === 0}
+                    >
+                      Preview auto-calibration result
+                    </SynInteropSwitch>
                     <div className="text-[11px] text-gray-500">
                       Workflow: run ICP without save, compare in preview, then apply to config.
                     </div>
-                    <button
-                      className="btn-success w-full"
-                      onClick={applyAutoCalibrationCandidate}
+                    <SynInteropButton
+                      variant="success"
+                      className="w-full"
+                      onPress={applyAutoCalibrationCandidate}
                       disabled={autoCalibApplying || !autoResult || (autoResult.results || []).length === 0 || autoResult.saved === true}
                     >
                       {autoCalibApplying ? 'Applying...' : 'Apply Auto-Calibration To Config'}
-                    </button>
+                    </SynInteropButton>
                     {autoResult && (autoResult.results || []).length > 0 && (
                       <div className="rounded border border-gray-200 bg-gray-50/70 px-2 py-2">
                         <div className="text-[11px] font-semibold text-gray-700 mb-1">Transform preview</div>
@@ -2056,43 +2012,13 @@ export default function CalibrationPage() {
                     )}
                   </div>
                   <div className="mt-3 rounded-lg border border-gray-200 bg-white px-2.5 py-2">
-                    <label htmlFor="clip_points_to_frame_preview" className="synergy-toggle">
-                      <input
-                        id="clip_points_to_frame_preview"
-                        className="synergy-toggle-input"
-                        type="checkbox"
-                        checked={clipPointsToFrame}
-                        onChange={(e) => handleToggleClipPoints(e.target.checked)}
-                      />
-                      <span className={`synergy-toggle-track ${clipPointsToFrame ? 'is-on' : ''}`} aria-hidden="true">
-                        <span className="synergy-toggle-thumb" />
-                      </span>
-                      <span className="synergy-toggle-label text-xs text-gray-700">
-                        Clip points to frame
-                      </span>
-                      <span className={`synergy-toggle-state ${clipPointsToFrame ? 'is-on' : ''}`}>
-                        {clipPointsToFrame ? 'ON' : 'OFF'}
-                      </span>
-                    </label>
+                    <SynInteropSwitch checked={clipPointsToFrame} onToggle={handleToggleClipPoints}>
+                      Clip points to frame
+                    </SynInteropSwitch>
                     <div className="mt-2">
-                      <label htmlFor="voxel_denoise_preview" className="synergy-toggle">
-                        <input
-                          id="voxel_denoise_preview"
-                          className="synergy-toggle-input"
-                          type="checkbox"
-                          checked={previewVoxelDenoiseEnabled}
-                          onChange={(e) => setPreviewVoxelDenoiseEnabled(e.target.checked)}
-                        />
-                        <span className={`synergy-toggle-track ${previewVoxelDenoiseEnabled ? 'is-on' : ''}`} aria-hidden="true">
-                          <span className="synergy-toggle-thumb" />
-                        </span>
-                        <span className="synergy-toggle-label text-xs text-gray-700">
-                          Shadow denoise (voxel)
-                        </span>
-                        <span className={`synergy-toggle-state ${previewVoxelDenoiseEnabled ? 'is-on' : ''}`}>
-                          {previewVoxelDenoiseEnabled ? 'ON' : 'OFF'}
-                        </span>
-                      </label>
+                      <SynInteropSwitch checked={previewVoxelDenoiseEnabled} onToggle={setPreviewVoxelDenoiseEnabled}>
+                        Shadow denoise (voxel)
+                      </SynInteropSwitch>
                     </div>
                     {previewVoxelDenoiseEnabled && (
                       <div className="mt-2 space-y-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
@@ -2120,45 +2046,15 @@ export default function CalibrationPage() {
                             onChange={(e) => setPreviewVoxelMinPointsPerCell(Number(e.target.value))}
                           />
                         </div>
-                        <label htmlFor="voxel_keep_lcc_preview" className="synergy-toggle">
-                          <input
-                            id="voxel_keep_lcc_preview"
-                            className="synergy-toggle-input"
-                            type="checkbox"
-                            checked={previewVoxelKeepLargestComponent}
-                            onChange={(e) => setPreviewVoxelKeepLargestComponent(e.target.checked)}
-                          />
-                          <span className={`synergy-toggle-track ${previewVoxelKeepLargestComponent ? 'is-on' : ''}`} aria-hidden="true">
-                            <span className="synergy-toggle-thumb" />
-                          </span>
-                          <span className="synergy-toggle-label text-xs text-gray-700">
-                            Keep largest component
-                          </span>
-                          <span className={`synergy-toggle-state ${previewVoxelKeepLargestComponent ? 'is-on' : ''}`}>
-                            {previewVoxelKeepLargestComponent ? 'ON' : 'OFF'}
-                          </span>
-                        </label>
+                        <SynInteropSwitch checked={previewVoxelKeepLargestComponent} onToggle={setPreviewVoxelKeepLargestComponent}>
+                          Keep largest component
+                        </SynInteropSwitch>
                       </div>
                     )}
                     <div className="mt-2">
-                      <label htmlFor="region_filter_preview" className="synergy-toggle">
-                        <input
-                          id="region_filter_preview"
-                          className="synergy-toggle-input"
-                          type="checkbox"
-                          checked={previewRegionEnabled}
-                          onChange={(e) => setPreviewRegionEnabled(e.target.checked)}
-                        />
-                        <span className={`synergy-toggle-track ${previewRegionEnabled ? 'is-on' : ''}`} aria-hidden="true">
-                          <span className="synergy-toggle-thumb" />
-                        </span>
-                        <span className="synergy-toggle-label text-xs text-gray-700">
-                          Region filter (ROI rectangle)
-                        </span>
-                        <span className={`synergy-toggle-state ${previewRegionEnabled ? 'is-on' : ''}`}>
-                          {previewRegionEnabled ? 'ON' : 'OFF'}
-                        </span>
-                      </label>
+                      <SynInteropSwitch checked={previewRegionEnabled} onToggle={setPreviewRegionEnabled}>
+                        Region filter (ROI rectangle)
+                      </SynInteropSwitch>
                     </div>
                     {previewRegionEnabled && (
                       <div className="mt-2 space-y-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
@@ -2171,33 +2067,15 @@ export default function CalibrationPage() {
                         <div className="text-[11px] text-gray-600">
                           Z: {previewRegionWorldBounds.minZ.toFixed(1)} .. {previewRegionWorldBounds.maxZ.toFixed(1)} mm
                         </div>
-                        <button
-                          className="btn-secondary btn-sm"
-                          onClick={() => setPreviewRegionRect({ x0: 0.2, y0: 0.15, x1: 0.8, y1: 0.85 })}
-                        >
+                        <SynInteropButton size="small" onPress={() => setPreviewRegionRect({ x0: 0.2, y0: 0.15, x1: 0.8, y1: 0.85 })}>
                           Reset Region
-                        </button>
+                        </SynInteropButton>
                       </div>
                     )}
                     <div className="mt-2">
-                      <label htmlFor="orthogonal_filter_preview" className="synergy-toggle">
-                        <input
-                          id="orthogonal_filter_preview"
-                          className="synergy-toggle-input"
-                          type="checkbox"
-                          checked={previewOrthogonalFilterEnabled}
-                          onChange={(e) => setPreviewOrthogonalFilterEnabled(e.target.checked)}
-                        />
-                        <span className={`synergy-toggle-track ${previewOrthogonalFilterEnabled ? 'is-on' : ''}`} aria-hidden="true">
-                          <span className="synergy-toggle-thumb" />
-                        </span>
-                        <span className="synergy-toggle-label text-xs text-gray-700">
-                          Orthogonal surfaces only
-                        </span>
-                        <span className={`synergy-toggle-state ${previewOrthogonalFilterEnabled ? 'is-on' : ''}`}>
-                          {previewOrthogonalFilterEnabled ? 'ON' : 'OFF'}
-                        </span>
-                      </label>
+                      <SynInteropSwitch checked={previewOrthogonalFilterEnabled} onToggle={setPreviewOrthogonalFilterEnabled}>
+                        Orthogonal surfaces only
+                      </SynInteropSwitch>
                     </div>
                     {previewOrthogonalFilterEnabled && (
                       <div className="mt-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
@@ -2216,24 +2094,9 @@ export default function CalibrationPage() {
                       </div>
                     )}
                     <div className="mt-2">
-                      <label htmlFor="noise_filter_preview" className="synergy-toggle">
-                        <input
-                          id="noise_filter_preview"
-                          className="synergy-toggle-input"
-                          type="checkbox"
-                          checked={previewNoiseFilterEnabled}
-                          onChange={(e) => setPreviewNoiseFilterEnabled(e.target.checked)}
-                        />
-                        <span className={`synergy-toggle-track ${previewNoiseFilterEnabled ? 'is-on' : ''}`} aria-hidden="true">
-                          <span className="synergy-toggle-thumb" />
-                        </span>
-                        <span className="synergy-toggle-label text-xs text-gray-700">
-                          Noise filter (statistical)
-                        </span>
-                        <span className={`synergy-toggle-state ${previewNoiseFilterEnabled ? 'is-on' : ''}`}>
-                          {previewNoiseFilterEnabled ? 'ON' : 'OFF'}
-                        </span>
-                      </label>
+                      <SynInteropSwitch checked={previewNoiseFilterEnabled} onToggle={setPreviewNoiseFilterEnabled}>
+                        Noise filter (statistical)
+                      </SynInteropSwitch>
                     </div>
                     {previewNoiseFilterEnabled && (
                       <div className="mt-2 space-y-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
@@ -2266,24 +2129,9 @@ export default function CalibrationPage() {
                       </div>
                     )}
                     <div className="mt-2">
-                      <label htmlFor="edge_filter_preview" className="synergy-toggle">
-                        <input
-                          id="edge_filter_preview"
-                          className="synergy-toggle-input"
-                          type="checkbox"
-                          checked={previewEdgeFilterEnabled}
-                          onChange={(e) => setPreviewEdgeFilterEnabled(e.target.checked)}
-                        />
-                        <span className={`synergy-toggle-track ${previewEdgeFilterEnabled ? 'is-on' : ''}`} aria-hidden="true">
-                          <span className="synergy-toggle-thumb" />
-                        </span>
-                        <span className="synergy-toggle-label text-xs text-gray-700">
-                          Edge filter (preview)
-                        </span>
-                        <span className={`synergy-toggle-state ${previewEdgeFilterEnabled ? 'is-on' : ''}`}>
-                          {previewEdgeFilterEnabled ? 'ON' : 'OFF'}
-                        </span>
-                      </label>
+                      <SynInteropSwitch checked={previewEdgeFilterEnabled} onToggle={setPreviewEdgeFilterEnabled}>
+                        Edge filter (preview)
+                      </SynInteropSwitch>
                     </div>
                     {previewEdgeFilterEnabled && (
                       <div className="mt-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
@@ -2304,19 +2152,17 @@ export default function CalibrationPage() {
                   </div>
                   <div className="mt-3">
                     <label className="text-xs text-gray-600">Scanner</label>
-                    <select
-                      className="input mt-1"
-                      value={previewDeviceId}
-                      onChange={(e) => setPreviewDeviceId(e.target.value)}
-                    >
-                      {devices
-                        .filter((d) => previewVisibleIds.includes(d.device_id))
-                        .map((d) => (
-                          <option key={d.device_id} value={d.device_id}>
-                            {d.name || d.device_id}
-                          </option>
-                        ))}
-                    </select>
+                    <div className="mt-1">
+                      <SynInteropDropdown
+                        value={previewDeviceId}
+                        onChange={setPreviewDeviceId}
+                        options={previewScannerOptions.map((d) => ({
+                          value: d.device_id,
+                          label: d.name || d.device_id,
+                        }))}
+                        placeholder="Choose scanner"
+                      />
+                    </div>
                   </div>
                   {previewDeviceId && liveAdjustments[previewDeviceId] && (
                     <div className="mt-3 space-y-3">
@@ -2361,14 +2207,14 @@ export default function CalibrationPage() {
                         />
                       </div>
                       <div className="grid grid-cols-4 gap-2">
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { x: liveAdjustments[previewDeviceId].x - 0.01 })}>X-</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { x: liveAdjustments[previewDeviceId].x + 0.01 })}>X+</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { y: liveAdjustments[previewDeviceId].y - 0.01 })}>Y-</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { y: liveAdjustments[previewDeviceId].y + 0.01 })}>Y+</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { z: liveAdjustments[previewDeviceId].z - 0.01 })}>Z-</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { z: liveAdjustments[previewDeviceId].z + 0.01 })}>Z+</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { yaw: liveAdjustments[previewDeviceId].yaw - 1 })}>R-</button>
-                        <button className="btn-secondary btn-sm" onClick={() => handleLiveAdjustmentChange(previewDeviceId, { yaw: liveAdjustments[previewDeviceId].yaw + 1 })}>R+</button>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { x: liveAdjustments[previewDeviceId].x - 0.01 })}>X-</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { x: liveAdjustments[previewDeviceId].x + 0.01 })}>X+</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { y: liveAdjustments[previewDeviceId].y - 0.01 })}>Y-</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { y: liveAdjustments[previewDeviceId].y + 0.01 })}>Y+</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { z: liveAdjustments[previewDeviceId].z - 0.01 })}>Z-</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { z: liveAdjustments[previewDeviceId].z + 0.01 })}>Z+</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { yaw: liveAdjustments[previewDeviceId].yaw - 1 })}>R-</SynInteropButton>
+                        <SynInteropButton size="small" onPress={() => handleLiveAdjustmentChange(previewDeviceId, { yaw: liveAdjustments[previewDeviceId].yaw + 1 })}>R+</SynInteropButton>
                       </div>
                     </div>
                   )}
@@ -2418,17 +2264,24 @@ export default function CalibrationPage() {
                       const nextFormat =
                         nextType === 'lms4000'
                           ? 'lmdscandata'
-                          : (formData.format_type === 'msgpack' ? 'msgpack' : 'compact');
+                          : (
+                            formData.format_type === 'msgpack'
+                            || formData.format_type === 'compact'
+                            || formData.format_type === 'lmdscandata'
+                          )
+                            ? formData.format_type
+                            : 'compact';
+                      const nextIsLmd = nextFormat === 'lmdscandata';
                       setFormData({
                         ...formData,
                         device_type: nextType,
-                        protocol: nextType === 'lms4000' ? 'tcp' : 'udp',
+                        protocol: (nextType === 'lms4000' || nextIsLmd) ? 'tcp' : 'udp',
                         format_type: nextFormat,
-                        port: nextType === 'lms4000' ? 2111 : 2115,
+                        port: (nextType === 'lms4000' || nextIsLmd) ? 2111 : 2115,
                       });
                     }}
                   >
-                    <option value="picoscan">Picoscan (UDP)</option>
+                    <option value="picoscan">Picoscan</option>
                     <option value="lms4000">LMS4000 (TCP LMDscandata)</option>
                   </select>
                 </div>
@@ -2437,8 +2290,16 @@ export default function CalibrationPage() {
                   <select
                     className="input mt-1"
                     value={formData.format_type}
-                    onChange={(e) => setFormData({ ...formData, format_type: e.target.value })}
-                    disabled={formData.device_type === 'lms4000'}
+                    onChange={(e) => {
+                      const nextFormat = e.target.value;
+                      const nextIsLmd = nextFormat === 'lmdscandata';
+                      setFormData({
+                        ...formData,
+                        format_type: nextFormat,
+                        protocol: nextIsLmd ? 'tcp' : 'udp',
+                        port: nextIsLmd ? 2111 : 2115,
+                      });
+                    }}
                   >
                     {formData.device_type === 'lms4000' ? (
                       <option value="lmdscandata">lmdscandata</option>
@@ -2446,13 +2307,14 @@ export default function CalibrationPage() {
                       <>
                         <option value="compact">compact</option>
                         <option value="msgpack">messagepack</option>
+                        <option value="lmdscandata">lmdscandata (TCP)</option>
                       </>
                     )}
                   </select>
                 </div>
                 <input
                   className="input"
-                  placeholder={formData.device_type === 'lms4000' ? 'Sensor IP Address' : 'IP Address'}
+                  placeholder={(formData.device_type === 'lms4000' || formData.format_type === 'lmdscandata') ? 'Sensor IP Address' : 'IP Address'}
                   value={formData.ip_address}
                   onChange={(e) => setFormData({ ...formData, ip_address: e.target.value })}
                 />
@@ -2601,7 +2463,7 @@ export default function CalibrationPage() {
                 <X size={16} />
               </button>
             </div>
-            <div className="card-body grid grid-cols-2 gap-4 text-sm text-gray-700">
+            <div className="card-body grid grid-cols-1 gap-4 text-sm text-gray-700 sm:grid-cols-2">
               <div>
                 <div className="text-xs text-gray-500">Device ID</div>
                 <div className="font-mono">{detailsDevice.device_id}</div>

@@ -34,7 +34,7 @@ export default function StatisticsPanel({ statistics, loading }: StatisticsPanel
   return (
     <div className="card">
       <h3 className="text-lg font-semibold text-slate-900">Statistics</h3>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {stats.map((stat) => (
           <div key={stat.label} className="flex flex-col gap-1">
             <span className="text-xs font-medium text-gray-600">

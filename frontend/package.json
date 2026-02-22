@@ -9,6 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@synergy-design-system/components": "^3.4.0",
+    "@synergy-design-system/fonts": "^1.0.3",
+    "@synergy-design-system/styles": "^2.0.1",
+    "@synergy-design-system/tokens": "^3.4.0",
     "axios": "^1.13.4",
     "lucide-react": "^0.563.0",
     "next": "16.1.6",
@@ -26,6 +30,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-plotly.js": "^2.6.4",
+    "@types/three": "^0.183.1",
     "babel-plugin-react-compiler": "1.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",

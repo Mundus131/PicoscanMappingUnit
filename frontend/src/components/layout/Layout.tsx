@@ -7,21 +7,27 @@
 import React from 'react';
 import Header from './Header';
 import Sidebar from './Sidebar';
+import { usePathname } from 'next/navigation';
 
 interface LayoutProps {
   children: React.ReactNode;
 }
 
 export default function Layout({ children }: LayoutProps) {
+  const [railOpen, setRailOpen] = React.useState(false);
+  const pathname = usePathname();
+
+  React.useEffect(() => {
+    setRailOpen(false);
+  }, [pathname]);
+
   return (
-    <div className="flex min-h-screen app-shell">
-      <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <Header />
-        <main className="flex-1 overflow-auto">
-          <div className="content-wrap">
-            {children}
-          </div>
+    <div className="shell appshell">
+      <Header railOpen={railOpen} onToggleRail={() => setRailOpen((v) => !v)} />
+      <div className="appshell-main">
+        <Sidebar railOpen={railOpen} onSetRailOpen={setRailOpen} />
+        <main className="appshell-content">
+          <div className="content-wrap">{children}</div>
         </main>
       </div>
     </div>

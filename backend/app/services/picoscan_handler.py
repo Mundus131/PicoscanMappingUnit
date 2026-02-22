@@ -4,6 +4,9 @@ Picoscan Handler -Real communication with SICK Picoscan LIDAR devices
 import logging
 from typing import Tuple, Optional, List
 import numpy as np
+import io
+import threading
+from contextlib import redirect_stdout, redirect_stderr
 
 # Importy z ScanSegmentAPI - prawidłowe ścieżki
 try:
@@ -21,6 +24,7 @@ except ImportError:
     from scansegmentapi.compact_stream_extractor import CompactStreamExtractor
 
 logger = logging.getLogger(__name__)
+_scansegmentapi_stdio_lock = threading.Lock()
 
 
 class PicoscanHandler:
@@ -114,36 +118,10 @@ class PicoscanHandler:
             return None
         
         try:
-            # Suppress noisy prints from ScanSegmentAPI that write directly to
-            # stdout (e.g. "Received segment X."). Use a small context manager
-            # to filter those writes during the receive call.
-            from contextlib import contextmanager
-            import sys
-
-            @contextmanager
-            def _suppress_scansegmentapi_prints():
-                orig_write = sys.stdout.write
-
-                def _write(s):
-                    try:
-                        if isinstance(s, str):
-                            if not s.strip():
-                                return len(s)
-                            lowered = s.lower()
-                            if "received segment" in lowered or ("received" in lowered and "segment" in lowered):
-                                return len(s)
-                    except Exception:
-                        pass
-                    return orig_write(s)
-
-                sys.stdout.write = _write
-                try:
-                    yield
-                finally:
-                    sys.stdout.write = orig_write
-
-            with _suppress_scansegmentapi_prints():
-                result = self.receiver.receive_segments(num_segments)
+            # Silence noisy direct stdout prints from ScanSegmentAPI.
+            with _scansegmentapi_stdio_lock:
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    result = self.receiver.receive_segments(num_segments)
 
             # Treat empty results (timeout/no data) as no data
             if not result:
