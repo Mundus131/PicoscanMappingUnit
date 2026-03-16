@@ -1,0 +1,62 @@
+name: Build Docker Artifacts (ARM64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-backend:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (arm64) and export tar
+        run: >
+          docker buildx build
+          --platform linux/arm64/v8
+          -t picocan-backend:arm64
+          -f backend/Dockerfile
+          backend
+          --output type=docker,dest=backend-arm64.tar
+
+      - name: Upload backend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picocan-backend-arm64
+          path: backend-arm64.tar
+
+  build-frontend:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build frontend image (arm64) and export tar
+        run: >
+          docker buildx build
+          --platform linux/arm64/v8
+          -t picocan-frontend:arm64
+          -f frontend/Dockerfile
+          frontend
+          --output type=docker,dest=frontend-arm64.tar
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picocan-frontend-arm64
+          path: frontend-arm64.tar
