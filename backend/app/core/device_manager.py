@@ -112,6 +112,8 @@ class DeviceManager:
             # Ensure sensible default for segments_per_scan
             if "segments_per_scan" not in self.point_cloud_settings:
                 self.point_cloud_settings["segments_per_scan"] = 10
+            if "receive_batch_segments" not in self.point_cloud_settings:
+                self.point_cloud_settings["receive_batch_segments"] = 1
             if "require_complete_frames" not in self.point_cloud_settings:
                 self.point_cloud_settings["require_complete_frames"] = True
             if "incomplete_frame_timeout_s" not in self.point_cloud_settings:

@@ -144,6 +144,7 @@ def _build_preview_response(
     request: Request,
     device_ids: list[str],
     max_points: int = 20000,
+    accumulate_frames: int = 1,
     calibration_overrides: dict | None = None,
     use_edge_filter: bool = False,
     edge_curvature_threshold: float = 0.08,
@@ -170,7 +171,9 @@ def _build_preview_response(
     if not ids:
         raise HTTPException(status_code=400, detail="device_ids is required")
 
-    if hasattr(receiver_manager, "get_point_clouds_for_devices"):
+    if hasattr(receiver_manager, "get_point_clouds_for_devices_accumulated"):
+        clouds = receiver_manager.get_point_clouds_for_devices_accumulated(ids, frame_count=int(accumulate_frames or 1))
+    elif hasattr(receiver_manager, "get_point_clouds_for_devices"):
         clouds = receiver_manager.get_point_clouds_for_devices(ids, num_segments=10)
     else:
         clouds = receiver_manager.get_point_clouds(num_segments=10)
@@ -402,12 +405,13 @@ async def auto_calibrate(req: AutoCalibrationRequest, request: Request):
 
 
 @router.get("/preview")
-async def preview_calibrated(device_ids: str, request: Request, max_points: int = 20000):
+async def preview_calibrated(device_ids: str, request: Request, max_points: int = 20000, accumulate_frames: int = 1):
     """Return merged calibrated point cloud for preview (saved calibration only)."""
     return _build_preview_response(
         request=request,
         device_ids=[d for d in device_ids.split(",") if d],
         max_points=max_points,
+        accumulate_frames=accumulate_frames,
     )
 
 
@@ -428,6 +432,7 @@ async def preview_calibrated_with_overrides(req: CalibrationPreviewRequest, requ
         request=request,
         device_ids=req.device_ids,
         max_points=req.max_points,
+        accumulate_frames=req.accumulate_frames,
         calibration_overrides=overrides,
         use_edge_filter=bool(req.use_edge_filter),
         edge_curvature_threshold=float(req.edge_curvature_threshold),

@@ -131,6 +131,8 @@ export default function CalibrationPage() {
   const [previewNoiseFilterEnabled, setPreviewNoiseFilterEnabled] = useState(false);
   const [previewNoiseFilterK, setPreviewNoiseFilterK] = useState(16);
   const [previewNoiseFilterStdRatio, setPreviewNoiseFilterStdRatio] = useState(1.2);
+  const [previewAccumulateEnabled, setPreviewAccumulateEnabled] = useState(true);
+  const [previewAccumulateFrames, setPreviewAccumulateFrames] = useState(10);
   const [autoCalibApplying, setAutoCalibApplying] = useState(false);
   const [autoCalibCandidateMap, setAutoCalibCandidateMap] = useState<Record<string, { translation: number[]; rotation_deg: number[]; scale: number }>>({});
   const [previewFilterSaving, setPreviewFilterSaving] = useState(false);
@@ -797,6 +799,7 @@ export default function CalibrationPage() {
         const res = await api.post('/calibration/preview', {
           device_ids: previewVisibleIds,
           max_points: 20000,
+          accumulate_frames: previewAccumulateEnabled ? previewAccumulateFrames : 1,
           calibration_overrides:
             previewAutoCalibrationEnabled && Object.keys(autoCalibCandidateMap).length > 0
               ? autoCalibCandidateMap
@@ -859,6 +862,8 @@ export default function CalibrationPage() {
     previewNoiseFilterEnabled,
     previewNoiseFilterK,
     previewNoiseFilterStdRatio,
+    previewAccumulateEnabled,
+    previewAccumulateFrames,
   ]);
 
   useEffect(() => {
@@ -2015,6 +2020,25 @@ export default function CalibrationPage() {
                     <SynInteropSwitch checked={clipPointsToFrame} onToggle={handleToggleClipPoints}>
                       Clip points to frame
                     </SynInteropSwitch>
+                    <div className="mt-2">
+                      <SynInteropSwitch checked={previewAccumulateEnabled} onToggle={setPreviewAccumulateEnabled}>
+                        Accumulate frames (denser preview)
+                      </SynInteropSwitch>
+                    </div>
+                    {previewAccumulateEnabled && (
+                      <div className="mt-2 rounded border border-gray-200 bg-gray-50/60 px-2 py-2">
+                        <label className="text-xs text-gray-600">Frames to accumulate: {previewAccumulateFrames}</label>
+                        <input
+                          className="w-full mt-1"
+                          type="range"
+                          min={1}
+                          max={30}
+                          step={1}
+                          value={previewAccumulateFrames}
+                          onChange={(e) => setPreviewAccumulateFrames(Number(e.target.value))}
+                        />
+                      </div>
+                    )}
                     <div className="mt-2">
                       <SynInteropSwitch checked={previewVoxelDenoiseEnabled} onToggle={setPreviewVoxelDenoiseEnabled}>
                         Shadow denoise (voxel)

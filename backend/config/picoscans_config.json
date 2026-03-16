@@ -12,29 +12,29 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          1300.0,
+          10.0,
           0.0,
           700.0
         ],
         "rotation_deg": [
           0.0,
-          135.0,
+          63.0,
           0.0
         ],
         "scale": 1.0
       },
-      "frame_corner": "top-right",
+      "frame_corner": "top-left",
       "frame_position": [
-        1.3,
+        0.01,
         0.7,
         0.0
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        135.0
+        63.0
       ],
-      "segments_per_scan": null,
+      "segments_per_scan": 2,
       "acquisition_mode": "continuous",
       "encoder_enabled": false,
       "speed_profile": "fixed",
@@ -52,29 +52,29 @@
       "connection_status": "disconnected",
       "calibration": {
         "translation": [
-          326.828842677852,
-          0.0,
-          788.5966167784112
+          391.1488509234827,
+          -2.496861859128723e-14,
+          627.1465421850339
         ],
         "rotation_deg": [
           0.0,
-          54.80019802403257,
+          52.70501995952074,
           0.0
         ],
         "scale": 1.0
       },
-      "frame_corner": "top-left",
+      "frame_corner": "top-right",
       "frame_position": [
-        0.326828842677852,
-        0.7885966167784112,
-        0.0
+        0.3911488509234827,
+        0.627146542185034,
+        -2.496861859128723e-17
       ],
       "frame_rotation_deg": [
         0.0,
         0.0,
-        54.80019802403257
+        52.70501995952074
       ],
-      "segments_per_scan": null,
+      "segments_per_scan": 2,
       "acquisition_mode": "continuous",
       "encoder_enabled": false,
       "speed_profile": "fixed",
@@ -88,18 +88,19 @@
     "interpolate_missing_data": true,
     "missing_data_method": "kriging",
     "require_complete_frames": false,
-    "incomplete_frame_timeout_s": 0.35
+    "incomplete_frame_timeout_s": 0.35,
+    "receive_batch_segments": 1
   },
   "frame_settings": {
-    "width_m": 1.3,
+    "width_m": 0.5,
     "height_m": 0.7,
     "origin_mode": "bottom-left",
-    "clip_points_to_frame": true
+    "clip_points_to_frame": false
   },
   "motion_settings": {
     "mode": "encoder",
     "fixed_speed_mps": null,
-    "profiling_distance_mm": 10.0,
+    "profiling_distance_mm": 30.0,
     "encoder_wheel_mode": "circumference",
     "encoder_wheel_value_mm": 200.0,
     "encoder_rps": 0.0

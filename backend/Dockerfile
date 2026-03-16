@@ -11,6 +11,7 @@ WORKDIR /app
 # - libgl1/libglib2.0-0/libgomp1: common runtime libs for opencv/scipy stacks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    ca-certificates \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
@@ -18,11 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt ./
 
-# open3d wheels are often unavailable on arm64; skip in container build.
-# Auto-calibration endpoint already handles missing open3d with clear error.
-RUN grep -v "^open3d==" requirements.txt > requirements.docker.txt \
-    && pip install --upgrade pip \
-    && pip install -r requirements.docker.txt
+ARG GIT_SSL_NO_VERIFY=0
+ARG PIP_TRUSTED_HOSTS=""
+
+RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
+    && PIP_TRUSTED_FLAGS="" \
+    && for h in ${PIP_TRUSTED_HOSTS}; do PIP_TRUSTED_FLAGS="${PIP_TRUSTED_FLAGS} --trusted-host ${h}"; done \
+    && pip install --upgrade pip ${PIP_TRUSTED_FLAGS} \
+    && pip install -r requirements.txt ${PIP_TRUSTED_FLAGS}
 
 COPY . .
 

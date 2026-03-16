@@ -15,6 +15,7 @@ import time
 import asyncio
 import numpy as np
 import threading
+from collections import deque
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,8 @@ def _get_session_from_app(app) -> dict:
             "last_update_ts": None,
             "last_points": [],
             "accumulated_points": [],
+            "preview_points_history": deque(maxlen=30),
+            "profile_frame_buffer": [],
             "last_profile_distance_mm": 0.0,
             "profiles_count": 0,
             "devices": [],
@@ -165,6 +168,8 @@ def _get_session_from_app(app) -> dict:
     session.setdefault("accumulated_points_count", 0)
     session.setdefault("last_points_np", None)
     session.setdefault("last_points_emit_ts", 0.0)
+    session.setdefault("preview_points_history", deque(maxlen=30))
+    session.setdefault("profile_frame_buffer", [])
     return session
 
 
@@ -369,6 +374,13 @@ def _update_session_once(session: dict, receiver_manager):
             if (now_emit - last_emit) >= 0.15:
                 session["last_points"] = pts.tolist()
                 session["last_points_emit_ts"] = now_emit
+                history = session.get("preview_points_history")
+                if isinstance(history, deque):
+                    history.append(np.array(pts, copy=True))
+            # Buffer frames for profile accumulation (used when recording).
+            buffer = session.get("profile_frame_buffer")
+            if session.get("recording") and isinstance(buffer, list):
+                buffer.append(np.array(pts, copy=True))
 
             # Build 3D stack along Z based on traveled distance
             if session.get("recording"):
@@ -385,7 +397,16 @@ def _update_session_once(session: dict, receiver_manager):
                 if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
                     profiles_to_add = int(delta // profiling_distance_mm)
                     profiles_added_in_cycle = profiles_to_add
-                    profile_points = np.asarray(pts, dtype=np.float32)
+                    # Use accumulated frames since last profile to build a denser profile.
+                    buffer = session.get("profile_frame_buffer")
+                    if isinstance(buffer, list) and len(buffer) > 0:
+                        try:
+                            profile_points = np.vstack(buffer).astype(np.float32)
+                        except Exception:
+                            profile_points = np.asarray(pts, dtype=np.float32)
+                        buffer.clear()
+                    else:
+                        profile_points = np.asarray(pts, dtype=np.float32)
                     chunks = session.get("accumulated_chunks")
                     if not isinstance(chunks, list):
                         chunks = []
@@ -1375,11 +1396,32 @@ async def estimate_device_segments(
 
 
 @router.get("/trigger/latest-cloud")
-async def trigger_latest_cloud(request: Request, max_points: int = 40000):
+async def trigger_latest_cloud(
+    request: Request,
+    max_points: int = 40000,
+    accumulate_frames: int = 1,
+    accumulate_profiles: int = 0,
+):
     session = _get_session(request)
-    if not session.get("recording") and session.get("accumulated_points"):
-        points = session.get("accumulated_points") or []
-    else:
+    points = None
+    chunks = session.get("accumulated_chunks")
+    if isinstance(chunks, list) and len(chunks) > 0:
+        try:
+            points = np.vstack(chunks).tolist() if len(chunks) > 1 else chunks[0].tolist()
+        except Exception:
+            points = None
+    if points is None and session.get("accumulated_points"):
+        points = session.get("accumulated_points") or None
+    if int(accumulate_frames or 1) > 1:
+        history = session.get("preview_points_history")
+        if isinstance(history, deque) and len(history) > 0:
+            take = min(int(accumulate_frames), len(history))
+            recent = list(history)[-take:]
+            try:
+                points = np.vstack(recent).tolist() if len(recent) > 1 else recent[0].tolist()
+            except Exception:
+                points = None
+    if points is None:
         points = session.get("last_points") or []
     total_points = len(points)
     if max_points is not None and max_points > 0 and total_points > max_points:
@@ -1398,13 +1440,34 @@ async def trigger_latest_cloud(request: Request, max_points: int = 40000):
 
 
 @router.get("/trigger/latest-cloud/stream")
-async def trigger_latest_cloud_stream(request: Request, max_points: int = 30000):
+async def trigger_latest_cloud_stream(
+    request: Request,
+    max_points: int = 30000,
+    accumulate_frames: int = 1,
+    accumulate_profiles: int = 0,
+):
     async def event_generator():
         while True:
             session = _get_session(request)
-            if not session.get("recording") and session.get("accumulated_points"):
-                points = session.get("accumulated_points") or []
-            else:
+            points = None
+            chunks = session.get("accumulated_chunks")
+            if isinstance(chunks, list) and len(chunks) > 0:
+                try:
+                    points = np.vstack(chunks).tolist() if len(chunks) > 1 else chunks[0].tolist()
+                except Exception:
+                    points = None
+            if points is None and session.get("accumulated_points"):
+                points = session.get("accumulated_points") or None
+            if int(accumulate_frames or 1) > 1:
+                history = session.get("preview_points_history")
+                if isinstance(history, deque) and len(history) > 0:
+                    take = min(int(accumulate_frames), len(history))
+                    recent = list(history)[-take:]
+                    try:
+                        points = np.vstack(recent).tolist() if len(recent) > 1 else recent[0].tolist()
+                    except Exception:
+                        points = None
+            if points is None:
                 points = session.get("last_points") or []
             total_points = len(points)
             if max_points is not None and max_points > 0 and total_points > max_points:
@@ -1538,6 +1601,37 @@ async def get_receiver_metrics(device_id: str, request: Request):
         "device_id": device_id,
         "listening": receiver.connected,
         "metrics": metrics
+    }
+
+
+@router.get("/segment-stats/{device_id}")
+async def get_segment_stats(device_id: str, request: Request):
+    """Get lightweight diagnostics about the latest raw segment payload."""
+    receiver_manager = request.app.state.receiver_manager
+    if receiver_manager is None:
+        raise HTTPException(status_code=500, detail="Receiver manager not initialized")
+
+    receiver_info = receiver_manager.receivers.get(device_id)
+    if not receiver_info:
+        device = device_manager.get_device(device_id)
+        if not device:
+            raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+        return {
+            "device_id": device_id,
+            "stats": None,
+            "info": "Receiver not initialized"
+        }
+
+    if not isinstance(receiver_info, dict):
+        return {
+            "device_id": device_id,
+            "stats": None,
+            "info": "Receiver entry not in dict form"
+        }
+
+    return {
+        "device_id": device_id,
+        "stats": receiver_info.get("last_segment_stats")
     }
 
 

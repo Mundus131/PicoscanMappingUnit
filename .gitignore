@@ -14,6 +14,13 @@ frontend/node_modules/
 # Build
 .next/
 dist/
+*.tar
+*.tar.gz
+
+# Local artifacts
+*.pem
+test.txt
+tmp_framecheck.py
 
 # Generated gRPC stubs
 backend/app/services/tdc_proto/*_pb2.py

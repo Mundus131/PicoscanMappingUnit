@@ -483,6 +483,7 @@ class PicoscanReceiverManager:
                     "incomplete_frames_dropped": 0,
                     "last_seen_frame_number": None,
                     "last_poll_ts": None,
+                    "points_history": deque(maxlen=30),
                     "active_stream": f"scansegmentapi:{receiver.format_type}",
                     "fallback_enabled": False,
                     "fallback_receiver": None,
@@ -637,12 +638,12 @@ class PicoscanReceiverManager:
         if fb is None:
             return None
 
-        segments_to_request = info.get("segments_per_scan")
-        if not segments_to_request:
-            segments_to_request = int((device_manager.point_cloud_settings or {}).get("segments_per_scan") or 1)
-        segments_to_request = max(1, int(segments_to_request))
+        # Read small batches from UDP to minimize blocking latency.
+        # Full-frame assembly is handled separately by segments_per_scan logic.
+        batch_segments = int((device_manager.point_cloud_settings or {}).get("receive_batch_segments") or 1)
+        batch_segments = max(1, min(16, batch_segments))
 
-        segments = fb.receive_segments(segments_to_request)
+        segments = fb.receive_segments(batch_segments)
         if not segments:
             streak = int(info.get("fallback_no_data_streak", 0) or 0) + 1
             info["fallback_no_data_streak"] = streak
@@ -675,6 +676,15 @@ class PicoscanReceiverManager:
             if not info.get("listening"):
                 time.sleep(0.05)
                 continue
+            # Keep runtime segments_per_scan aligned to explicit device config.
+            try:
+                device_cfg = device_manager.get_device(device_id)
+                configured = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
+                if configured is not None and configured > 0:
+                    if info.get("segments_per_scan") != int(configured):
+                        info["segments_per_scan"] = int(configured)
+            except Exception:
+                pass
             now = time.time()
             next_poll_ts = float(info.get("next_poll_ts") or 0.0)
             if now < next_poll_ts:
@@ -717,14 +727,15 @@ class PicoscanReceiverManager:
                     else:
                         points = self._try_scansegment_fallback_points(info)
                 else:
-                    segments_to_request = info.get("segments_per_scan")
-                    if not segments_to_request:
-                        segments_to_request = int((device_manager.point_cloud_settings or {}).get("segments_per_scan") or 1)
-                    segments_to_request = max(1, int(segments_to_request))
-                    segments = receiver.receive_segments(segments_to_request)
+                    # Keep UDP receive non-blocking-ish: batch size controls read cadence,
+                    # while segments_per_scan still controls complete-frame assembly.
+                    batch_segments = int((device_manager.point_cloud_settings or {}).get("receive_batch_segments") or 1)
+                    batch_segments = max(1, min(16, batch_segments))
+                    segments = receiver.receive_segments(batch_segments)
                     if segments:
                         segment_payload = segments[0] if isinstance(segments, tuple) else segments
                         segment_list = segment_payload if isinstance(segment_payload, list) else [segment_payload]
+                        info["last_segment_stats"] = self._summarize_segment_payload(segment_list)
                         self._update_segment_estimate_from_receive(info, segments, segment_list)
                         assembled_segments = self._assemble_complete_frame_segments(info, segment_list)
                         if assembled_segments:
@@ -738,11 +749,17 @@ class PicoscanReceiverManager:
                         info["latest_points"] = points
                         info["latest_update_ts"] = time.time()
                         info["frame_counter"] = int(info.get("frame_counter", 0) + 1)
+                        history = info.get("points_history")
+                        if isinstance(history, deque):
+                            history.append(np.array(points, copy=True))
                     else:
                         with lock:
                             info["latest_points"] = np.array(points, copy=True)
                             info["latest_update_ts"] = time.time()
                             info["frame_counter"] = int(info.get("frame_counter", 0) + 1)
+                            history = info.get("points_history")
+                            if isinstance(history, deque):
+                                history.append(np.array(points, copy=True))
                     info["availability"] = "online"
                     info["last_error"] = None
                     info["error_streak"] = 0
@@ -966,15 +983,19 @@ class PicoscanReceiverManager:
         if len(timeout_obs) >= 8:
             inferred = int(round(float(np.median(np.asarray(list(timeout_obs), dtype=np.float64)))))
             if inferred > 0 and inferred <= 128 and expected > 0 and abs(inferred - expected) >= 2:
-                logger.info(
-                    "Adaptive segments_per_scan update for %s: %s -> %s (from incomplete-frame observations)",
-                    info.get("device_id"),
-                    expected,
-                    inferred,
-                )
-                info["segments_per_scan"] = inferred
-                info["segment_estimate"] = inferred
-                info["segment_estimate_updated_ts"] = now
+                # Do not override explicit per-device config.
+                device_cfg = device_manager.get_device(info.get("device_id"))
+                configured = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
+                if not configured:
+                    logger.info(
+                        "Adaptive segments_per_scan update for %s: %s -> %s (from incomplete-frame observations)",
+                        info.get("device_id"),
+                        expected,
+                        inferred,
+                    )
+                    info["segments_per_scan"] = inferred
+                    info["segment_estimate"] = inferred
+                    info["segment_estimate_updated_ts"] = now
 
         # Keep pending map bounded.
         if len(pending) > 8:
@@ -982,6 +1003,64 @@ class PicoscanReceiverManager:
                 pending.pop(frame_key, None)
                 pending_ts.pop(frame_key, None)
         return None
+
+    def _summarize_segment_payload(self, segment_list: list) -> dict:
+        """Lightweight diagnostics about the latest raw segment payload."""
+        stats = {
+            "segments_in_batch": int(len(segment_list or [])),
+            "modules": 0,
+            "scans": 0,
+            "echoes": None,
+            "beams": None,
+            "has_distance": False,
+            "distance_samples": 0,
+            "distance_nonzero": 0,
+            "distance_zero": 0,
+            "keys": [],
+            "timestamp": time.time(),
+        }
+        if not segment_list:
+            return stats
+        seg = segment_list[0]
+        if isinstance(seg, dict):
+            stats["keys"] = sorted(list(seg.keys()))
+        modules = seg.get("Modules") if isinstance(seg, dict) else None
+        if isinstance(modules, list) and modules:
+            stats["modules"] = len(modules)
+            first_mod = modules[0] or {}
+            scans = first_mod.get("SegmentData", [])
+        else:
+            scans = seg.get("SegmentData", []) if isinstance(seg, dict) else []
+        if isinstance(scans, list) and scans:
+            stats["scans"] = len(scans)
+            first_scan = scans[0] or {}
+            distances = first_scan.get("Distance", [])
+            if isinstance(distances, list) and distances:
+                stats["has_distance"] = True
+                stats["echoes"] = len(distances)
+                try:
+                    stats["beams"] = len(distances[0]) if distances[0] is not None else 0
+                except Exception:
+                    stats["beams"] = None
+                try:
+                    nonzero = 0
+                    zero = 0
+                    samples = 0
+                    for echo in distances:
+                        if not isinstance(echo, (list, tuple, np.ndarray)):
+                            continue
+                        for d in echo:
+                            samples += 1
+                            if d and d > 0:
+                                nonzero += 1
+                            else:
+                                zero += 1
+                    stats["distance_samples"] = samples
+                    stats["distance_nonzero"] = nonzero
+                    stats["distance_zero"] = zero
+                except Exception:
+                    pass
+        return stats
 
     def get_latest_point_cloud(self, device_id: str):
         info = self.receivers.get(device_id)
@@ -1027,6 +1106,30 @@ class PicoscanReceiverManager:
             receiver_info = self.receivers.get(device_id)
             if not (isinstance(receiver_info, dict) and receiver_info.get("listening")):
                 continue
+            latest = self.get_latest_point_cloud(device_id)
+            if latest and latest.get("points") is not None and len(latest["points"]) > 0:
+                point_clouds[device_id] = latest["points"]
+        return point_clouds
+
+    def get_point_clouds_for_devices_accumulated(self, device_ids: List[str], frame_count: int = 1) -> dict:
+        """Return accumulated point clouds from the last N frames per device."""
+        point_clouds: dict = {}
+        frames = max(1, int(frame_count or 1))
+        for device_id in (device_ids or []):
+            receiver_info = self.receivers.get(device_id)
+            if not (isinstance(receiver_info, dict) and receiver_info.get("listening")):
+                continue
+            history = receiver_info.get("points_history")
+            if isinstance(history, deque) and len(history) > 0:
+                slice_count = min(frames, len(history))
+                recent = list(history)[-slice_count:]
+                try:
+                    merged = np.vstack(recent) if len(recent) > 1 else recent[0]
+                    if merged is not None and len(merged) > 0:
+                        point_clouds[device_id] = merged
+                        continue
+                except Exception:
+                    pass
             latest = self.get_latest_point_cloud(device_id)
             if latest and latest.get("points") is not None and len(latest["points"]) > 0:
                 point_clouds[device_id] = latest["points"]

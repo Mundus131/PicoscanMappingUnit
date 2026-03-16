@@ -171,7 +171,9 @@ export default function AcquisitionPage() {
 
   const fetchLatest = async (full = fullCloud) => {
     const res = await api.get('/acquisition/trigger/latest-cloud', {
-      params: { max_points: full ? 0 : 30000 },
+      params: {
+        max_points: full ? 0 : 30000,
+      },
     });
     setPoints(res.data?.points || []);
     fitOnceRef.current = false;

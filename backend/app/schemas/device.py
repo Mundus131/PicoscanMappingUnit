@@ -138,6 +138,7 @@ class AutoCalibrationApplyRequest(BaseModel):
 class CalibrationPreviewRequest(BaseModel):
     device_ids: List[str]
     max_points: int = 20000
+    accumulate_frames: int = 1
     calibration_overrides: Optional[Dict[str, CalibrationData]] = None
     use_edge_filter: bool = False
     edge_curvature_threshold: float = 0.08
