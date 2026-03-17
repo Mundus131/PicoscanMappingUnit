@@ -34,6 +34,40 @@ interface AcquisitionLiveStatus {
   encoder_speed_mps?: number | null;
 }
 
+interface SystemMetrics {
+  available: boolean;
+  os?: {
+    name?: string;
+    release?: string;
+    version?: string;
+    machine?: string;
+  };
+  cpu?: {
+    percent?: number;
+    cores_logical?: number | null;
+    cores_physical?: number | null;
+  };
+  memory?: {
+    total_bytes?: number;
+    available_bytes?: number;
+    used_bytes?: number;
+    percent?: number;
+  };
+  disk?: {
+    path?: string;
+    total_bytes?: number;
+    used_bytes?: number;
+    free_bytes?: number;
+    percent?: number;
+  };
+  uptime_s?: number;
+  process?: {
+    pid?: number;
+    rss_bytes?: number;
+    cpu_percent?: number;
+  };
+}
+
 type TriggerInputName = 'DI_A' | 'DI_B' | 'DI_C' | 'DI_D' | 'DIO_A' | 'DIO_B' | 'DIO_C' | 'DIO_D';
 type AnalysisApp = 'none' | 'log' | 'conveyor_object';
 
@@ -80,6 +114,18 @@ interface RegionRectNorm {
   y0: number;
   x1: number;
   y1: number;
+}
+
+function formatBytes(value?: number): string {
+  if (!value || value <= 0) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = value;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
 }
 
 export default function CalibrationPage() {
@@ -173,6 +219,7 @@ export default function CalibrationPage() {
   const [tdcStatus, setTdcStatus] = useState<TdcStatusResponse | null>(null);
   const [acquisitionLiveStatus, setAcquisitionLiveStatus] = useState<AcquisitionLiveStatus | null>(null);
   const [ioState, setIoState] = useState<IoStateResponse | null>(null);
+  const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(null);
   const [tdcSaving, setTdcSaving] = useState(false);
   const [tdcSavedAt, setTdcSavedAt] = useState<number | null>(null);
 
@@ -589,6 +636,15 @@ export default function CalibrationPage() {
     }
   };
 
+  const loadSystemMetrics = async () => {
+    try {
+      const res = await api.get('/system/metrics');
+      setSystemMetrics(res.data || null);
+    } catch {
+      setSystemMetrics(null);
+    }
+  };
+
   const loadAcquisitionLiveStatus = async () => {
     try {
       const res = await api.get('/acquisition/trigger/status');
@@ -737,6 +793,7 @@ export default function CalibrationPage() {
     loadTdcStatus();
     loadAcquisitionLiveStatus();
     loadIoState();
+    loadSystemMetrics();
   }, []);
 
   useEffect(() => {
@@ -752,6 +809,7 @@ export default function CalibrationPage() {
       loadTdcStatus();
       loadAcquisitionLiveStatus();
       loadIoState();
+      loadSystemMetrics();
     }, 3000);
     return () => clearInterval(interval);
   }, []);
@@ -1737,7 +1795,72 @@ export default function CalibrationPage() {
 
         </div>
 
-          <syn-card className="app-card">
+          <div className="space-y-6">
+            <syn-card className="app-card">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-xl font-semibold text-slate-900">System Health</h2>
+                  <p className="text-xs text-gray-500 mt-1">Host metrics for runtime monitoring</p>
+                </div>
+                <syn-button size="small" onClick={loadSystemMetrics}>Refresh</syn-button>
+              </div>
+              <div className="mt-4 grid grid-cols-1 gap-3 text-sm">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <div className="text-xs text-gray-500">CPU usage</div>
+                    <div className="text-lg font-semibold text-slate-900">
+                      {systemMetrics?.available ? `${systemMetrics.cpu?.percent?.toFixed(0) ?? '-'}%` : 'Unavailable'}
+                    </div>
+                    <div className="text-[11px] text-gray-500">
+                      {systemMetrics?.cpu?.cores_physical ?? '-'}P / {systemMetrics?.cpu?.cores_logical ?? '-'}L cores
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-gray-500">Memory</div>
+                    <div className="text-lg font-semibold text-slate-900">
+                      {typeof systemMetrics?.memory?.percent === 'number' ? `${systemMetrics.memory.percent.toFixed(0)}%` : '-'}
+                    </div>
+                    <div className="text-[11px] text-gray-500">
+                      {formatBytes(systemMetrics?.memory?.used_bytes)} / {formatBytes(systemMetrics?.memory?.total_bytes)}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-gray-500">Disk</div>
+                    <div className="text-lg font-semibold text-slate-900">
+                      {typeof systemMetrics?.disk?.percent === 'number' ? `${systemMetrics.disk.percent.toFixed(0)}%` : '-'}
+                    </div>
+                    <div className="text-[11px] text-gray-500">
+                      {formatBytes(systemMetrics?.disk?.used_bytes)} / {formatBytes(systemMetrics?.disk?.total_bytes)}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-gray-500">Process</div>
+                    <div className="text-lg font-semibold text-slate-900">
+                      {systemMetrics?.process?.pid ?? '-'}
+                    </div>
+                    <div className="text-[11px] text-gray-500">
+                      RSS {formatBytes(systemMetrics?.process?.rss_bytes)} · CPU {systemMetrics?.process?.cpu_percent?.toFixed(0) ?? '-'}%
+                    </div>
+                  </div>
+                </div>
+                <div className="rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 p-3 text-xs text-gray-600">
+                  <div className="flex items-center justify-between">
+                    <div className="font-semibold text-gray-700 dark:text-gray-300">Host</div>
+                    <div className="text-[11px] text-gray-500">
+                      Uptime: {typeof systemMetrics?.uptime_s === 'number' ? `${Math.floor(systemMetrics.uptime_s / 60)} min` : '-'}
+                    </div>
+                  </div>
+                  <div className="mt-2">
+                    {systemMetrics?.os?.name ?? '-'} {systemMetrics?.os?.release ?? ''} {systemMetrics?.os?.machine ?? ''}
+                  </div>
+                </div>
+              </div>
+              <footer slot="footer">
+                <small>Metrics are sampled from backend host, refreshes every 3 seconds.</small>
+              </footer>
+            </syn-card>
+
+            <syn-card className="app-card">
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold text-slate-900">Devices</h2>
               <span className="text-xs text-gray-500">{devices.length} devices</span>
@@ -1825,6 +1948,7 @@ export default function CalibrationPage() {
               <small>Device registry. Auto-calibration is available only in Live Preview.</small>
             </footer>
           </syn-card>
+          </div>
         </div>
 
         {previewActive && (

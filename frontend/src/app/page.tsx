@@ -53,6 +53,52 @@ interface AnalyticsResultsResponse {
   analysis_timestamp_ms?: number | null;
 }
 
+interface SystemMetrics {
+  available: boolean;
+  os?: {
+    name?: string;
+    release?: string;
+    version?: string;
+    machine?: string;
+  };
+  cpu?: {
+    percent?: number;
+    cores_logical?: number | null;
+    cores_physical?: number | null;
+  };
+  memory?: {
+    total_bytes?: number;
+    available_bytes?: number;
+    used_bytes?: number;
+    percent?: number;
+  };
+  disk?: {
+    path?: string;
+    total_bytes?: number;
+    used_bytes?: number;
+    free_bytes?: number;
+    percent?: number;
+  };
+  uptime_s?: number;
+  process?: {
+    pid?: number;
+    rss_bytes?: number;
+    cpu_percent?: number;
+  };
+}
+
+function formatBytes(value?: number): string {
+  if (!value || value <= 0) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = value;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
+}
+
 function formatAppName(app: string | undefined): string {
   if (app === 'none') return 'None (acquisition only)';
   return app === 'conveyor_object' ? 'Conveyor Object' : 'Log Measurement';
@@ -73,17 +119,19 @@ export default function DashboardPage() {
   const [analyticsResults, setAnalyticsResults] = useState<AnalyticsResultsResponse | null>(null);
   const [devices, setDevices] = useState<DeviceCfg[]>([]);
   const [availability, setAvailability] = useState<AvailabilityResponse | null>(null);
+  const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(null);
 
   const refreshAll = async () => {
     setLoading(true);
     try {
-      const [st, anCfg, moCfg, anRes, devs, avail] = await Promise.all([
+      const [st, anCfg, moCfg, anRes, devs, avail, sys] = await Promise.all([
         api.get('/acquisition/trigger/status'),
         api.get('/calibration/analysis-settings'),
         api.get('/calibration/motion-settings'),
         api.get('/acquisition/analytics/results'),
         api.get('/devices/'),
         api.get('/acquisition/devices/availability'),
+        api.get('/system/metrics'),
       ]);
       setStatus(st.data || null);
       setAnalysisSettings(anCfg.data || null);
@@ -91,6 +139,7 @@ export default function DashboardPage() {
       setAnalyticsResults(anRes.data || null);
       setDevices(Array.isArray(devs.data) ? devs.data : []);
       setAvailability(avail.data || null);
+      setSystemMetrics(sys.data || null);
       setLastRefreshTs(Date.now());
     } finally {
       setLoading(false);
@@ -175,6 +224,20 @@ export default function DashboardPage() {
             <div className="mt-1 text-xl font-semibold text-slate-900">{distanceM.toFixed(3)} m</div>
             <div className="mt-2 text-xs text-gray-500">
               Profiles: {status?.profiles_count ?? 0} | Profiling distance: {status?.profiling_distance_mm ?? '-'} mm
+            </div>
+          </syn-card>
+
+          <syn-card className="app-card">
+            <div className="text-xs text-gray-500">System health</div>
+            <div className="mt-1 text-xl font-semibold text-slate-900">
+              {systemMetrics?.available ? `${systemMetrics.cpu?.percent?.toFixed(0) ?? '-'}% CPU` : 'Unavailable'}
+            </div>
+            <div className="mt-2 text-xs text-gray-500">
+              RAM: {typeof systemMetrics?.memory?.percent === 'number' ? `${systemMetrics.memory.percent.toFixed(0)}%` : '-'} |
+              Disk: {typeof systemMetrics?.disk?.percent === 'number' ? ` ${systemMetrics.disk.percent.toFixed(0)}%` : ' -'}
+            </div>
+            <div className="mt-1 text-[11px] text-gray-500">
+              {systemMetrics?.os?.name ?? '-'} {systemMetrics?.os?.release ?? ''}
             </div>
           </syn-card>
         </div>
