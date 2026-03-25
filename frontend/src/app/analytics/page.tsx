@@ -5,6 +5,7 @@ import Layout from '@/components/layout/Layout';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
 import { SynInteropButton, SynInteropDropdown } from '@/components/synergy/SynInterop';
+import { decodePointCloudPayload } from '@/lib/pointCloudPayload';
 import { Play, Square, RefreshCw, Wand2, Plus, Trash2, ArrowUp, ArrowDown, X } from 'lucide-react';
 
 interface TriggerStatus {
@@ -705,7 +706,7 @@ export default function AnalyticsPage() {
     const res = await api.get('/acquisition/trigger/latest-cloud', {
       params: { max_points: full ? 0 : 30000 },
     });
-    setPoints(res.data?.points || []);
+    setPoints(decodePointCloudPayload(res.data));
     fitOnceRef.current = false;
     setHoverPoint(null);
     setViewerKey((v) => v + 1);
@@ -716,7 +717,7 @@ export default function AnalyticsPage() {
     api.get('/acquisition/trigger/latest-cloud', {
       params: { max_points: 30000 },
     }).then((res) => {
-      setPoints(res.data?.points || []);
+      setPoints(decodePointCloudPayload(res.data));
       fitOnceRef.current = false;
       setHoverPoint(null);
       setViewerKey((v) => v + 1);

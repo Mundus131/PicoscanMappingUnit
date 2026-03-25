@@ -15,11 +15,14 @@ import time
 import asyncio
 import numpy as np
 import threading
-from collections import deque
+import base64
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+SESSION_TIMING_WINDOW = 240
+PREVIEW_CACHE_MAX_POINTS = 40000
+PREVIEW_SERIALIZE_INTERVAL_S = 0.2
 
 
 class AcquisitionRequest(BaseModel):
@@ -121,9 +124,16 @@ def _get_session_from_app(app) -> dict:
             "distance_mm": 0.0,
             "last_update_ts": None,
             "last_points": [],
-            "accumulated_points": [],
-            "preview_points_history": deque(maxlen=30),
-            "profile_frame_buffer": [],
+            "captured_profiles": [],
+            "captured_points_count": 0,
+            "pending_recording_frames": [],
+            "captured_full_points_np": None,
+            "captured_full_cache_dirty": False,
+            "captured_preview_points_np": None,
+            "captured_preview_blob_b64": "",
+            "captured_preview_blob_stride": 4,
+            "captured_preview_cache_dirty": False,
+            "captured_preview_last_encode_ts": 0.0,
             "last_profile_distance_mm": 0.0,
             "profiles_count": 0,
             "devices": [],
@@ -144,10 +154,13 @@ def _get_session_from_app(app) -> dict:
             "archive_last_duration_ms": None,
             "archive_last_points_count": 0,
             "archive_last_ts": None,
-            "accumulated_chunks": [],
-            "accumulated_points_count": 0,
+            "archive_pending": False,
+            "archive_last_error": None,
             "last_points_np": None,
             "last_points_emit_ts": 0.0,
+            "perf_stage_samples": {},
+            "perf_latest_cloud_request_ms": [],
+            "perf_latest_cloud_stream_request_ms": [],
         }
         app.state.acquisition_session = session
     # Ensure keys exist also for sessions initialized in app startup
@@ -164,17 +177,210 @@ def _get_session_from_app(app) -> dict:
     session.setdefault("archive_last_duration_ms", None)
     session.setdefault("archive_last_points_count", 0)
     session.setdefault("archive_last_ts", None)
-    session.setdefault("accumulated_chunks", [])
-    session.setdefault("accumulated_points_count", 0)
     session.setdefault("last_points_np", None)
     session.setdefault("last_points_emit_ts", 0.0)
-    session.setdefault("preview_points_history", deque(maxlen=30))
-    session.setdefault("profile_frame_buffer", [])
+    session.setdefault("captured_profiles", [])
+    session.setdefault("captured_points_count", 0)
+    session.setdefault("pending_recording_frames", [])
+    session.setdefault("captured_full_points_np", None)
+    session.setdefault("captured_full_cache_dirty", False)
+    session.setdefault("captured_preview_points_np", None)
+    session.setdefault("captured_preview_blob_b64", "")
+    session.setdefault("captured_preview_blob_stride", 4)
+    session.setdefault("captured_preview_cache_dirty", False)
+    session.setdefault("captured_preview_last_encode_ts", 0.0)
+    session.setdefault("archive_pending", False)
+    session.setdefault("archive_last_error", None)
+    session.setdefault("perf_stage_samples", {})
+    session.setdefault("perf_latest_cloud_request_ms", [])
+    session.setdefault("perf_latest_cloud_stream_request_ms", [])
     return session
 
 
 def _get_session(request: Request) -> dict:
     return _get_session_from_app(request.app)
+
+
+def _resolve_tdc_label(app) -> str:
+    tdc_enabled = bool((device_manager.tdc_settings or {}).get("enabled", False))
+    if not tdc_enabled:
+        return "DISABLED"
+    tdc_state = getattr(app.state, "tdc_input_state", None)
+    if tdc_state == 2:
+        return "HIGH"
+    if tdc_state == 1:
+        return "LOW"
+    return "UNKNOWN"
+
+
+def _record_session_stage(session: dict, stage: str, duration_ms: float):
+    samples_map = session.get("perf_stage_samples")
+    if not isinstance(samples_map, dict):
+        samples_map = {}
+        session["perf_stage_samples"] = samples_map
+    samples = samples_map.get(stage)
+    if not isinstance(samples, list):
+        samples = []
+        samples_map[stage] = samples
+    samples.append(float(duration_ms))
+    if len(samples) > SESSION_TIMING_WINDOW:
+        del samples[:-SESSION_TIMING_WINDOW]
+
+
+def _summarize_session_stage_timings(session: dict) -> dict:
+    samples_map = session.get("perf_stage_samples")
+    if not isinstance(samples_map, dict):
+        return {}
+    summary: dict = {}
+    for stage, samples in samples_map.items():
+        if not isinstance(samples, list) or len(samples) == 0:
+            continue
+        arr = np.asarray(samples, dtype=np.float64)
+        if arr.size == 0:
+            continue
+        summary[stage] = {
+            "samples": int(arr.size),
+            "last_ms": float(arr[-1]),
+            "mean_ms": float(np.mean(arr)),
+            "p95_ms": float(np.percentile(arr, 95)),
+        }
+    return summary
+
+
+def _downsample_points_np(points: np.ndarray | None, max_points: int) -> np.ndarray:
+    if points is None:
+        return np.empty((0, 4), dtype=np.float32)
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2:
+        return np.empty((0, 4), dtype=np.float32)
+    if max_points <= 0 or len(arr) <= max_points:
+        return np.array(arr, copy=True)
+    step = max(1, len(arr) // max_points)
+    sampled = arr[::step]
+    if len(sampled) > max_points:
+        sampled = sampled[:max_points]
+    return np.array(sampled, copy=True)
+
+
+def _append_profile_to_session_cache(session: dict, profile_points: np.ndarray):
+    profile_np = np.asarray(profile_points, dtype=np.float32)
+    if profile_np.ndim != 2 or profile_np.shape[0] == 0:
+        return
+    captured_profiles = session.get("captured_profiles")
+    if not isinstance(captured_profiles, list):
+        captured_profiles = []
+        session["captured_profiles"] = captured_profiles
+    captured_profiles.append(profile_np)
+    session["captured_points_count"] = int(session.get("captured_points_count", 0) + int(profile_np.shape[0]))
+    session["captured_full_cache_dirty"] = True
+
+    existing_preview = session.get("captured_preview_points_np")
+    if isinstance(existing_preview, np.ndarray) and existing_preview.ndim == 2 and existing_preview.shape[0] > 0:
+        combined = np.vstack([existing_preview, profile_np])
+    else:
+        combined = profile_np
+    session["captured_preview_points_np"] = _downsample_points_np(combined, PREVIEW_CACHE_MAX_POINTS)
+    session["captured_preview_cache_dirty"] = True
+    _maybe_refresh_captured_preview_blob(session, force=False)
+
+
+def _get_captured_preview_points(session: dict) -> np.ndarray:
+    preview_np = session.get("captured_preview_points_np")
+    if isinstance(preview_np, np.ndarray) and preview_np.ndim == 2:
+        return preview_np
+    return np.empty((0, 4), dtype=np.float32)
+
+
+def _empty_preview_blob_payload() -> dict:
+    return {
+        "points_blob_b64": "",
+        "points_encoding": "float32_base64",
+        "point_stride": 4,
+        "points_count": 0,
+    }
+
+
+def _maybe_refresh_captured_preview_blob(session: dict, force: bool) -> dict:
+    preview_np = _get_captured_preview_points(session)
+    if preview_np.shape[0] == 0:
+        session["captured_preview_blob_b64"] = ""
+        session["captured_preview_blob_stride"] = 4
+        session["captured_preview_cache_dirty"] = False
+        return _empty_preview_blob_payload()
+    dirty = bool(session.get("captured_preview_cache_dirty", True))
+    cached_blob = session.get("captured_preview_blob_b64")
+    cached_stride = int(session.get("captured_preview_blob_stride", 4) or 4)
+    if not dirty:
+        if isinstance(cached_blob, str):
+            return {
+                "points_blob_b64": cached_blob,
+                "points_encoding": "float32_base64",
+                "point_stride": cached_stride,
+                "points_count": int(preview_np.shape[0]),
+            }
+    now = time.time()
+    last_ts = float(session.get("captured_preview_last_encode_ts", 0.0) or 0.0)
+    if (not force) and isinstance(cached_blob, str) and cached_blob and (now - last_ts) < PREVIEW_SERIALIZE_INTERVAL_S:
+        return {
+            "points_blob_b64": cached_blob,
+            "points_encoding": "float32_base64",
+            "point_stride": cached_stride,
+            "points_count": int(preview_np.shape[0]),
+        }
+    t0 = time.perf_counter()
+    packed = np.ascontiguousarray(preview_np, dtype=np.float32)
+    blob_b64 = base64.b64encode(packed.tobytes()).decode("ascii")
+    _record_session_stage(session, "serialize_captured_preview", (time.perf_counter() - t0) * 1000.0)
+    session["captured_preview_blob_b64"] = blob_b64
+    session["captured_preview_blob_stride"] = int(packed.shape[1]) if packed.ndim == 2 and packed.shape[1] > 0 else 4
+    session["captured_preview_cache_dirty"] = False
+    session["captured_preview_last_encode_ts"] = now
+    return {
+        "points_blob_b64": blob_b64,
+        "points_encoding": "float32_base64",
+        "point_stride": int(session["captured_preview_blob_stride"]),
+        "points_count": int(packed.shape[0]),
+    }
+
+
+def _get_captured_preview_blob(session: dict) -> dict:
+    if not bool(session.get("captured_preview_cache_dirty", True)):
+        preview_np = _get_captured_preview_points(session)
+        cached_blob = session.get("captured_preview_blob_b64")
+        cached_stride = int(session.get("captured_preview_blob_stride", 4) or 4)
+        if isinstance(cached_blob, str):
+            return {
+                "points_blob_b64": cached_blob,
+                "points_encoding": "float32_base64",
+                "point_stride": cached_stride,
+                "points_count": int(preview_np.shape[0]),
+            }
+    return _maybe_refresh_captured_preview_blob(session, force=True)
+
+
+def _get_captured_full_points_np(session: dict) -> np.ndarray:
+    cached = session.get("captured_full_points_np")
+    dirty = bool(session.get("captured_full_cache_dirty", False))
+    if isinstance(cached, np.ndarray) and cached.ndim == 2 and not dirty:
+        return cached
+    chunks = session.get("captured_profiles")
+    if not isinstance(chunks, list) or len(chunks) == 0:
+        empty = np.empty((0, 4), dtype=np.float32)
+        session["captured_full_points_np"] = empty
+        session["captured_full_cache_dirty"] = False
+        return empty
+    arrays = [c for c in chunks if isinstance(c, np.ndarray) and c.ndim == 2 and c.shape[0] > 0]
+    if not arrays:
+        empty = np.empty((0, 4), dtype=np.float32)
+        session["captured_full_points_np"] = empty
+        session["captured_full_cache_dirty"] = False
+        return empty
+    t0 = time.perf_counter()
+    full = np.vstack(arrays).astype(np.float32, copy=False)
+    _record_session_stage(session, "materialize_captured_full_points", (time.perf_counter() - t0) * 1000.0)
+    session["captured_full_points_np"] = full
+    session["captured_full_cache_dirty"] = False
+    return full
 
 
 def _calc_speed_from_encoder_rpm(rpm: float, motion: dict) -> float | None:
@@ -327,7 +533,9 @@ def _update_session_once(session: dict, receiver_manager):
 
     # fetch point clouds and merge
     try:
+        t_fetch = time.perf_counter()
         point_clouds = receiver_manager.get_point_clouds(num_segments=10)
+        _record_session_stage(session, "fetch_clouds", (time.perf_counter() - t_fetch) * 1000.0)
         point_clouds_to_merge = []
         for device_id, points in point_clouds.items():
             device = device_manager.get_device(device_id)
@@ -338,7 +546,9 @@ def _update_session_once(session: dict, receiver_manager):
             point_clouds_to_merge.append((points, device.calibration))
 
         if point_clouds_to_merge:
+            t_merge = time.perf_counter()
             merged = PointCloudProcessor.merge_point_clouds(point_clouds_to_merge)
+            _record_session_stage(session, "merge_clouds", (time.perf_counter() - t_merge) * 1000.0)
             pts = merged.points
             if getattr(merged, "intensities", None) is not None:
                 try:
@@ -346,7 +556,9 @@ def _update_session_once(session: dict, receiver_manager):
                         pts = np.column_stack([merged.points, merged.intensities])
                 except Exception:
                     pts = merged.points
+            t_filter = time.perf_counter()
             pts = _apply_configured_preview_filters(pts)
+            _record_session_stage(session, "preview_filters", (time.perf_counter() - t_filter) * 1000.0)
             # Normalize RSSI to 0-100 if present
             if isinstance(pts, np.ndarray) and pts.shape[1] >= 4:
                 try:
@@ -372,15 +584,15 @@ def _update_session_once(session: dict, receiver_manager):
             now_emit = time.time()
             last_emit = float(session.get("last_points_emit_ts", 0.0) or 0.0)
             if (now_emit - last_emit) >= 0.15:
+                t_serialize = time.perf_counter()
                 session["last_points"] = pts.tolist()
+                _record_session_stage(session, "serialize_points", (time.perf_counter() - t_serialize) * 1000.0)
                 session["last_points_emit_ts"] = now_emit
-                history = session.get("preview_points_history")
-                if isinstance(history, deque):
-                    history.append(np.array(pts, copy=True))
-            # Buffer frames for profile accumulation (used when recording).
-            buffer = session.get("profile_frame_buffer")
-            if session.get("recording") and isinstance(buffer, list):
-                buffer.append(np.array(pts, copy=True))
+            if session.get("recording"):
+                t_stack = time.perf_counter()
+                pending_frames = session.get("pending_recording_frames")
+                if isinstance(pending_frames, list):
+                    pending_frames.append(np.array(pts, copy=True))
 
             # Build 3D stack along Z based on traveled distance
             if session.get("recording"):
@@ -397,20 +609,15 @@ def _update_session_once(session: dict, receiver_manager):
                 if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
                     profiles_to_add = int(delta // profiling_distance_mm)
                     profiles_added_in_cycle = profiles_to_add
-                    # Use accumulated frames since last profile to build a denser profile.
-                    buffer = session.get("profile_frame_buffer")
-                    if isinstance(buffer, list) and len(buffer) > 0:
+                    pending_frames = session.get("pending_recording_frames")
+                    if isinstance(pending_frames, list) and len(pending_frames) > 0:
                         try:
-                            profile_points = np.vstack(buffer).astype(np.float32)
+                            profile_points = np.vstack(pending_frames).astype(np.float32)
                         except Exception:
                             profile_points = np.asarray(pts, dtype=np.float32)
-                        buffer.clear()
+                        pending_frames.clear()
                     else:
                         profile_points = np.asarray(pts, dtype=np.float32)
-                    chunks = session.get("accumulated_chunks")
-                    if not isinstance(chunks, list):
-                        chunks = []
-                        session["accumulated_chunks"] = chunks
                     if profiles_to_add == 1:
                         step_distance = last_profile_distance + profiling_distance_mm
                         if profile_points.shape[1] >= 3:
@@ -418,10 +625,7 @@ def _update_session_once(session: dict, receiver_manager):
                             prof[:, 1] = step_distance
                         else:
                             prof = profile_points
-                        chunks.append(np.asarray(prof, dtype=np.float32))
-                        session["accumulated_points_count"] = int(
-                            session.get("accumulated_points_count", 0) + int(prof.shape[0])
-                        )
+                        _append_profile_to_session_cache(session, prof)
                     else:
                         for i in range(profiles_to_add):
                             step_distance = last_profile_distance + profiling_distance_mm * (i + 1)
@@ -431,14 +635,12 @@ def _update_session_once(session: dict, receiver_manager):
                                 prof[:, 1] = step_distance
                             else:
                                 prof = profile_points
-                            chunks.append(np.asarray(prof, dtype=np.float32))
-                            session["accumulated_points_count"] = int(
-                                session.get("accumulated_points_count", 0) + int(prof.shape[0])
-                            )
+                            _append_profile_to_session_cache(session, prof)
                     session["profiles_count"] = int(session.get("profiles_count", 0) + profiles_to_add)
                     # Keep full acquisition points for analysis fidelity.
                     # Visualization endpoints apply their own max_points downsampling.
                     session["last_profile_distance_mm"] = last_profile_distance + profiling_distance_mm * profiles_to_add
+                _record_session_stage(session, "recording_stack", (time.perf_counter() - t_stack) * 1000.0)
     except Exception:
         pass
     finally:
@@ -468,26 +670,6 @@ def _run_acquisition_loop(app):
         else:
             time.sleep(0.05)
 
-
-def _materialize_accumulated_points(session: dict):
-    chunks = session.get("accumulated_chunks")
-    if isinstance(chunks, list) and chunks:
-        arrays = [c for c in chunks if isinstance(c, np.ndarray) and c.size > 0]
-        if arrays:
-            try:
-                merged = np.vstack(arrays)
-                session["accumulated_points"] = merged.tolist()
-            except Exception:
-                flat = []
-                for arr in arrays:
-                    flat.extend(arr.tolist())
-                session["accumulated_points"] = flat
-        else:
-            session["accumulated_points"] = []
-    else:
-        session["accumulated_points"] = session.get("accumulated_points") or []
-
-
 def start_trigger_session(app):
     """Start acquisition session (profile recording) for internal calls."""
     session = _get_session_from_app(app)
@@ -504,9 +686,16 @@ def start_trigger_session(app):
     session["recording"] = True
     session["distance_mm"] = 0.0
     session["last_update_ts"] = time.time()
-    session["accumulated_points"] = []
-    session["accumulated_chunks"] = []
-    session["accumulated_points_count"] = 0
+    session["captured_profiles"] = []
+    session["captured_points_count"] = 0
+    session["pending_recording_frames"] = []
+    session["captured_full_points_np"] = None
+    session["captured_full_cache_dirty"] = False
+    session["captured_preview_points_np"] = None
+    session["captured_preview_blob_b64"] = ""
+    session["captured_preview_blob_stride"] = 4
+    session["captured_preview_cache_dirty"] = False
+    session["captured_preview_last_encode_ts"] = 0.0
     session["last_profile_distance_mm"] = 0.0
     session["profiles_count"] = 0
     # Clear previous run analysis state to avoid stale results being shown.
@@ -517,6 +706,8 @@ def start_trigger_session(app):
     session["archive_last_duration_ms"] = None
     session["archive_last_points_count"] = 0
     session["archive_last_ts"] = None
+    session["archive_pending"] = False
+    session["archive_last_error"] = None
     session["last_points_np"] = None
     session["last_points_emit_ts"] = 0.0
     session["start_delay_mm_remaining"] = 0.0
@@ -526,11 +717,29 @@ def start_trigger_session(app):
     return session
 
 
+def _save_measurement_async(session: dict, payload: dict):
+    def worker():
+        t_archive_start = time.perf_counter()
+        try:
+            save_measurement(payload)
+            session["archive_last_duration_ms"] = int((time.perf_counter() - t_archive_start) * 1000)
+            session["archive_last_points_count"] = int(len(payload.get("original_points") or []))
+            session["archive_last_ts"] = int(time.time() * 1000)
+            session["archive_last_error"] = None
+        except Exception as exc:
+            session["archive_last_error"] = str(exc)
+        finally:
+            session["archive_pending"] = False
+
+    session["archive_pending"] = True
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _run_analysis_for_session(session: dict, app):
     try:
         t0 = time.time()
-        _materialize_accumulated_points(session)
-        points = session.get("accumulated_points") or []
+        points_np = _get_captured_full_points_np(session)
+        points = points_np.tolist() if isinstance(points_np, np.ndarray) and points_np.shape[0] > 0 else []
         # If no accumulated profiles were created (e.g. encoder mode without enough
         # movement), use latest cloud as fallback so analysis reflects current run.
         if not points:
@@ -585,32 +794,26 @@ def _run_analysis_for_session(session: dict, app):
                 values = _apply_output_units(values, output_cfg)
                 payload = _format_output_payload(values, output_cfg)
                 notifier.broadcast(payload)
-            try:
-                t_archive_start = time.perf_counter()
-                save_measurement({
-                    "analysis_app": analysis_app,
-                    "metrics": metrics_for_save or session.get("analysis_metrics"),
-                    "original_points": points,
-                    "augmented_points": session["analysis_points"],
-                    "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
-                    "profiling_distance_mm": profiling_distance_mm,
-                    "profiles_count": session.get("profiles_count", 0),
-                    "distance_mm": session.get("distance_mm", 0.0),
-                    "devices": session.get("devices", []),
-                    "analysis_duration_ms": session.get("analysis_duration_ms"),
-                })
-                session["archive_last_duration_ms"] = int((time.perf_counter() - t_archive_start) * 1000)
-                session["archive_last_points_count"] = int(len(points))
-                session["archive_last_ts"] = int(time.time() * 1000)
-                logger.info(
-                    "Analysis archived: app=%s points=%s profiles=%s duration_ms=%s",
-                    analysis_app,
-                    int(len(points)),
-                    int(session.get("profiles_count", 0) or 0),
-                    session.get("analysis_duration_ms"),
-                )
-            except Exception:
-                pass
+            payload = {
+                "analysis_app": analysis_app,
+                "metrics": metrics_for_save or session.get("analysis_metrics"),
+                "original_points": points,
+                "augmented_points": session["analysis_points"],
+                "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
+                "profiling_distance_mm": profiling_distance_mm,
+                "profiles_count": session.get("profiles_count", 0),
+                "distance_mm": session.get("distance_mm", 0.0),
+                "devices": session.get("devices", []),
+                "analysis_duration_ms": session.get("analysis_duration_ms"),
+            }
+            _save_measurement_async(session, payload)
+            logger.info(
+                "Analysis queued for archive: app=%s points=%s profiles=%s duration_ms=%s",
+                analysis_app,
+                int(len(points)),
+                int(session.get("profiles_count", 0) or 0),
+                session.get("analysis_duration_ms"),
+            )
         else:
             session["analysis_metrics"] = None
             session["analysis_points"] = []
@@ -641,8 +844,7 @@ def stop_trigger_session(app):
     if stop_event:
         stop_event.set()
     _run_analysis_for_session(session, app)
-    # Release chunk buffers after analysis materialization to reduce memory pressure.
-    session["accumulated_chunks"] = []
+    session["pending_recording_frames"] = []
     return session
 
 
@@ -776,6 +978,16 @@ def _estimate_speed_capability(session: dict, receiver_manager) -> dict:
     online_count = len(availability["online_ids"])
     enabled_total = int(availability["enabled_total"])
     online_ratio = (online_count / enabled_total) if enabled_total > 0 else 0.0
+    receiver_pipeline = {
+        device_id: {
+            "pipeline_timing_ms": (item or {}).get("pipeline_timing_ms") or {},
+            "last_points_count": (item or {}).get("last_points_count"),
+            "expected_segment_pattern": (item or {}).get("expected_segment_pattern") or [],
+            "last_complete_segment_pattern": (item or {}).get("last_complete_segment_pattern") or [],
+            "incomplete_frames_dropped": (item or {}).get("incomplete_frames_dropped", 0),
+        }
+        for device_id, item in (availability.get("health") or {}).items()
+    }
 
     return {
         "profiling_distance_mm": profiling_distance_mm,
@@ -797,7 +1009,10 @@ def _estimate_speed_capability(session: dict, receiver_manager) -> dict:
             "last_archive_duration_ms": session.get("archive_last_duration_ms"),
             "last_archive_points_count": session.get("archive_last_points_count"),
             "last_archive_ts": session.get("archive_last_ts"),
+            "archive_pending": bool(session.get("archive_pending", False)),
+            "archive_last_error": session.get("archive_last_error"),
         },
+        "pipeline_timing_ms": _summarize_session_stage_timings(session),
         "device_availability": {
             "enabled_total": enabled_total,
             "online": online_count,
@@ -805,6 +1020,7 @@ def _estimate_speed_capability(session: dict, receiver_manager) -> dict:
             "online_ids": availability["online_ids"],
             "offline_ids": availability["offline_ids"],
         },
+        "receiver_pipeline": receiver_pipeline,
         "validation_notes": [
             overload_note,
             "Limit jakościowy liczony dla zasady 1 profil / iteracja pętli akwizycji.",
@@ -1136,6 +1352,8 @@ async def start_trigger(request: Request):
         "recording": session.get("recording", False),
         "devices": session["devices"],
         "distance_mm": session["distance_mm"],
+        "archive_pending": bool(session.get("archive_pending", False)),
+        "archive_last_error": session.get("archive_last_error"),
         "availability": {
             "online_ids": availability["online_ids"],
             "offline_ids": availability["offline_ids"],
@@ -1154,6 +1372,8 @@ async def stop_trigger(request: Request):
         "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
         "analysis_duration_ms": session.get("analysis_duration_ms"),
         "archive_last_points_count": session.get("archive_last_points_count"),
+        "archive_pending": bool(session.get("archive_pending", False)),
+        "archive_last_error": session.get("archive_last_error"),
         "profiles_count": session.get("profiles_count", 0),
     }
 
@@ -1222,13 +1442,7 @@ async def trigger_status(request: Request):
     receiver_manager = getattr(request.app.state, "receiver_manager", None)
     _ensure_enabled_device_listeners(receiver_manager)
     availability = _device_availability_summary(receiver_manager)
-    tdc_state = getattr(request.app.state, "tdc_input_state", None)
-    if tdc_state == 2:
-        tdc_label = "HIGH"
-    elif tdc_state == 1:
-        tdc_label = "LOW"
-    else:
-        tdc_label = "UNKNOWN"
+    tdc_label = _resolve_tdc_label(request.app)
     return {
         "recording": session.get("recording", False),
         "distance_mm": session.get("distance_mm", 0.0),
@@ -1243,6 +1457,9 @@ async def trigger_status(request: Request):
         "trigger_source": session.get("trigger_source", "manual"),
         "devices_online": len(availability["online_ids"]),
         "devices_enabled": availability["enabled_total"],
+        "archive_pending": bool(session.get("archive_pending", False)),
+        "archive_last_error": session.get("archive_last_error"),
+        "pipeline_timing_ms": _summarize_session_stage_timings(session),
     }
 
 
@@ -1252,13 +1469,7 @@ async def trigger_status_stream(request: Request):
         while True:
             session = _get_session(request)
             _sync_encoder_worker(session)
-            tdc_state = getattr(request.app.state, "tdc_input_state", None)
-            if tdc_state == 2:
-                tdc_label = "HIGH"
-            elif tdc_state == 1:
-                tdc_label = "LOW"
-            else:
-                tdc_label = "UNKNOWN"
+            tdc_label = _resolve_tdc_label(request.app)
             payload = {
                 "recording": session.get("recording", False),
                 "distance_mm": session.get("distance_mm", 0.0),
@@ -1271,6 +1482,9 @@ async def trigger_status_stream(request: Request):
                 "last_update_ts": session.get("last_update_ts"),
                 "tdc_input_state": tdc_label,
                 "trigger_source": session.get("trigger_source", "manual"),
+                "archive_pending": bool(session.get("archive_pending", False)),
+                "archive_last_error": session.get("archive_last_error"),
+                "pipeline_timing_ms": _summarize_session_stage_timings(session),
             }
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(0.5)
@@ -1303,184 +1517,107 @@ async def trigger_performance_analysis(request: Request):
     return _estimate_speed_capability(session, receiver_manager)
 
 
-@router.post("/segments/estimate/{device_id}")
-async def estimate_device_segments(
-    device_id: str,
-    request: Request,
-    sample_seconds: float = 3.0,
-    min_samples: int = 6,
-    auto_apply: bool = False,
-):
-    """
-    Estimate segments_per_scan before regular acquisition.
-    Uses runtime frame/segment counters observed by receiver workers.
-    """
-    receiver_manager = getattr(request.app.state, "receiver_manager", None)
-    if receiver_manager is None:
-        raise HTTPException(status_code=500, detail="Receiver manager not initialized")
-
-    device = device_manager.get_device(device_id)
-    if not device:
-        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
-    if not bool(getattr(device, "enabled", True)):
-        raise HTTPException(status_code=400, detail=f"Device {device_id} is disabled")
-
-    # Ensure listener exists.
-    if device_id not in receiver_manager.receivers:
-        started = receiver_manager.start_listening(
-            device.device_id,
-            "0.0.0.0",
-            device.port,
-            segments_per_scan=getattr(device, "segments_per_scan", None),
-            format_type=getattr(device, "format_type", "compact"),
-            device_type=getattr(device, "device_type", "picoscan"),
-            sensor_ip=getattr(device, "ip_address", None),
-        )
-        if not started:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to start listener for {device_id} on {device.ip_address}:{device.port}",
-            )
-
-    # LMDscandata path: segment count estimation is not meaningful for this stream type.
-    if _uses_lmd_stream(device):
-        return {
-            "device_id": device_id,
-            "device_type": str(getattr(device, "device_type", "picoscan") or "picoscan").lower(),
-            "format_type": "lmdscandata",
-            "segments_per_scan_estimated": None,
-            "samples": 0,
-            "applied": False,
-            "note": "Segmentation estimate is not applicable for LMDscandata stream.",
-        }
-
-    deadline = time.time() + max(1.0, float(sample_seconds))
-    best_estimate = None
-    best_samples = 0
-    health_item = None
-    while time.time() < deadline:
-        health = receiver_manager.get_health_snapshot()
-        health_item = health.get(device_id) or {}
-        estimate = health_item.get("segments_per_scan_estimated")
-        samples = int(health_item.get("segments_estimate_samples") or 0)
-        if estimate:
-            best_estimate = int(estimate)
-            best_samples = max(best_samples, samples)
-        if best_estimate and best_samples >= max(1, int(min_samples)):
-            break
-        time.sleep(0.1)
-
-    applied = False
-    if auto_apply and best_estimate and best_estimate > 0:
-        device_manager.update_device(device_id, {"device_id": device_id, "segments_per_scan": int(best_estimate)})
-        applied = True
-
-    if not best_estimate:
-        return {
-            "device_id": device_id,
-            "segments_per_scan_estimated": None,
-            "samples": best_samples,
-            "applied": False,
-            "health": health_item or {},
-            "note": "No estimate yet. Check UDP stream and try with longer sample_seconds.",
-        }
-
-    return {
-        "device_id": device_id,
-        "segments_per_scan_estimated": int(best_estimate),
-        "samples": best_samples,
-        "configured_segments_per_scan": getattr(device_manager.get_device(device_id), "segments_per_scan", None),
-        "applied": applied,
-        "health": health_item or {},
-    }
-
-
 @router.get("/trigger/latest-cloud")
 async def trigger_latest_cloud(
     request: Request,
     max_points: int = 40000,
-    accumulate_frames: int = 1,
-    accumulate_profiles: int = 0,
 ):
     session = _get_session(request)
-    points = None
-    chunks = session.get("accumulated_chunks")
-    if isinstance(chunks, list) and len(chunks) > 0:
-        try:
-            points = np.vstack(chunks).tolist() if len(chunks) > 1 else chunks[0].tolist()
-        except Exception:
-            points = None
-    if points is None and session.get("accumulated_points"):
-        points = session.get("accumulated_points") or None
-    if int(accumulate_frames or 1) > 1:
-        history = session.get("preview_points_history")
-        if isinstance(history, deque) and len(history) > 0:
-            take = min(int(accumulate_frames), len(history))
-            recent = list(history)[-take:]
-            try:
-                points = np.vstack(recent).tolist() if len(recent) > 1 else recent[0].tolist()
-            except Exception:
-                points = None
-    if points is None:
-        points = session.get("last_points") or []
-    total_points = len(points)
-    if max_points is not None and max_points > 0 and total_points > max_points:
-        step = max(1, total_points // max_points)
-        points = points[::step]
-        if len(points) > max_points:
-            points = points[:max_points]
-    return {
-        "points": points,
-        "points_count": len(points),
-        "total_points": total_points,
-        "distance_mm": session.get("distance_mm", 0.0),
-        "profiles_count": session.get("profiles_count", 0),
-        "recording": session.get("recording", False),
-    }
+    t_req = time.perf_counter()
+    if max_points is not None and int(max_points) <= 0:
+        full_np = _get_captured_full_points_np(session)
+        points = full_np.tolist() if full_np.shape[0] > 0 else (session.get("last_points") or [])
+        payload = {
+            "points": points,
+            "points_count": len(points),
+            "total_points": len(points),
+            "distance_mm": session.get("distance_mm", 0.0),
+            "profiles_count": session.get("profiles_count", 0),
+            "recording": session.get("recording", False),
+            "preview_points_count": int(_get_captured_preview_points(session).shape[0]),
+            "captured_points_count": int(session.get("captured_points_count", 0) or 0),
+            "pipeline_timing_ms": _summarize_session_stage_timings(session),
+        }
+    else:
+        preview_payload = _get_captured_preview_blob(session)
+        preview_count = int(preview_payload.get("points_count", 0) or 0)
+        total_points = preview_count
+        if preview_count <= 0:
+            points = session.get("last_points") or []
+            total_points = len(points)
+            if max_points is not None and max_points > 0 and total_points > max_points:
+                t_downsample = time.perf_counter()
+                step = max(1, total_points // max_points)
+                points = points[::step]
+                if len(points) > max_points:
+                    points = points[:max_points]
+                _record_session_stage(session, "latest_cloud_downsample", (time.perf_counter() - t_downsample) * 1000.0)
+            payload = {
+                "points": points,
+                "points_count": len(points),
+                "total_points": total_points,
+                "distance_mm": session.get("distance_mm", 0.0),
+                "profiles_count": session.get("profiles_count", 0),
+                "recording": session.get("recording", False),
+                "preview_points_count": int(_get_captured_preview_points(session).shape[0]),
+                "captured_points_count": int(session.get("captured_points_count", 0) or 0),
+                "pipeline_timing_ms": _summarize_session_stage_timings(session),
+            }
+        else:
+            payload = {
+                "points": [],
+                "points_count": preview_count,
+                "total_points": total_points,
+                "distance_mm": session.get("distance_mm", 0.0),
+                "profiles_count": session.get("profiles_count", 0),
+                "recording": session.get("recording", False),
+                "preview_points_count": int(_get_captured_preview_points(session).shape[0]),
+                "captured_points_count": int(session.get("captured_points_count", 0) or 0),
+                "pipeline_timing_ms": _summarize_session_stage_timings(session),
+                **preview_payload,
+            }
+    _record_session_stage(session, "latest_cloud_request", (time.perf_counter() - t_req) * 1000.0)
+    return payload
 
 
 @router.get("/trigger/latest-cloud/stream")
 async def trigger_latest_cloud_stream(
     request: Request,
     max_points: int = 30000,
-    accumulate_frames: int = 1,
-    accumulate_profiles: int = 0,
 ):
     async def event_generator():
         while True:
             session = _get_session(request)
-            points = None
-            chunks = session.get("accumulated_chunks")
-            if isinstance(chunks, list) and len(chunks) > 0:
-                try:
-                    points = np.vstack(chunks).tolist() if len(chunks) > 1 else chunks[0].tolist()
-                except Exception:
-                    points = None
-            if points is None and session.get("accumulated_points"):
-                points = session.get("accumulated_points") or None
-            if int(accumulate_frames or 1) > 1:
-                history = session.get("preview_points_history")
-                if isinstance(history, deque) and len(history) > 0:
-                    take = min(int(accumulate_frames), len(history))
-                    recent = list(history)[-take:]
-                    try:
-                        points = np.vstack(recent).tolist() if len(recent) > 1 else recent[0].tolist()
-                    except Exception:
-                        points = None
-            if points is None:
+            t_req = time.perf_counter()
+            preview_payload = _get_captured_preview_blob(session)
+            total_points = int(preview_payload.get("points_count", 0) or 0)
+            if total_points <= 0:
                 points = session.get("last_points") or []
-            total_points = len(points)
-            if max_points is not None and max_points > 0 and total_points > max_points:
-                step = max(1, total_points // max_points)
-                points = points[::step]
-                if len(points) > max_points:
-                    points = points[:max_points]
-            payload = {
-                "points": points,
-                "points_count": len(points),
-                "total_points": total_points,
-                "recording": session.get("recording", False),
-            }
+                total_points = len(points)
+                if max_points is not None and max_points > 0 and total_points > max_points:
+                    t_downsample = time.perf_counter()
+                    step = max(1, total_points // max_points)
+                    points = points[::step]
+                    if len(points) > max_points:
+                        points = points[:max_points]
+                    _record_session_stage(session, "latest_cloud_stream_downsample", (time.perf_counter() - t_downsample) * 1000.0)
+                payload = {
+                    "points": points,
+                    "points_count": len(points),
+                    "total_points": total_points,
+                    "recording": session.get("recording", False),
+                    "pipeline_timing_ms": _summarize_session_stage_timings(session),
+                }
+            else:
+                payload = {
+                    "points": [],
+                    "points_count": total_points,
+                    "total_points": total_points,
+                    "recording": session.get("recording", False),
+                    "pipeline_timing_ms": _summarize_session_stage_timings(session),
+                    **preview_payload,
+                }
+            _record_session_stage(session, "latest_cloud_stream_request", (time.perf_counter() - t_req) * 1000.0)
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(1.0)
 
@@ -1735,84 +1872,34 @@ async def live_preview(device_id: str, request: Request):
         
         async def event_generator():
             """Generate SSE events with point cloud data"""
-            # Check if receiver already exists (from auto-start)
             receiver_info = receiver_manager.receivers.get(device_id)
-            
-            use_lmd_stream = _uses_lmd_stream(device)
             if not receiver_info:
-                # No active receiver - create temporary one
-                if use_lmd_stream:
-                    receiver = Lms4000Receiver(sensor_ip=device.ip_address, sensor_port=device.port)
-                    if not receiver.start_listening():
-                        yield f"data: {json.dumps({'error': 'Failed to connect LMDscandata stream ' + str(device.ip_address) + ':' + str(device.port)})}\n\n"
-                        return
-                else:
-                    receiver = PicoscanReceiver(
-                        listen_ip="0.0.0.0",
-                        listen_port=device.port,
-                        format_type=getattr(device, "format_type", "compact"),
-                    )
-                    # Try to start listening
-                    if not receiver.start_listening():
-                        yield f"data: {json.dumps({'error': 'Failed to start listening on port ' + str(device.port)})}\n\n"
-                        return
-                
-                own_receiver = True
-            else:
-                # Use existing receiver from auto-start
-                if isinstance(receiver_info, dict) and "receiver" in receiver_info:
-                    receiver = receiver_info["receiver"]
-                else:
-                    receiver = receiver_info
-                own_receiver = False
-            
+                started = receiver_manager.start_listening(
+                    device.device_id,
+                    "0.0.0.0",
+                    device.port,
+                    segments_per_scan=getattr(device, "segments_per_scan", None),
+                    format_type=getattr(device, "format_type", "compact"),
+                    device_type=getattr(device, "device_type", "picoscan"),
+                    sensor_ip=getattr(device, "ip_address", None),
+                )
+                if not started:
+                    yield f"data: {json.dumps({'error': 'Failed to start live preview listener for ' + str(device.device_id)})}\n\n"
+                    return
+
             try:
                 logger.info(f"Live preview started for {device_id}")
-                
-                # Stream data continuously
                 frame_count = 0
                 while True:
                     try:
-                        if not own_receiver:
-                            latest = receiver_manager.get_latest_point_cloud(device_id)
-                            if not latest or latest.get("points") is None or len(latest.get("points")) == 0:
-                                yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
-                                await asyncio.sleep(0.05)
-                                continue
-                            points = latest["points"]
-                            frame_number = latest.get("frame")
-                        elif use_lmd_stream:
-                            points = receiver.receive_point_cloud(2)
-                            if points is None or len(points) == 0:
-                                yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
-                                await asyncio.sleep(0.05)
-                                continue
-                            frame_number = None
-                        else:
-                            segments_per_scan = None
-                            try:
-                                device = device_manager.get_device(device_id)
-                                segments_per_scan = (
-                                    getattr(device, 'segments_per_scan', None)
-                                    or device_manager.point_cloud_settings.get("segments_per_scan")
-                                )
-                            except Exception:
-                                segments_per_scan = None
-                            segments_to_get = segments_per_scan or 1
-                            segments = receiver.receive_segments(num_segments=segments_to_get)
-                            if not segments:
-                                yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
-                                await asyncio.sleep(0.05)
-                                continue
-                            segment_list = _extract_segments(segments)
-                            points = receiver.segments_to_point_cloud(segment_list)
-                            frame_number = None
-                            try:
-                                if segment_list and segment_list[0].get("Modules"):
-                                    frame_number = segment_list[0]["Modules"][0].get("FrameNumber")
-                            except Exception:
-                                frame_number = None
-                        
+                        latest = receiver_manager.get_latest_point_cloud(device_id)
+                        if not latest or latest.get("points") is None or len(latest.get("points")) == 0:
+                            yield f"data: {json.dumps({'status': 'waiting', 'device_id': device_id})}\n\n"
+                            await asyncio.sleep(0.05)
+                            continue
+                        points = latest["points"]
+                        frame_number = latest.get("frame")
+
                         if hasattr(points, 'tolist'):
                             points_list = points.tolist()
                         else:
@@ -1845,14 +1932,6 @@ async def live_preview(device_id: str, request: Request):
             except Exception as e:
                 logger.error(f"Live preview error: {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            
-            finally:
-                # Only close if this endpoint created the receiver
-                if own_receiver:
-                    try:
-                        receiver.stop_listening()
-                    except:
-                        pass
         
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     

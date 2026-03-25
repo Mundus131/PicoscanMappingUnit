@@ -3,11 +3,12 @@ Picoscan Receiver - Nasłuchiwanie danych UDP od Picoscanu
 PC jest SERWEREM, Picoscan wysyła dane UDP
 """
 import logging
+import socket
+from collections import Counter, deque
 from typing import Optional, List, Tuple
 import numpy as np
 import threading
 import time
-from collections import deque
 import io
 from contextlib import redirect_stdout, redirect_stderr
 from app.services.lms4000_receiver import Lms4000Receiver
@@ -25,6 +26,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _scansegmentapi_stdio_lock = threading.Lock()
+UDP_RCVBUF_BYTES = 4 * 1024 * 1024
+PATTERN_OBSERVATION_WINDOW = 40
+PATTERN_SWITCH_STABLE_FRAMES = 5
+PATTERN_INITIAL_LOCK_FRAMES = 3
+PIPELINE_TIMING_WINDOW = 120
 
 
 class PicoscanReceiver:
@@ -64,6 +70,15 @@ class PicoscanReceiver:
                     self.listen_port,
                     65535  # Max packet size
                 )
+                try:
+                    self.transport_layer.client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RCVBUF_BYTES)
+                except Exception as sock_exc:
+                    logger.debug(
+                        "Failed to increase UDP receive buffer on %s:%s: %s",
+                        self.listen_ip,
+                        self.listen_port,
+                        sock_exc,
+                    )
 
                 if self.format_type == "msgpack":
                     self.receiver = MsgpackApi.Receiver(self.transport_layer)
@@ -192,124 +207,131 @@ class PicoscanReceiver:
     
     def segments_to_point_cloud(self, segments: List[dict]) -> np.ndarray:
         """Convert segments to point cloud (X, Y, Z, RSSI)."""
-        points = []
-        
+        arrays: list[np.ndarray] = []
+
         try:
             for segment in segments:
                 if self.format_type == "msgpack":
-                    points.extend(self._extract_points_msgpack(segment))
+                    segment_points = self._extract_points_msgpack(segment)
                 else:
-                    points.extend(self._extract_points_compact(segment))
-            
-            if points:
-                return np.array(points, dtype=np.float32)
-            else:
-                return np.array([], dtype=np.float32).reshape(0, 3)
+                    segment_points = self._extract_points_compact(segment)
+                if isinstance(segment_points, np.ndarray) and segment_points.ndim == 2 and segment_points.shape[0] > 0:
+                    arrays.append(segment_points.astype(np.float32, copy=False))
+
+            if arrays:
+                return np.vstack(arrays).astype(np.float32, copy=False)
+            return np.array([], dtype=np.float32).reshape(0, 4)
         except Exception as e:
             logger.error(f"Error converting: {e}")
-            return np.array([], dtype=np.float32).reshape(0, 3)
-    
-    def _extract_points_compact(self, segment: dict) -> List[list]:
-        """Extract points from Compact format segment"""
-        points = []
-        
+            return np.array([], dtype=np.float32).reshape(0, 4)
+
+    def _build_points_from_scan(
+        self,
+        distances,
+        *,
+        phi: float,
+        theta_start: float,
+        theta_stop: float,
+        channel_theta,
+        rssi,
+    ) -> np.ndarray:
+        distance_arr = np.asarray(distances, dtype=np.float32)
+        if distance_arr.ndim != 2 or distance_arr.shape[0] == 0 or distance_arr.shape[1] == 0:
+            return np.empty((0, 4), dtype=np.float32)
+
+        num_beams = int(distance_arr.shape[1])
+        if channel_theta is not None:
+            theta_arr = np.asarray(channel_theta, dtype=np.float32)
+            if theta_arr.ndim != 1 or theta_arr.shape[0] != num_beams:
+                theta_arr = None
+        else:
+            theta_arr = None
+
+        if theta_arr is None:
+            if num_beams > 1:
+                theta_arr = np.linspace(theta_start, theta_stop, num_beams, dtype=np.float32)
+            else:
+                theta_arr = np.asarray([theta_start], dtype=np.float32)
+
+        valid_rows, valid_cols = np.nonzero(distance_arr > 0)
+        if valid_rows.size == 0:
+            return np.empty((0, 4), dtype=np.float32)
+
+        distance_vals = distance_arr[valid_rows, valid_cols]
+        theta_vals = theta_arr[valid_cols]
+        phi_val = np.float32(phi)
+        cos_theta = np.cos(theta_vals).astype(np.float32, copy=False)
+        sin_theta = np.sin(theta_vals).astype(np.float32, copy=False)
+        cos_phi = np.float32(np.cos(phi_val))
+        sin_phi = np.float32(np.sin(phi_val))
+
+        x = distance_vals * cos_theta * cos_phi
+        y = distance_vals * cos_theta * sin_phi
+        z = distance_vals * sin_theta
+
+        rssi_vals = np.zeros_like(distance_vals, dtype=np.float32)
         try:
-            for module_idx, module in enumerate(segment.get("Modules", [])):
-                # Get angles for this module
+            rssi_arr = np.asarray(rssi, dtype=np.float32)
+            if rssi_arr.shape == distance_arr.shape:
+                rssi_vals = rssi_arr[valid_rows, valid_cols]
+        except Exception:
+            pass
+
+        return np.column_stack((x, y, z, rssi_vals)).astype(np.float32, copy=False)
+
+    def _extract_points_compact(self, segment: dict) -> np.ndarray:
+        """Extract points from Compact format segment."""
+        arrays: list[np.ndarray] = []
+
+        try:
+            for module in segment.get("Modules", []):
                 phi_list = module.get("Phi", [0.0])
                 theta_start_list = module.get("ThetaStart", [0.0])
                 theta_stop_list = module.get("ThetaStop", [0.0])
-                
-                for scan_idx, scan in enumerate(module.get("SegmentData", [])):
-                    distances = scan.get("Distance", [])
-                    if not distances:
-                        continue
 
-                    # distances is [echo][beam]
-                    num_echos = len(distances)
-                    num_beams = len(distances[0]) if num_echos > 0 else 0
-                    if num_beams == 0:
-                        continue
-                    
-                    # Get angle for this scan
+                for scan_idx, scan in enumerate(module.get("SegmentData", [])):
                     phi = phi_list[scan_idx] if scan_idx < len(phi_list) else 0.0
                     theta_start = theta_start_list[scan_idx] if scan_idx < len(theta_start_list) else 0.0
                     theta_stop = theta_stop_list[scan_idx] if scan_idx < len(theta_stop_list) else theta_start
-                    channel_theta = scan.get("ChannelTheta")
-                    rssi = scan.get("Rssi")
-                    
-                    for beam_idx in range(num_beams):
-                        # Prefer per-beam theta if available
-                        if channel_theta is not None and len(channel_theta) > beam_idx:
-                            theta = channel_theta[beam_idx]
-                        else:
-                            denom = (num_beams - 1) if num_beams > 1 else 1
-                            theta = theta_start + beam_idx * (theta_stop - theta_start) / denom
-
-                        for echo_idx in range(num_echos):
-                            distance = distances[echo_idx][beam_idx]
-                            if distance > 0:  # Skip invalid
-                                # Angles are in radians per ScanSegmentAPI
-                                x = distance * np.cos(theta) * np.cos(phi)
-                                y = distance * np.cos(theta) * np.sin(phi)
-                                z = distance * np.sin(theta)
-                                rssi_val = 0.0
-                                try:
-                                    if rssi is not None and len(rssi) > echo_idx and len(rssi[echo_idx]) > beam_idx:
-                                        rssi_val = float(rssi[echo_idx][beam_idx])
-                                except Exception:
-                                    rssi_val = 0.0
-                                points.append([x, y, z, rssi_val])
+                    scan_points = self._build_points_from_scan(
+                        scan.get("Distance", []),
+                        phi=phi,
+                        theta_start=theta_start,
+                        theta_stop=theta_stop,
+                        channel_theta=scan.get("ChannelTheta"),
+                        rssi=scan.get("Rssi"),
+                    )
+                    if scan_points.shape[0] > 0:
+                        arrays.append(scan_points)
         except Exception as e:
             logger.warning(f"Error extracting points: {e}")
-        
-        return points
 
-    def _extract_points_msgpack(self, segment: dict) -> List[list]:
+        if not arrays:
+            return np.empty((0, 4), dtype=np.float32)
+        return np.vstack(arrays).astype(np.float32, copy=False)
+
+    def _extract_points_msgpack(self, segment: dict) -> np.ndarray:
         """Extract points from msgpack format segment."""
-        points = []
+        arrays: list[np.ndarray] = []
 
         try:
             for scan in segment.get("SegmentData", []):
-                distances = scan.get("Distance", [])
-                if not distances:
-                    continue
-                num_echos = len(distances)
-                num_beams = len(distances[0]) if num_echos > 0 else 0
-                if num_beams == 0:
-                    continue
-
-                phi = scan.get("Phi", 0.0)
-                theta_start = scan.get("ThetaStart", 0.0)
-                theta_stop = scan.get("ThetaStop", theta_start)
-                channel_theta = scan.get("ChannelTheta")
-                rssi = scan.get("Rssi")
-
-                for beam_idx in range(num_beams):
-                    if channel_theta is not None and len(channel_theta) > beam_idx:
-                        theta = channel_theta[beam_idx]
-                    else:
-                        denom = (num_beams - 1) if num_beams > 1 else 1
-                        theta = theta_start + beam_idx * (theta_stop - theta_start) / denom
-
-                    for echo_idx in range(num_echos):
-                        distance = distances[echo_idx][beam_idx]
-                        if distance <= 0:
-                            continue
-                        x = distance * np.cos(theta) * np.cos(phi)
-                        y = distance * np.cos(theta) * np.sin(phi)
-                        z = distance * np.sin(theta)
-                        rssi_val = 0.0
-                        try:
-                            if rssi is not None and len(rssi) > echo_idx and len(rssi[echo_idx]) > beam_idx:
-                                rssi_val = float(rssi[echo_idx][beam_idx])
-                        except Exception:
-                            rssi_val = 0.0
-                        points.append([x, y, z, rssi_val])
+                scan_points = self._build_points_from_scan(
+                    scan.get("Distance", []),
+                    phi=scan.get("Phi", 0.0),
+                    theta_start=scan.get("ThetaStart", 0.0),
+                    theta_stop=scan.get("ThetaStop", scan.get("ThetaStart", 0.0)),
+                    channel_theta=scan.get("ChannelTheta"),
+                    rssi=scan.get("Rssi"),
+                )
+                if scan_points.shape[0] > 0:
+                    arrays.append(scan_points)
         except Exception as e:
             logger.warning(f"Error extracting msgpack points: {e}")
 
-        return points
+        if not arrays:
+            return np.empty((0, 4), dtype=np.float32)
+        return np.vstack(arrays).astype(np.float32, copy=False)
     
     def get_info(self) -> dict:
         """Get receiver info"""
@@ -332,6 +354,119 @@ class PicoscanReceiverManager:
         self._auto_stop: threading.Event | None = None
         self._auto_retry_state: dict[str, dict] = {}
         self._lock = threading.Lock()
+
+    def _build_expected_pattern_hint(self, segments_per_scan: int | None) -> list[int] | None:
+        try:
+            count = int(segments_per_scan or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            return None
+        return list(range(count))
+
+    def _build_receiver_info(
+        self,
+        *,
+        receiver,
+        receiver_type: str,
+        device_id: str,
+        device_type: str,
+        format_type: str,
+        listen_ip: str,
+        listen_port: int,
+        segments_per_scan: int | None,
+        fallback_enabled: bool,
+        fallback_listen_ip: str | None,
+        fallback_listen_port: int | None,
+        fallback_formats: list[str],
+    ) -> dict:
+        expected_pattern = self._build_expected_pattern_hint(segments_per_scan)
+        return {
+            "receiver": receiver,
+            "type": receiver_type,
+            "device_id": device_id,
+            "device_type": device_type,
+            "format_type": format_type,
+            "listening": True,
+            "listen_ip": listen_ip,
+            "listen_port": listen_port,
+            "segments": [],
+            "segments_per_scan_hint": segments_per_scan,
+            "expected_segment_pattern": expected_pattern,
+            "dominant_segment_pattern": expected_pattern,
+            "dominant_pattern_samples": 0,
+            "pattern_observations": deque(maxlen=PATTERN_OBSERVATION_WINDOW),
+            "pattern_switch_count": 0,
+            "pattern_last_switch_ts": None,
+            "last_closed_frame_number": None,
+            "last_closed_segment_pattern": [],
+            "last_complete_frame_number": None,
+            "last_complete_segment_pattern": [],
+            "latest_points": None,
+            "latest_update_ts": None,
+            "frame_counter": 0,
+            "lock": threading.Lock(),
+            "availability": "unknown",
+            "last_error": None,
+            "error_streak": 0,
+            "no_data_streak": 0,
+            "next_poll_ts": 0.0,
+            "poll_backoff_s": 0.0,
+            "data_timestamps": deque(maxlen=24),
+            "frame_segments_pending": {},
+            "frame_pending_ts": {},
+            "incomplete_frames_dropped": 0,
+            "last_seen_frame_number": None,
+            "last_poll_ts": None,
+            "active_stream": (
+                "lmdscandata"
+                if str(receiver_type).lower() == "lmdscandata"
+                else f"scansegmentapi:{format_type}"
+            ),
+            "fallback_enabled": fallback_enabled,
+            "fallback_receiver": None,
+            "fallback_listen_ip": fallback_listen_ip,
+            "fallback_listen_port": fallback_listen_port,
+            "fallback_formats": fallback_formats,
+            "fallback_format_idx": 0,
+            "fallback_active_format": None,
+            "fallback_no_data_streak": 0,
+            "fallback_activations": 0,
+            "fallback_next_retry_ts": 0.0,
+            "fallback_block_reason": None,
+            "last_partial_frame_number": None,
+            "last_partial_segment_counters": [],
+            "last_segment_stats": None,
+            "perf_udp_receive_ms": deque(maxlen=PIPELINE_TIMING_WINDOW),
+            "perf_assemble_ms": deque(maxlen=PIPELINE_TIMING_WINDOW),
+            "perf_convert_ms": deque(maxlen=PIPELINE_TIMING_WINDOW),
+            "perf_store_ms": deque(maxlen=PIPELINE_TIMING_WINDOW),
+            "perf_cycle_ms": deque(maxlen=PIPELINE_TIMING_WINDOW),
+            "perf_last_points_count": 0,
+        }
+
+    def _record_timing(self, info: dict, key: str, duration_ms: float):
+        samples = info.get(key)
+        if not isinstance(samples, deque):
+            samples = deque(maxlen=PIPELINE_TIMING_WINDOW)
+            info[key] = samples
+        try:
+            samples.append(float(duration_ms))
+        except Exception:
+            pass
+
+    def _summarize_timing(self, samples) -> dict | None:
+        if not isinstance(samples, deque) or len(samples) == 0:
+            return None
+        arr = np.asarray(list(samples), dtype=np.float64)
+        if arr.size == 0:
+            return None
+        return {
+            "samples": int(arr.size),
+            "last_ms": float(arr[-1]),
+            "mean_ms": float(np.mean(arr)),
+            "p95_ms": float(np.percentile(arr, 95)),
+        }
 
     def add_receiver(self, device_id: str, receiver: PicoscanReceiver) -> bool:
         """Add receiver"""
@@ -380,50 +515,20 @@ class PicoscanReceiverManager:
                 ok = receiver.start_listening()
                 if ok:
                     logger.info("Listening for LMDscandata on TCP %s:%s (%s)", sensor_ip, listen_port, device_id)
-                    self.receivers[device_id] = {
-                        "receiver": receiver,
-                        "type": "lmdscandata",
-                        "device_id": device_id,
-                        "device_type": dev_type,
-                        "format_type": "lmdscandata",
-                        "listening": True,
-                        "listen_ip": sensor_ip,
-                        "listen_port": listen_port,
-                        "segments": [],
-                        "segments_per_scan": 2,
-                        "latest_points": None,
-                        "latest_update_ts": None,
-                        "frame_counter": 0,
-                        "lock": threading.Lock(),
-                        "availability": "unknown",
-                        "last_error": None,
-                        "error_streak": 0,
-                        "no_data_streak": 0,
-                        "next_poll_ts": 0.0,
-                        "poll_backoff_s": 0.0,
-                        "data_timestamps": deque(maxlen=24),
-                        "segment_observations": deque(maxlen=120),
-                        "segment_estimate": None,
-                        "segment_estimate_updated_ts": None,
-                        "frame_segments_pending": {},
-                        "frame_pending_ts": {},
-                        "segment_timeout_observations": deque(maxlen=40),
-                        "incomplete_frames_dropped": 0,
-                        "last_seen_frame_number": None,
-                        "last_poll_ts": None,
-                        "active_stream": "lmdscandata",
-                        "fallback_enabled": True,
-                        "fallback_receiver": None,
-                        "fallback_listen_ip": "0.0.0.0",
-                        "fallback_listen_port": 2115 if int(listen_port) == 2111 else int(listen_port),
-                        "fallback_formats": ["compact", "msgpack"],
-                        "fallback_format_idx": 0,
-                        "fallback_active_format": None,
-                        "fallback_no_data_streak": 0,
-                        "fallback_activations": 0,
-                        "fallback_next_retry_ts": 0.0,
-                        "fallback_block_reason": None,
-                    }
+                    self.receivers[device_id] = self._build_receiver_info(
+                        receiver=receiver,
+                        receiver_type="lmdscandata",
+                        device_id=device_id,
+                        device_type=dev_type,
+                        format_type="lmdscandata",
+                        listen_ip=sensor_ip,
+                        listen_port=listen_port,
+                        segments_per_scan=2,
+                        fallback_enabled=True,
+                        fallback_listen_ip="0.0.0.0",
+                        fallback_listen_port=2115 if int(listen_port) == 2111 else int(listen_port),
+                        fallback_formats=["compact", "msgpack"],
+                    )
                     self._start_worker(device_id)
                 return ok
 
@@ -451,52 +556,20 @@ class PicoscanReceiverManager:
 
             receiver = PicoscanReceiver(listen_ip, listen_port, format_type=format_type)
             if receiver.start_listening():
-                # Store optional segments_per_scan provided from device config
-                self.receivers[device_id] = {
-                    "receiver": receiver,
-                    "type": "picoscan",
-                    "device_id": device_id,
-                    "device_type": dev_type,
-                    "format_type": receiver.format_type,
-                    "listening": True,
-                    "listen_ip": listen_ip,
-                    "listen_port": listen_port,
-                    "segments": [],
-                    "segments_per_scan": segments_per_scan,
-                    "latest_points": None,
-                    "latest_update_ts": None,
-                    "frame_counter": 0,
-                    "lock": threading.Lock(),
-                    "availability": "unknown",
-                    "last_error": None,
-                    "error_streak": 0,
-                    "no_data_streak": 0,
-                    "next_poll_ts": 0.0,
-                    "poll_backoff_s": 0.0,
-                    "data_timestamps": deque(maxlen=24),
-                    "segment_observations": deque(maxlen=120),
-                    "segment_estimate": None,
-                    "segment_estimate_updated_ts": None,
-                    "frame_segments_pending": {},
-                    "frame_pending_ts": {},
-                    "segment_timeout_observations": deque(maxlen=40),
-                    "incomplete_frames_dropped": 0,
-                    "last_seen_frame_number": None,
-                    "last_poll_ts": None,
-                    "points_history": deque(maxlen=30),
-                    "active_stream": f"scansegmentapi:{receiver.format_type}",
-                    "fallback_enabled": False,
-                    "fallback_receiver": None,
-                    "fallback_listen_ip": None,
-                    "fallback_listen_port": None,
-                    "fallback_formats": [],
-                    "fallback_format_idx": 0,
-                    "fallback_active_format": None,
-                    "fallback_no_data_streak": 0,
-                    "fallback_activations": 0,
-                    "fallback_next_retry_ts": 0.0,
-                    "fallback_block_reason": None,
-                }
+                self.receivers[device_id] = self._build_receiver_info(
+                    receiver=receiver,
+                    receiver_type="picoscan",
+                    device_id=device_id,
+                    device_type=dev_type,
+                    format_type=receiver.format_type,
+                    listen_ip=listen_ip,
+                    listen_port=listen_port,
+                    segments_per_scan=segments_per_scan,
+                    fallback_enabled=False,
+                    fallback_listen_ip=None,
+                    fallback_listen_port=None,
+                    fallback_formats=[],
+                )
                 self._start_worker(device_id)
                 return True
             return False
@@ -654,7 +727,6 @@ class PicoscanReceiverManager:
 
         segment_payload = segments[0] if isinstance(segments, tuple) else segments
         segment_list = segment_payload if isinstance(segment_payload, list) else [segment_payload]
-        self._update_segment_estimate_from_receive(info, segments, segment_list)
         assembled_segments = self._assemble_complete_frame_segments(info, segment_list)
         if not assembled_segments:
             return None
@@ -676,15 +748,6 @@ class PicoscanReceiverManager:
             if not info.get("listening"):
                 time.sleep(0.05)
                 continue
-            # Keep runtime segments_per_scan aligned to explicit device config.
-            try:
-                device_cfg = device_manager.get_device(device_id)
-                configured = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
-                if configured is not None and configured > 0:
-                    if info.get("segments_per_scan") != int(configured):
-                        info["segments_per_scan"] = int(configured)
-            except Exception:
-                pass
             now = time.time()
             next_poll_ts = float(info.get("next_poll_ts") or 0.0)
             if now < next_poll_ts:
@@ -716,9 +779,11 @@ class PicoscanReceiverManager:
             use_lmd_stream = (rtype == "lms4000") or (info_format == "lmdscandata")
             info["last_poll_ts"] = time.time()
             try:
+                cycle_start = time.perf_counter()
                 points = None
+                had_transport_activity = False
                 if use_lmd_stream and hasattr(receiver, "receive_point_cloud"):
-                    scans_to_request = info.get("segments_per_scan") or 2
+                    scans_to_request = max(1, len(info.get("expected_segment_pattern") or [])) or 2
                     points = receiver.receive_point_cloud(int(scans_to_request))
                     if points is not None and len(points) > 0:
                         info["active_stream"] = "lmdscandata"
@@ -731,35 +796,47 @@ class PicoscanReceiverManager:
                     # while segments_per_scan still controls complete-frame assembly.
                     batch_segments = int((device_manager.point_cloud_settings or {}).get("receive_batch_segments") or 1)
                     batch_segments = max(1, min(16, batch_segments))
+                    t_udp = time.perf_counter()
                     segments = receiver.receive_segments(batch_segments)
+                    self._record_timing(info, "perf_udp_receive_ms", (time.perf_counter() - t_udp) * 1000.0)
                     if segments:
+                        had_transport_activity = True
                         segment_payload = segments[0] if isinstance(segments, tuple) else segments
                         segment_list = segment_payload if isinstance(segment_payload, list) else [segment_payload]
                         info["last_segment_stats"] = self._summarize_segment_payload(segment_list)
-                        self._update_segment_estimate_from_receive(info, segments, segment_list)
+                        t_assemble = time.perf_counter()
                         assembled_segments = self._assemble_complete_frame_segments(info, segment_list)
+                        self._record_timing(info, "perf_assemble_ms", (time.perf_counter() - t_assemble) * 1000.0)
                         if assembled_segments:
+                            t_convert = time.perf_counter()
                             points = receiver.segments_to_point_cloud(assembled_segments)
+                            self._record_timing(info, "perf_convert_ms", (time.perf_counter() - t_convert) * 1000.0)
                             if points is not None and len(points) > 0:
                                 info["active_stream"] = f"scansegmentapi:{getattr(receiver, 'format_type', 'compact')}"
+                                info["last_partial_frame_number"] = None
+                                info["last_partial_segment_counters"] = []
+                        else:
+                            pending = info.get("frame_segments_pending") or {}
+                            if pending:
+                                newest_frame = max(int(frame_no) for frame_no in pending.keys())
+                                newest_parts = pending.get(newest_frame) or {}
+                                info["last_partial_frame_number"] = newest_frame
+                                info["last_partial_segment_counters"] = sorted(int(seg_no) for seg_no in newest_parts.keys())
 
                 if points is not None and len(points) > 0:
+                    t_store = time.perf_counter()
                     lock = info.get("lock")
                     if lock is None:
                         info["latest_points"] = points
                         info["latest_update_ts"] = time.time()
                         info["frame_counter"] = int(info.get("frame_counter", 0) + 1)
-                        history = info.get("points_history")
-                        if isinstance(history, deque):
-                            history.append(np.array(points, copy=True))
                     else:
                         with lock:
                             info["latest_points"] = np.array(points, copy=True)
                             info["latest_update_ts"] = time.time()
                             info["frame_counter"] = int(info.get("frame_counter", 0) + 1)
-                            history = info.get("points_history")
-                            if isinstance(history, deque):
-                                history.append(np.array(points, copy=True))
+                    self._record_timing(info, "perf_store_ms", (time.perf_counter() - t_store) * 1000.0)
+                    info["perf_last_points_count"] = int(len(points))
                     info["availability"] = "online"
                     info["last_error"] = None
                     info["error_streak"] = 0
@@ -769,6 +846,13 @@ class PicoscanReceiverManager:
                     data_ts = info.get("data_timestamps")
                     if isinstance(data_ts, deque):
                         data_ts.append(time.time())
+                elif had_transport_activity:
+                    info["availability"] = "online"
+                    info["last_error"] = None
+                    info["error_streak"] = 0
+                    info["no_data_streak"] = 0
+                    info["poll_backoff_s"] = 0.0
+                    info["next_poll_ts"] = 0.0
                 else:
                     streak = int(info.get("no_data_streak", 0)) + 1
                     info["no_data_streak"] = streak
@@ -779,6 +863,7 @@ class PicoscanReceiverManager:
                     info["poll_backoff_s"] = backoff
                     info["next_poll_ts"] = time.time() + backoff
                     time.sleep(min(0.2, backoff))
+                self._record_timing(info, "perf_cycle_ms", (time.perf_counter() - cycle_start) * 1000.0)
             except Exception as e:
                 logger.debug("Receiver worker error [%s]: %s", device_id, e)
                 info["availability"] = "offline"
@@ -790,69 +875,79 @@ class PicoscanReceiverManager:
                 info["next_poll_ts"] = time.time() + backoff
                 time.sleep(min(0.25, backoff))
 
-    def _update_segment_estimate_from_receive(self, info: dict, receive_result, segment_list: list):
+    def _normalize_segment_pattern(self, counters: list[int] | tuple[int, ...] | None) -> tuple[int, ...]:
+        if not counters:
+            return tuple()
         try:
-            frame_to_max_counter: dict[int, int] = {}
-            # Preferred: vectors returned by ScanSegmentAPI.
-            if isinstance(receive_result, tuple) and len(receive_result) >= 3:
-                frame_numbers = receive_result[1] or []
-                segment_counters = receive_result[2] or []
-                for frame_no, seg_counter in zip(frame_numbers, segment_counters):
-                    try:
-                        f = int(frame_no)
-                        c = int(seg_counter)
-                    except Exception:
-                        continue
-                    if c < 0:
-                        continue
-                    prev = frame_to_max_counter.get(f)
-                    if prev is None or c > prev:
-                        frame_to_max_counter[f] = c
-
-            # Fallback: read metadata from decoded segment payload.
-            if not frame_to_max_counter:
-                for seg in segment_list or []:
-                    try:
-                        modules = seg.get("Modules") if isinstance(seg, dict) else None
-                        if not modules:
-                            continue
-                        m0 = modules[0]
-                        f = int(m0.get("FrameNumber"))
-                        c = int(m0.get("SegmentCounter"))
-                        if c < 0:
-                            continue
-                        prev = frame_to_max_counter.get(f)
-                        if prev is None or c > prev:
-                            frame_to_max_counter[f] = c
-                    except Exception:
-                        continue
-
-            if not frame_to_max_counter:
-                return
-
-            obs = info.get("segment_observations")
-            if not isinstance(obs, deque):
-                obs = deque(maxlen=120)
-                info["segment_observations"] = obs
-
-            for max_counter in frame_to_max_counter.values():
-                # SegmentCounter is typically 0..N-1 => N = max + 1.
-                seg_count = int(max_counter) + 1
-                if seg_count <= 0 or seg_count > 128:
-                    continue
-                obs.append(seg_count)
-
-            if len(obs) >= 3:
-                arr = np.asarray(list(obs), dtype=np.float64)
-                estimate = int(round(float(np.median(arr))))
-                if estimate > 0:
-                    info["segment_estimate"] = estimate
-                    info["segment_estimate_updated_ts"] = time.time()
-                    # Auto-use estimated value if no explicit per-device value exists.
-                    if not info.get("segments_per_scan"):
-                        info["segments_per_scan"] = estimate
+            return tuple(sorted({int(c) for c in counters}))
         except Exception:
-            pass
+            return tuple()
+
+    def _register_closed_frame_pattern(self, info: dict, frame_no: int | None, counters: list[int] | tuple[int, ...]):
+        pattern = self._normalize_segment_pattern(counters)
+        if not pattern:
+            return tuple(), tuple(), False
+
+        observations = info.get("pattern_observations")
+        if not isinstance(observations, deque):
+            observations = deque(maxlen=PATTERN_OBSERVATION_WINDOW)
+            info["pattern_observations"] = observations
+        observations.append(pattern)
+
+        counts = Counter(observations)
+        dominant_pattern, dominant_count = counts.most_common(1)[0]
+        expected_pattern = self._normalize_segment_pattern(info.get("expected_segment_pattern"))
+        recent = list(observations)[-PATTERN_SWITCH_STABLE_FRAMES:]
+        stable_recent = (
+            len(recent) >= PATTERN_SWITCH_STABLE_FRAMES and all(item == dominant_pattern for item in recent)
+        )
+
+        info["dominant_segment_pattern"] = list(dominant_pattern)
+        info["dominant_pattern_samples"] = int(dominant_count)
+        info["last_closed_frame_number"] = frame_no
+        info["last_closed_segment_pattern"] = list(pattern)
+
+        if not expected_pattern:
+            if dominant_count >= PATTERN_INITIAL_LOCK_FRAMES:
+                info["expected_segment_pattern"] = list(dominant_pattern)
+                expected_pattern = dominant_pattern
+        elif expected_pattern != dominant_pattern and stable_recent and dominant_count >= PATTERN_SWITCH_STABLE_FRAMES:
+            logger.info(
+                "Adaptive segment pattern update for %s: %s -> %s",
+                info.get("device_id"),
+                list(expected_pattern),
+                list(dominant_pattern),
+            )
+            info["expected_segment_pattern"] = list(dominant_pattern)
+            info["pattern_switch_count"] = int(info.get("pattern_switch_count", 0) or 0) + 1
+            info["pattern_last_switch_ts"] = time.time()
+            expected_pattern = dominant_pattern
+
+        complete = bool(expected_pattern) and pattern == expected_pattern
+        if complete:
+            info["last_complete_frame_number"] = frame_no
+            info["last_complete_segment_pattern"] = list(pattern)
+            info["last_partial_frame_number"] = None
+            info["last_partial_segment_counters"] = []
+        return pattern, expected_pattern, complete
+
+    def _finalize_pending_frame(self, info: dict, frame_key: int, bucket: dict, strict_integrity: bool):
+        counters = sorted(int(k) for k in bucket.keys())
+        pattern, expected_pattern, complete = self._register_closed_frame_pattern(info, frame_key, counters)
+        if complete or (not strict_integrity):
+            return [bucket[idx] for idx in counters]
+        info["incomplete_frames_dropped"] = int(info.get("incomplete_frames_dropped", 0) or 0) + 1
+        info["last_partial_frame_number"] = frame_key
+        info["last_partial_segment_counters"] = list(pattern)
+        if expected_pattern:
+            logger.debug(
+                "Dropped incomplete frame for %s frame=%s pattern=%s expected=%s",
+                info.get("device_id"),
+                frame_key,
+                list(pattern),
+                list(expected_pattern),
+            )
+        return None
 
     def _extract_frame_counter(self, segment: dict):
         try:
@@ -911,26 +1006,19 @@ class PicoscanReceiverManager:
             bucket[int(seg_counter)] = seg
             pending_ts[frame_key] = now
 
-        expected = int(info.get("segments_per_scan") or 0)
-        if expected <= 0:
-            expected = int(info.get("segment_estimate") or 0)
-        timeout_obs = info.get("segment_timeout_observations")
-        if not isinstance(timeout_obs, deque):
-            timeout_obs = deque(maxlen=40)
-            info["segment_timeout_observations"] = timeout_obs
+        expected_pattern = self._normalize_segment_pattern(info.get("expected_segment_pattern"))
 
         # Prefer oldest pending frame to keep temporal order.
         for frame_key in sorted(pending.keys()):
             bucket = pending.get(frame_key) or {}
             if not bucket:
                 continue
-            if expected > 0:
-                # If we already have at least expected segments, emit frame sorted by counter.
-                # Do not require strict 0..N-1 continuity because hidden-angle segments may be omitted.
-                if len(bucket) >= expected:
+            observed_pattern = self._normalize_segment_pattern(list(bucket.keys()))
+            if expected_pattern and observed_pattern == expected_pattern:
                     out = [bucket[idx] for idx in sorted(bucket.keys())]
                     pending.pop(frame_key, None)
                     pending_ts.pop(frame_key, None)
+                    self._register_closed_frame_pattern(info, frame_key, sorted(bucket.keys()))
                     return out
 
         # If we already observed a newer frame, close oldest older frame.
@@ -945,13 +1033,7 @@ class PicoscanReceiverManager:
                 frame_key = min(older_frames)
                 bucket = pending.get(frame_key) or {}
                 if bucket:
-                    if strict_integrity and expected > 0 and len(bucket) < expected:
-                        info["incomplete_frames_dropped"] = int(info.get("incomplete_frames_dropped", 0) or 0) + 1
-                        timeout_obs.append(len(bucket))
-                        pending.pop(frame_key, None)
-                        pending_ts.pop(frame_key, None)
-                        return None
-                    out = [bucket[idx] for idx in sorted(bucket.keys())]
+                    out = self._finalize_pending_frame(info, frame_key, bucket, strict_integrity)
                     pending.pop(frame_key, None)
                     pending_ts.pop(frame_key, None)
                     return out
@@ -961,41 +1043,13 @@ class PicoscanReceiverManager:
             if (now - float(ts or now)) < stale_timeout_s:
                 continue
             bucket = pending.get(frame_key) or {}
-            counters = sorted(int(k) for k in bucket.keys())
-            contiguous = bool(counters) and counters == list(range(counters[-1] + 1))
-            if contiguous:
-                timeout_obs.append(len(counters))
             if bucket:
-                if strict_integrity and expected > 0 and len(bucket) < expected:
-                    info["incomplete_frames_dropped"] = int(info.get("incomplete_frames_dropped", 0) or 0) + 1
-                    pending.pop(frame_key, None)
-                    pending_ts.pop(frame_key, None)
-                    return None
-                out = [bucket[idx] for idx in counters]
+                out = self._finalize_pending_frame(info, frame_key, bucket, strict_integrity)
                 pending.pop(frame_key, None)
                 pending_ts.pop(frame_key, None)
                 return out
             pending.pop(frame_key, None)
             pending_ts.pop(frame_key, None)
-
-        # If config is too high and stale frames repeatedly show lower contiguous sizes,
-        # adapt runtime expected count (without immediate config file write).
-        if len(timeout_obs) >= 8:
-            inferred = int(round(float(np.median(np.asarray(list(timeout_obs), dtype=np.float64)))))
-            if inferred > 0 and inferred <= 128 and expected > 0 and abs(inferred - expected) >= 2:
-                # Do not override explicit per-device config.
-                device_cfg = device_manager.get_device(info.get("device_id"))
-                configured = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
-                if not configured:
-                    logger.info(
-                        "Adaptive segments_per_scan update for %s: %s -> %s (from incomplete-frame observations)",
-                        info.get("device_id"),
-                        expected,
-                        inferred,
-                    )
-                    info["segments_per_scan"] = inferred
-                    info["segment_estimate"] = inferred
-                    info["segment_estimate_updated_ts"] = now
 
         # Keep pending map bounded.
         if len(pending) > 8:
@@ -1111,30 +1165,6 @@ class PicoscanReceiverManager:
                 point_clouds[device_id] = latest["points"]
         return point_clouds
 
-    def get_point_clouds_for_devices_accumulated(self, device_ids: List[str], frame_count: int = 1) -> dict:
-        """Return accumulated point clouds from the last N frames per device."""
-        point_clouds: dict = {}
-        frames = max(1, int(frame_count or 1))
-        for device_id in (device_ids or []):
-            receiver_info = self.receivers.get(device_id)
-            if not (isinstance(receiver_info, dict) and receiver_info.get("listening")):
-                continue
-            history = receiver_info.get("points_history")
-            if isinstance(history, deque) and len(history) > 0:
-                slice_count = min(frames, len(history))
-                recent = list(history)[-slice_count:]
-                try:
-                    merged = np.vstack(recent) if len(recent) > 1 else recent[0]
-                    if merged is not None and len(merged) > 0:
-                        point_clouds[device_id] = merged
-                        continue
-                except Exception:
-                    pass
-            latest = self.get_latest_point_cloud(device_id)
-            if latest and latest.get("points") is not None and len(latest["points"]) > 0:
-                point_clouds[device_id] = latest["points"]
-        return point_clouds
-
     def get_health_snapshot(self) -> dict:
         snapshot: dict = {}
         now = time.time()
@@ -1142,14 +1172,7 @@ class PicoscanReceiverManager:
             if not isinstance(info, dict):
                 continue
             device_cfg = device_manager.get_device(device_id)
-            per_device_segments = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
-            global_default_segments = int((device_manager.point_cloud_settings or {}).get("segments_per_scan") or 1)
-            runtime_segments = info.get("segments_per_scan")
-            effective_segments = (
-                runtime_segments
-                if runtime_segments is not None
-                else (per_device_segments if per_device_segments is not None else global_default_segments)
-            )
+            configured_segments = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
             data_ts = info.get("data_timestamps")
             data_hz = None
             if isinstance(data_ts, deque) and len(data_ts) >= 2:
@@ -1170,14 +1193,27 @@ class PicoscanReceiverManager:
                 "no_data_streak": int(info.get("no_data_streak", 0) or 0),
                 "latest_data_age_s": age_s,
                 "data_rate_hz": data_hz,
-                "segments_per_scan_configured": per_device_segments,
-                "segments_per_scan_global_default": global_default_segments,
-                "segments_per_scan_runtime": runtime_segments,
-                "segments_per_scan_effective": effective_segments,
-                "segments_per_scan_estimated": info.get("segment_estimate"),
-                "segments_estimate_samples": len(info.get("segment_observations") or []),
-                "segments_estimate_updated_ts": info.get("segment_estimate_updated_ts"),
+                "segments_per_scan_configured": configured_segments,
+                "expected_segment_pattern": info.get("expected_segment_pattern") or [],
+                "dominant_segment_pattern": info.get("dominant_segment_pattern") or [],
+                "dominant_pattern_samples": int(info.get("dominant_pattern_samples", 0) or 0),
+                "pattern_switch_count": int(info.get("pattern_switch_count", 0) or 0),
+                "pattern_last_switch_ts": info.get("pattern_last_switch_ts"),
+                "last_closed_frame_number": info.get("last_closed_frame_number"),
+                "last_closed_segment_pattern": info.get("last_closed_segment_pattern") or [],
+                "last_complete_frame_number": info.get("last_complete_frame_number"),
+                "last_complete_segment_pattern": info.get("last_complete_segment_pattern") or [],
                 "incomplete_frames_dropped": int(info.get("incomplete_frames_dropped", 0) or 0),
+                "last_partial_frame_number": info.get("last_partial_frame_number"),
+                "last_partial_segment_counters": info.get("last_partial_segment_counters") or [],
+                "pipeline_timing_ms": {
+                    "udp_receive": self._summarize_timing(info.get("perf_udp_receive_ms")),
+                    "assemble": self._summarize_timing(info.get("perf_assemble_ms")),
+                    "convert": self._summarize_timing(info.get("perf_convert_ms")),
+                    "store": self._summarize_timing(info.get("perf_store_ms")),
+                    "cycle": self._summarize_timing(info.get("perf_cycle_ms")),
+                },
+                "last_points_count": int(info.get("perf_last_points_count", 0) or 0),
                 "fallback_enabled": bool(info.get("fallback_enabled", False)),
                 "fallback_active_format": info.get("fallback_active_format"),
                 "fallback_activations": int(info.get("fallback_activations", 0) or 0),

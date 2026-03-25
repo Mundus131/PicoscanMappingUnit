@@ -6,6 +6,8 @@ __pycache__/
 .Python
 venv/
 backend/venv/
+tools/picoscan_validation/.venv/
+tools/picoscan_validation/output/
 
 # Node
 node_modules/
@@ -21,6 +23,8 @@ dist/
 *.pem
 test.txt
 tmp_framecheck.py
+backend_server_stdout.log
+backend_server_stderr.log
 
 # Generated gRPC stubs
 backend/app/services/tdc_proto/*_pb2.py

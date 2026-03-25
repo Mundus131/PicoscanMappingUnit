@@ -88,7 +88,16 @@ async def startup_event():
             "distance_mm": 0.0,
             "last_update_ts": None,
             "last_points": [],
-            "accumulated_points": [],
+            "captured_profiles": [],
+            "captured_points_count": 0,
+            "pending_recording_frames": [],
+            "captured_full_points_np": None,
+            "captured_full_cache_dirty": False,
+            "captured_preview_points_np": None,
+            "captured_preview_blob_b64": "",
+            "captured_preview_blob_stride": 4,
+            "captured_preview_cache_dirty": False,
+            "captured_preview_last_encode_ts": 0.0,
             "last_profile_distance_mm": 0.0,
             "profiles_count": 0,
             "devices": [],
@@ -100,6 +109,8 @@ async def startup_event():
             "analysis_points": [],
             "analysis_duration_ms": None,
             "analysis_timestamp_ms": None,
+            "archive_pending": False,
+            "archive_last_error": None,
         }
         acquisition.ensure_encoder_monitor_started(app)
         
@@ -145,9 +156,14 @@ async def startup_event():
         logger.error(f"Error starting TCP notifier: {e}")
 
     try:
-        tdc_monitor = TdcTriggerMonitor(app)
-        tdc_monitor.start()
-        app.state.tdc_monitor = tdc_monitor
+        tdc_enabled = bool((device_manager.tdc_settings or {}).get("enabled", False))
+        if tdc_enabled:
+            tdc_monitor = TdcTriggerMonitor(app)
+            tdc_monitor.start()
+            app.state.tdc_monitor = tdc_monitor
+            logger.info("TDC monitor started")
+        else:
+            logger.info("TDC monitor disabled in configuration; backend running in manual mode")
     except Exception as e:
         logger.error(f"Error starting TDC monitor: {e}")
 

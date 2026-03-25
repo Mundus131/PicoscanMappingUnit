@@ -1,46 +1,6 @@
 {
   "devices": [
     {
-      "device_id": "picoscan_1771697652515",
-      "name": "Pico tr",
-      "ip_address": "192.168.0.1",
-      "port": 2115,
-      "device_type": "picoscan",
-      "protocol": "udp",
-      "format_type": "compact",
-      "enabled": true,
-      "connection_status": "disconnected",
-      "calibration": {
-        "translation": [
-          10.0,
-          0.0,
-          700.0
-        ],
-        "rotation_deg": [
-          0.0,
-          63.0,
-          0.0
-        ],
-        "scale": 1.0
-      },
-      "frame_corner": "top-left",
-      "frame_position": [
-        0.01,
-        0.7,
-        0.0
-      ],
-      "frame_rotation_deg": [
-        0.0,
-        0.0,
-        63.0
-      ],
-      "segments_per_scan": 2,
-      "acquisition_mode": "continuous",
-      "encoder_enabled": false,
-      "speed_profile": "fixed",
-      "lmd_yaw_correction_deg": null
-    },
-    {
       "device_id": "picoscan_1771697913920",
       "name": "pic tl",
       "ip_address": "192.168.0.10",
@@ -74,7 +34,7 @@
         0.0,
         52.70501995952074
       ],
-      "segments_per_scan": 2,
+      "segments_per_scan": 5,
       "acquisition_mode": "continuous",
       "encoder_enabled": false,
       "speed_profile": "fixed",
@@ -98,9 +58,9 @@
     "clip_points_to_frame": false
   },
   "motion_settings": {
-    "mode": "encoder",
-    "fixed_speed_mps": null,
-    "profiling_distance_mm": 30.0,
+    "mode": "fixed",
+    "fixed_speed_mps": 0.1,
+    "profiling_distance_mm": 5.0,
     "encoder_wheel_mode": "circumference",
     "encoder_wheel_value_mm": 200.0,
     "encoder_rps": 0.0
@@ -185,7 +145,7 @@
     ]
   },
   "tdc_settings": {
-    "enabled": true,
+    "enabled": false,
     "ip_address": "192.168.0.100",
     "port": 8081,
     "login": "admin",

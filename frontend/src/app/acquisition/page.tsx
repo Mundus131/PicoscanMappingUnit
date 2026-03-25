@@ -1,10 +1,11 @@
 'use client';
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
 import { SynInteropButton, SynInteropCheckbox } from '@/components/synergy/SynInterop';
+import { decodePointCloudPayload } from '@/lib/pointCloudPayload';
 import { Play, Square, RefreshCw } from 'lucide-react';
 
 interface TriggerStatus {
@@ -30,11 +31,16 @@ interface DeviceHealth {
   latest_data_age_s?: number | null;
   data_rate_hz?: number | null;
   segments_per_scan_configured?: number | null;
-  segments_per_scan_global_default?: number | null;
-  segments_per_scan_runtime?: number | null;
-  segments_per_scan_effective?: number | null;
-  segments_per_scan_estimated?: number | null;
-  segments_estimate_samples?: number;
+  expected_segment_pattern?: number[];
+  dominant_segment_pattern?: number[];
+  dominant_pattern_samples?: number;
+  pattern_switch_count?: number;
+  last_closed_frame_number?: number | null;
+  last_closed_segment_pattern?: number[];
+  last_complete_frame_number?: number | null;
+  last_complete_segment_pattern?: number[];
+  last_partial_frame_number?: number | null;
+  last_partial_segment_counters?: number[];
   incomplete_frames_dropped?: number;
 }
 
@@ -56,15 +62,6 @@ interface PerformanceAnalysisResponse {
     p95_update_ms?: number;
   };
   validation_notes?: string[];
-}
-
-interface SegmentEstimateResponse {
-  device_id: string;
-  segments_per_scan_estimated?: number | null;
-  configured_segments_per_scan?: number | null;
-  samples?: number;
-  applied?: boolean;
-  note?: string;
 }
 
 interface AcquisitionDevice {
@@ -101,9 +98,6 @@ export default function AcquisitionPage() {
   const [devices, setDevices] = useState<AcquisitionDevice[]>([]);
   const [availability, setAvailability] = useState<AvailabilityResponse | null>(null);
   const [performance, setPerformance] = useState<PerformanceAnalysisResponse | null>(null);
-  const [segmentsDeviceId, setSegmentsDeviceId] = useState<string>('');
-  const [estimateBusy, setEstimateBusy] = useState(false);
-  const [estimateResult, setEstimateResult] = useState<SegmentEstimateResponse | null>(null);
   const viewerRef = useRef<PointCloudThreeViewerHandle | null>(null);
   const fitOnceRef = useRef(false);
   const statusStreamRef = useRef<EventSource | null>(null);
@@ -117,11 +111,7 @@ export default function AcquisitionPage() {
   const fetchDevices = async () => {
     try {
       const res = await api.get('/devices/');
-      const loaded = res.data || [];
-      setDevices(loaded);
-      if (!segmentsDeviceId && loaded.length > 0) {
-        setSegmentsDeviceId(loaded[0].device_id);
-      }
+      setDevices(res.data || []);
     } catch {
       // ignore
     }
@@ -175,35 +165,24 @@ export default function AcquisitionPage() {
         max_points: full ? 0 : 30000,
       },
     });
-    setPoints(res.data?.points || []);
+    setPoints(decodePointCloudPayload(res.data));
     fitOnceRef.current = false;
     setHoverPoint(null);
     setViewerKey((v) => v + 1);
   };
 
-  const estimateSegments = async (autoApply = false) => {
-    if (!segmentsDeviceId) return;
-    setEstimateBusy(true);
-    try {
-      const res = await api.post(`/acquisition/segments/estimate/${segmentsDeviceId}`, null, {
-        params: {
-          sample_seconds: 4.0,
-          min_samples: 8,
-          auto_apply: autoApply,
-        },
-      });
-      setEstimateResult(res.data || null);
-      await fetchAvailability();
-      await fetchDevices();
-    } finally {
-      setEstimateBusy(false);
-    }
-  };
+  const fetchLatestEvent = useEffectEvent(async (full = fullCloud) => {
+    await fetchLatest(full);
+  });
+
+  const fetchFrameSettingsEvent = useEffectEvent(async () => {
+    await fetchFrameSettings();
+  });
 
   useEffect(() => {
     fetchStatus();
-    fetchLatest();
-    fetchFrameSettings();
+    fetchLatestEvent();
+    fetchFrameSettingsEvent();
     fetchDevices();
     fetchAvailability();
     fetchPerformance();
@@ -258,7 +237,7 @@ export default function AcquisitionPage() {
     const wasRecording = prevRecordingRef.current;
     const isRecording = !!status.recording;
     if (wasRecording && !isRecording) {
-      fetchLatest();
+      fetchLatestEvent();
     }
     prevRecordingRef.current = isRecording;
   }, [status.recording, fullCloud]);
@@ -484,11 +463,6 @@ export default function AcquisitionPage() {
     // Keep frame overlay in the same visual basis as transformed cloud [z, y, x].
     return { width: frameSize.height, height: frameSize.width };
   }, [frameSize]);
-  const selectedSegmentDeviceName = useMemo(() => {
-    const found = (devices || []).find((d) => d.device_id === segmentsDeviceId);
-    return found ? (found.name || found.device_id) : 'Select device';
-  }, [devices, segmentsDeviceId]);
-
   return (
     <Layout>
       <div className="space-y-6">
@@ -693,9 +667,9 @@ export default function AcquisitionPage() {
             </syn-card>
 
             <syn-card className="app-card">
-              <h2 className="text-xl font-semibold text-slate-900">Device Stream Health & Segments</h2>
+              <h2 className="text-xl font-semibold text-slate-900">Device Stream Health</h2>
               <p className="mt-1 text-xs text-gray-500">
-                Sprawdzenie online/offline i estymacja liczby segmentow przed akwizycja.
+                Pattern-based diagnostyka pelnych skanow i automatycznej rekalkulacji segmentow.
               </p>
 
               <div className="mt-3 grid grid-cols-1 gap-2">
@@ -710,13 +684,19 @@ export default function AcquisitionPage() {
                         <div className={`text-xs font-semibold uppercase ${stClass}`}>{st}</div>
                       </div>
                       <div className="mt-1 text-xs text-gray-500">
-                        cfg(dev): {h?.segments_per_scan_configured ?? '-'} | cfg(global): {h?.segments_per_scan_global_default ?? '-'} | runtime: {h?.segments_per_scan_runtime ?? '-'}
+                        cfg hint: {h?.segments_per_scan_configured ?? '-'} | expected pattern: [{(h?.expected_segment_pattern || []).join(', ')}]
                       </div>
                       <div className="text-xs text-gray-500">
-                        effective: {h?.segments_per_scan_effective ?? '-'} | estimated: {h?.segments_per_scan_estimated ?? '-'} | samples: {h?.segments_estimate_samples ?? 0}
+                        dominant pattern: [{(h?.dominant_segment_pattern || []).join(', ')}] | samples: {h?.dominant_pattern_samples ?? 0} | switches: {h?.pattern_switch_count ?? 0}
                       </div>
                       <div className="text-xs text-gray-500">
-                        dropped incomplete frames: {h?.incomplete_frames_dropped ?? 0}
+                        last closed frame: {h?.last_closed_frame_number ?? '-'} [{(h?.last_closed_segment_pattern || []).join(', ')}]
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        last complete frame: {h?.last_complete_frame_number ?? '-'} [{(h?.last_complete_segment_pattern || []).join(', ')}]
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        last partial frame: {h?.last_partial_frame_number ?? '-'} [{(h?.last_partial_segment_counters || []).join(', ')}] | dropped incomplete: {h?.incomplete_frames_dropped ?? 0}
                       </div>
                       <div className="text-xs text-gray-500">
                         data age: {typeof h?.latest_data_age_s === 'number' ? `${h.latest_data_age_s.toFixed(2)} s` : '-'} | rate: {typeof h?.data_rate_hz === 'number' ? `${h.data_rate_hz.toFixed(1)} Hz` : '-'}
@@ -725,38 +705,6 @@ export default function AcquisitionPage() {
                     </div>
                   );
                 })}
-              </div>
-
-              <div className="mt-4 grid grid-cols-1 gap-3">
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs text-gray-500">Device for segment estimation</span>
-                  <syn-dropdown>
-                    <syn-button slot="trigger" caret="">{selectedSegmentDeviceName}</syn-button>
-                    <syn-menu style={{ minWidth: 260 }}>
-                      {(devices || []).map((d) => (
-                        <syn-menu-item key={`segment-dev-${d.device_id}`} onClick={() => setSegmentsDeviceId(d.device_id)}>
-                          {d.name || d.device_id}
-                        </syn-menu-item>
-                      ))}
-                    </syn-menu>
-                  </syn-dropdown>
-                </label>
-
-                <div className="flex flex-wrap gap-2">
-                  <syn-button onClick={() => estimateSegments(false)} disabled={estimateBusy || !segmentsDeviceId}>
-                    {estimateBusy ? 'Estimating...' : 'Estimate Segments'}
-                  </syn-button>
-                  <syn-button variant="filled" onClick={() => estimateSegments(true)} disabled={estimateBusy || !segmentsDeviceId}>
-                    {estimateBusy ? 'Applying...' : 'Estimate & Apply'}
-                  </syn-button>
-                </div>
-
-                {estimateResult && (
-                  <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-gray-600">
-                    device: {estimateResult.device_id} | est: {estimateResult.segments_per_scan_estimated ?? '-'} | cfg: {estimateResult.configured_segments_per_scan ?? '-'} | samples: {estimateResult.samples ?? 0} | applied: {estimateResult.applied ? 'yes' : 'no'}
-                    {estimateResult.note && <div className="mt-1">{estimateResult.note}</div>}
-                  </div>
-                )}
               </div>
 
               {performance && (
@@ -769,7 +717,7 @@ export default function AcquisitionPage() {
               )}
 
               <footer slot="footer">
-                <small>Segment validation before acquisition startup.</small>
+                <small>Backend now adapts to runtime segment-pattern changes automatically.</small>
               </footer>
             </syn-card>
           </div>

@@ -1,0 +1,2 @@
+scansegmentapi @ git+https://github.com/SICKAG/ScanSegmentAPI
+matplotlib==3.10.6
