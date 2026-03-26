@@ -88,6 +88,28 @@ interface TdcStatusResponse {
   encoder_port?: string | null;
 }
 
+interface IntegrationCatalogApp {
+  application: string;
+  description?: string;
+  mqtt_topic?: string;
+}
+
+interface IntegrationStatusResponse {
+  active_app?: string;
+  mqtt?: {
+    enabled?: boolean;
+    connected?: boolean;
+    broker_reachable?: boolean;
+    broker_host?: string;
+    broker_port?: number;
+    topic_root?: string;
+    last_publish_ts_ms?: number | null;
+    last_error?: string | null;
+  } | null;
+  topics?: string[];
+  catalog?: IntegrationCatalogApp[];
+}
+
 interface LiveAdjustment {
   x: number;
   y: number;
@@ -218,6 +240,7 @@ export default function CalibrationPage() {
   const [acquisitionLiveStatus, setAcquisitionLiveStatus] = useState<AcquisitionLiveStatus | null>(null);
   const [ioState, setIoState] = useState<IoStateResponse | null>(null);
   const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(null);
+  const [integrationStatus, setIntegrationStatus] = useState<IntegrationStatusResponse | null>(null);
   const [tdcSaving, setTdcSaving] = useState(false);
   const [tdcSavedAt, setTdcSavedAt] = useState<number | null>(null);
 
@@ -576,7 +599,7 @@ export default function CalibrationPage() {
       const res = await api.get('/calibration/analysis-settings');
       if (res.data) {
         const active = String(res.data.active_app || 'log').toLowerCase();
-        setAnalysisApp(active === 'none' ? 'none' : 'log');
+        setAnalysisApp(active === 'conveyor_object' ? 'conveyor_object' : active === 'none' ? 'none' : 'log');
         if (typeof res.data.log_window_profiles === 'number') setLogWindowProfiles(res.data.log_window_profiles);
         if (typeof res.data.log_min_points === 'number') setLogMinPoints(res.data.log_min_points);
         if (typeof res.data.conveyor_plane_quantile === 'number') setConvPlaneQuantile(res.data.conveyor_plane_quantile);
@@ -658,6 +681,15 @@ export default function CalibrationPage() {
       setIoState(res.data || null);
     } catch {
       setIoState(null);
+    }
+  };
+
+  const loadIntegrationStatus = async () => {
+    try {
+      const res = await api.get('/integration/status');
+      setIntegrationStatus(res.data || null);
+    } catch {
+      // ignore
     }
   };
 
@@ -791,6 +823,7 @@ export default function CalibrationPage() {
     loadTdcStatus();
     loadAcquisitionLiveStatus();
     loadIoState();
+    loadIntegrationStatus();
     loadSystemMetrics();
   }, []);
 
@@ -807,6 +840,7 @@ export default function CalibrationPage() {
       loadTdcStatus();
       loadAcquisitionLiveStatus();
       loadIoState();
+      loadIntegrationStatus();
       loadSystemMetrics();
     }, 3000);
     return () => clearInterval(interval);
@@ -1780,6 +1814,48 @@ export default function CalibrationPage() {
                       </div>
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+            {integrationStatus && (
+              <div className="mt-3 rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 p-3 text-xs text-gray-600">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold text-gray-700 dark:text-gray-300">MQTT Integration</div>
+                  <div className="text-[11px] text-gray-500">
+                    app: {integrationStatus.active_app || '-'}
+                  </div>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div>publisher: {integrationStatus.mqtt?.enabled ? 'enabled' : 'disabled'}</div>
+                  <div>broker: {integrationStatus.mqtt?.broker_reachable ? 'reachable' : 'offline'}</div>
+                  <div>connected: {integrationStatus.mqtt?.connected ? 'yes' : 'no'}</div>
+                  <div>
+                    host: {integrationStatus.mqtt?.broker_host || '-'}:{integrationStatus.mqtt?.broker_port ?? '-'}
+                  </div>
+                  <div className="col-span-2">
+                    last publish:{' '}
+                    {integrationStatus.mqtt?.last_publish_ts_ms
+                      ? new Date(integrationStatus.mqtt.last_publish_ts_ms).toLocaleTimeString()
+                      : '-'}
+                  </div>
+                  <div className="col-span-2">
+                    topic root: {integrationStatus.mqtt?.topic_root || '-'}
+                  </div>
+                  {integrationStatus.mqtt?.last_error && (
+                    <div className="col-span-2 text-rose-600">
+                      error: {integrationStatus.mqtt.last_error}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-3">
+                  <div className="font-semibold text-gray-700 dark:text-gray-300">Published topics</div>
+                  <div className="mt-1 flex flex-col gap-1">
+                    {(integrationStatus.topics || []).map((topic) => (
+                      <div key={topic} className="rounded border border-slate-200 px-2 py-1 font-mono text-[11px] text-slate-700">
+                        {topic}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}

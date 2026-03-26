@@ -4,6 +4,7 @@ from typing import List, Generator
 from pydantic import BaseModel
 from app.core.device_manager import device_manager
 from app.analysis.log_measurement import compute_log_metrics, build_augmented_cloud
+from app.analysis.conveyor_measurement import compute_conveyor_object_metrics, build_conveyor_augmented_cloud
 from app.analysis.history_store import save_measurement, list_measurements, get_measurement
 from app.services.picoscan_receiver import PicoscanReceiver, PicoscanReceiverManager
 from app.services.lms4000_receiver import Lms4000Receiver
@@ -750,7 +751,7 @@ def _run_analysis_for_session(session: dict, app):
         profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
         analysis_cfg = device_manager.analysis_settings or {}
         analysis_app = str(analysis_cfg.get("active_app", "log") or "log").strip().lower()
-        if analysis_app not in {"log", "none"}:
+        if analysis_app not in {"log", "conveyor_object", "none"}:
             analysis_app = "log"
         session["analysis_timestamp_ms"] = int(time.time() * 1000)
         session["analysis_app"] = analysis_app
@@ -777,6 +778,31 @@ def _run_analysis_for_session(session: dict, app):
                     profiling_distance_mm=profiling_distance_mm,
                     y_min=y_min,
                     y_max=y_max,
+                )
+            elif analysis_app == "conveyor_object":
+                metrics = compute_conveyor_object_metrics(
+                    points,
+                    plane_quantile=float(analysis_cfg.get("conveyor_plane_quantile", 0.35) or 0.35),
+                    plane_inlier_mm=float(analysis_cfg.get("conveyor_plane_inlier_mm", 8.0) or 8.0),
+                    object_min_height_mm=float(analysis_cfg.get("conveyor_object_min_height_mm", 8.0) or 8.0),
+                    localization_algorithm=str(
+                        analysis_cfg.get("conveyor_localization_algorithm", "object_cloud_bbox") or "object_cloud_bbox"
+                    ),
+                    top_plane_quantile=float(analysis_cfg.get("conveyor_top_plane_quantile", 0.88) or 0.88),
+                    top_plane_inlier_mm=float(analysis_cfg.get("conveyor_top_plane_inlier_mm", 4.0) or 4.0),
+                    denoise_enabled=bool(analysis_cfg.get("conveyor_denoise_enabled", True)),
+                    denoise_cell_mm=float(analysis_cfg.get("conveyor_denoise_cell_mm", 8.0) or 8.0),
+                    denoise_min_points_per_cell=int(
+                        analysis_cfg.get("conveyor_denoise_min_points_per_cell", 3) or 3
+                    ),
+                    keep_largest_component=bool(analysis_cfg.get("conveyor_keep_largest_component", True)),
+                )
+                session["analysis_metrics"] = metrics
+                metrics_for_save = metrics
+                session["analysis_points"] = build_conveyor_augmented_cloud(
+                    points,
+                    metrics,
+                    max_points=int(analysis_cfg.get("conveyor_object_max_points", 60000) or 60000),
                 )
             else:
                 # "none" mode: keep only acquisition cloud, skip metric analysis.
@@ -1054,6 +1080,7 @@ def _flatten_output_values(session: dict, analysis_app: str, metrics: dict | Non
                 "volume_mm3": m.get("volume_mm3"),
                 "length_mm": length_mm,
                 "diameter_start_mm": first.get("diameter_mm"),
+                "diameter_middle_mm": diam.get("middle"),
                 "diameter_end_mm": last.get("diameter_mm"),
                 "diameter_avg_mm": diam.get("avg"),
                 "diameter_min_mm": diam.get("min"),
@@ -1111,6 +1138,7 @@ def _apply_output_units(values: dict, cfg: dict) -> dict:
     # Global unit-selected aliases.
     out["length"] = _conv_len(out.get("length_mm"))
     out["diameter_start"] = _conv_len(out.get("diameter_start_mm"))
+    out["diameter_middle"] = _conv_len(out.get("diameter_middle_mm"))
     out["diameter_end"] = _conv_len(out.get("diameter_end_mm"))
     out["diameter_avg"] = _conv_len(out.get("diameter_avg_mm"))
     out["diameter_min"] = _conv_len(out.get("diameter_min_mm"))
@@ -1132,6 +1160,7 @@ def _apply_output_units(values: dict, cfg: dict) -> dict:
 
     out["length_m"] = _to_m(out.get("length_mm"))
     out["diameter_start_m"] = _to_m(out.get("diameter_start_mm"))
+    out["diameter_middle_m"] = _to_m(out.get("diameter_middle_mm"))
     out["diameter_end_m"] = _to_m(out.get("diameter_end_mm"))
     out["diameter_avg_m"] = _to_m(out.get("diameter_avg_mm"))
     out["diameter_min_m"] = _to_m(out.get("diameter_min_mm"))
@@ -1233,7 +1262,7 @@ async def analytics_output_preview(request: Request):
 
     analysis_cfg = device_manager.analysis_settings or {}
     analysis_app = str(session.get("analysis_app") or analysis_cfg.get("active_app", "log") or "log").strip().lower()
-    if analysis_app not in {"log", "none"}:
+    if analysis_app not in {"log", "conveyor_object", "none"}:
         analysis_app = "log"
     metrics = session.get("analysis_metrics")
     source = "session"

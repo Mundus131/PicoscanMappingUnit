@@ -11,6 +11,11 @@ services:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
       - LOG_LEVEL=INFO
+      - MQTT_PUBLISH_ENABLED=true
+      - MQTT_HOST=mqtt-broker
+      - MQTT_PORT=1883
+      - MQTT_TOPIC_ROOT=picocan/pmu
+      - OPCUA_NAMESPACE_URI=urn:picocan:mapping-unit
       # Update this value on target server, e.g.:
       # ["http://192.168.0.100:3000","http://localhost:3000"]
       - CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000","http://192.168.0.100:3000"]
@@ -69,6 +74,43 @@ services:
       restart_policy:
         condition: any
 
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    configs:
+      - source: mosquitto_conf
+        target: /mosquitto/config/mosquitto.conf
+    ports:
+      - target: 1883
+        published: 1883
+        protocol: tcp
+        mode: host
+    networks:
+      - picocan_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
+  opcua-server:
+    image: picocan-opcua-server:arm64
+    environment:
+      - BACKEND_BASE_URL=http://backend:8000/api/v1
+      - MQTT_TOPIC_ROOT=picocan/pmu
+      - OPCUA_NAMESPACE_URI=urn:picocan:mapping-unit
+      - OPCUA_ENDPOINT=opc.tcp://0.0.0.0:4840/freeopcua/server/
+      - POLL_INTERVAL_S=1.0
+    ports:
+      - target: 4840
+        published: 4840
+        protocol: tcp
+        mode: host
+    networks:
+      - picocan_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
 networks:
   picocan_net:
     driver: overlay
@@ -77,3 +119,7 @@ networks:
 volumes:
   backend_logs:
   backend_data:
+
+configs:
+  mosquitto_conf:
+    file: ./integrations/mosquitto/mosquitto.conf

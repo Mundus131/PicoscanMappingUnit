@@ -125,6 +125,9 @@ def compute_log_metrics(
     diameters = [s.diameter_mm for s in slices]
     areas = [s.area_mm2 for s in slices]
     positions = [s.position_mm for s in slices]
+    first_slice = slices[0]
+    last_slice = slices[-1]
+    middle_slice = slices[len(slices) // 2]
 
     volume_mm3 = 0.0
     for i in range(len(slices) - 1):
@@ -147,6 +150,9 @@ def compute_log_metrics(
             "min": float(min(diameters)),
             "max": float(max(diameters)),
             "avg": float(sum(diameters) / len(diameters)),
+            "start": float(first_slice.diameter_mm),
+            "middle": float(middle_slice.diameter_mm),
+            "end": float(last_slice.diameter_mm),
         },
         "volume_mm3": volume_mm3,
         "volume_m3": volume_mm3 / 1e9,

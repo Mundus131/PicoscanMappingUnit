@@ -264,6 +264,30 @@ export default function DashboardPage() {
                   </div>
                 </div>
                 <div>
+                  <div className="text-xs text-gray-500">Diameter start</div>
+                  <div className="text-lg font-semibold text-slate-900">
+                    {typeof (logMetrics?.diameter_mm as Record<string, unknown> | undefined)?.start === 'number'
+                      ? `${((logMetrics?.diameter_mm as Record<string, unknown>).start as number).toFixed(1)} mm`
+                      : '-'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500">Diameter middle</div>
+                  <div className="text-lg font-semibold text-slate-900">
+                    {typeof (logMetrics?.diameter_mm as Record<string, unknown> | undefined)?.middle === 'number'
+                      ? `${((logMetrics?.diameter_mm as Record<string, unknown>).middle as number).toFixed(1)} mm`
+                      : '-'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500">Diameter end</div>
+                  <div className="text-lg font-semibold text-slate-900">
+                    {typeof (logMetrics?.diameter_mm as Record<string, unknown> | undefined)?.end === 'number'
+                      ? `${((logMetrics?.diameter_mm as Record<string, unknown>).end as number).toFixed(1)} mm`
+                      : '-'}
+                  </div>
+                </div>
+                <div>
                   <div className="text-xs text-gray-500">Diameter avg</div>
                   <div className="text-lg font-semibold text-slate-900">
                     {typeof (logMetrics?.diameter_mm as Record<string, unknown> | undefined)?.avg === 'number'

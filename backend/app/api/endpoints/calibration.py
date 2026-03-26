@@ -558,7 +558,7 @@ async def get_tdc_settings():
 async def get_analysis_settings():
     current = dict(device_manager.analysis_settings or {})
     active_app = str(current.get("active_app", "log") or "log").strip().lower()
-    if active_app not in {"log", "none"}:
+    if active_app not in {"log", "conveyor_object", "none"}:
         active_app = "log"
     current["active_app"] = active_app
     return current
@@ -651,7 +651,7 @@ async def update_output_settings(req: OutputSettings, request: Request):
 async def update_analysis_settings(req: AnalysisSettings):
     current = dict(device_manager.analysis_settings or {})
     active_app = str(req.active_app or "log").strip().lower()
-    if active_app not in {"log", "none"}:
+    if active_app not in {"log", "conveyor_object", "none"}:
         active_app = "log"
     loc_algo = (
         req.conveyor_localization_algorithm

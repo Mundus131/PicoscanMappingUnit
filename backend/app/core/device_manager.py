@@ -142,7 +142,7 @@ class DeviceManager:
             if "active_app" not in self.analysis_settings:
                 self.analysis_settings["active_app"] = "log"
             active_app = str(self.analysis_settings.get("active_app", "log") or "log").strip().lower()
-            if active_app not in {"log", "none"}:
+            if active_app not in {"log", "conveyor_object", "none"}:
                 active_app = "log"
             self.analysis_settings["active_app"] = active_app
             if "log_window_profiles" not in self.analysis_settings:
