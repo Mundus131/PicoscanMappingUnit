@@ -394,7 +394,7 @@ def _calc_speed_from_encoder_rpm(rpm: float, motion: dict) -> float | None:
     else:
         circ_m = (encoder_value_mm * np.pi) / 1000.0
     # TDC velocity is RPM (rotations per minute)
-    rps = abs(float(rpm)) / 60.0
+    rps = float(rpm) / 60.0
     return rps * circ_m
 
 
@@ -440,6 +440,7 @@ def _run_encoder_loop(session: dict):
             session["encoder_last_data"] = payload
             session["encoder_rpm"] = rpm
             session["encoder_speed_mps"] = speed_mps
+            session["encoder_sample_monotonic"] = time.monotonic()
             # Keep live speed visible even when trigger recording is stopped.
             session["speed_mps"] = speed_mps
         except Exception as exc:
@@ -489,7 +490,16 @@ def stop_encoder_monitor(app):
     session["encoder_speed_mps"] = None
 
 
+_session_lock = threading.RLock()
+
+
 def _update_session_once(session: dict, receiver_manager):
+    with _session_lock:
+        if session.get("recording"):
+            _update_session_locked(session, receiver_manager)
+
+
+def _update_session_locked(session: dict, receiver_manager):
     if receiver_manager is None:
         return
 
@@ -508,34 +518,53 @@ def _update_session_once(session: dict, receiver_manager):
     if profiling_distance_mm is None:
         profiling_distance_mm = 10.0
 
-    now = time.time()
-    last_ts = session.get("last_update_ts")
+    now = time.monotonic()
+    last_ts = session.get("last_motion_monotonic")
     current_speed_mps = None
     if mode == "fixed":
         current_speed_mps = fixed_speed
     elif mode == "encoder":
         encoder_live_speed = session.get("encoder_speed_mps")
-        if encoder_live_speed is not None:
+        age = now - session.get("encoder_sample_monotonic", float("-inf"))
+        if encoder_live_speed is not None and age <= 0.5:
             current_speed_mps = float(encoder_live_speed)
-        elif encoder_value_mm > 0 and encoder_rps > 0:
-            if encoder_mode == "circumference":
-                circ_m = encoder_value_mm / 1000.0
-            else:
-                circ_m = (encoder_value_mm * np.pi) / 1000.0
-            current_speed_mps = encoder_rps * circ_m
+        else:
+            session.setdefault("quality_issues", set()).add("encoder_stale")
+    if current_speed_mps is not None and current_speed_mps < 0:
+        session.setdefault("quality_issues", set()).add("reverse_motion")
+        current_speed_mps = None
 
     if last_ts is not None:
         dt = max(0.0, now - last_ts)
+        if mode == "encoder" and dt > 0.5:
+            session.setdefault("quality_issues", set()).add("motion_timing_gap")
+            current_speed_mps = None
         if current_speed_mps is not None:
             session["distance_mm"] = float(session.get("distance_mm", 0.0) + current_speed_mps * dt * 1000.0)
-    session["last_update_ts"] = now
+    session["last_motion_monotonic"] = now
+    session["last_update_ts"] = time.time()
     session["speed_mps"] = current_speed_mps
     session["profiling_distance_mm"] = profiling_distance_mm
 
     # fetch point clouds and merge
     try:
         t_fetch = time.perf_counter()
-        point_clouds = receiver_manager.get_point_clouds(num_segments=10)
+        point_clouds = {}
+        consumed = session.setdefault("consumed_frames", {})
+        for device_id in session.get("devices", []):
+            latest = receiver_manager.get_latest_point_cloud(device_id)
+            if not latest or consumed.get(device_id) == latest["frame"]:
+                continue
+            previous_frame = consumed.get(device_id)
+            if previous_frame is not None and latest["frame"] > previous_frame + 1:
+                session.setdefault("quality_issues", set()).add("frames_skipped")
+            consumed[device_id] = latest["frame"]
+            if latest["timestamp"] < session.get("capture_started_ts", 0):
+                continue
+            if time.time() - latest["timestamp"] > 0.15:
+                session.setdefault("quality_issues", set()).add("scanner_stale")
+                continue
+            point_clouds[device_id] = latest["points"]
         _record_session_stage(session, "fetch_clouds", (time.perf_counter() - t_fetch) * 1000.0)
         point_clouds_to_merge = []
         for device_id, points in point_clouds.items():
@@ -572,13 +601,6 @@ def _update_session_once(session: dict, receiver_manager):
                         pts[:, 3] = 0.0
                 except Exception:
                     pass
-            # limit size for transport
-            max_points = 20000
-            if len(pts) > max_points:
-                step = max(1, len(pts) // max_points)
-                pts = pts[::step]
-                if len(pts) > max_points:
-                    pts = pts[:max_points]
             session["last_points_np"] = np.asarray(pts, dtype=np.float32)
             # Avoid expensive list conversion on every loop iteration.
             # UI does not need 20Hz full serialization.
@@ -589,61 +611,33 @@ def _update_session_once(session: dict, receiver_manager):
                 session["last_points"] = pts.tolist()
                 _record_session_stage(session, "serialize_points", (time.perf_counter() - t_serialize) * 1000.0)
                 session["last_points_emit_ts"] = now_emit
-            if session.get("recording"):
+            if session.get("recording") and current_speed_mps is not None:
                 t_stack = time.perf_counter()
-                pending_frames = session.get("pending_recording_frames")
-                if isinstance(pending_frames, list):
-                    pending_frames.append(np.array(pts, copy=True))
+                session["pending_recording_frames"] = []
 
             # Build 3D stack along Z based on traveled distance
-            if session.get("recording"):
+            if session.get("recording") and current_speed_mps is not None:
                 last_profile_distance = float(session.get("last_profile_distance_mm", 0.0))
                 distance_mm = float(session.get("distance_mm", 0.0))
                 delta = distance_mm - last_profile_distance
                 # apply distance-based start delay by skipping accumulation
                 delay_remaining = float(session.get("start_delay_mm_remaining", 0.0))
-                if delay_remaining > 0:
-                    if delta > 0:
-                        remaining = max(0.0, delay_remaining - delta)
-                        session["start_delay_mm_remaining"] = remaining
+                if distance_mm < delay_remaining:
                     return
                 if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
-                    profiles_to_add = int(delta // profiling_distance_mm)
+                    profiles_to_add = 1
                     profiles_added_in_cycle = profiles_to_add
-                    pending_frames = session.get("pending_recording_frames")
-                    if isinstance(pending_frames, list) and len(pending_frames) > 0:
-                        try:
-                            profile_points = np.vstack(pending_frames).astype(np.float32)
-                        except Exception:
-                            profile_points = np.asarray(pts, dtype=np.float32)
-                        pending_frames.clear()
-                    else:
-                        profile_points = np.asarray(pts, dtype=np.float32)
-                    if profiles_to_add == 1:
-                        step_distance = last_profile_distance + profiling_distance_mm
-                        if profile_points.shape[1] >= 3:
-                            prof = profile_points.copy()
-                            prof[:, 1] = step_distance
-                        else:
-                            prof = profile_points
-                        _append_profile_to_session_cache(session, prof)
-                    else:
-                        for i in range(profiles_to_add):
-                            step_distance = last_profile_distance + profiling_distance_mm * (i + 1)
-                            if profile_points.shape[1] >= 3:
-                                prof = profile_points.copy()
-                                # Use data Y as motion axis (matches x/z scan plane in UI)
-                                prof[:, 1] = step_distance
-                            else:
-                                prof = profile_points
-                            _append_profile_to_session_cache(session, prof)
+                    prof = np.array(pts, dtype=np.float32, copy=True)
+                    prof[:, 1] = distance_mm
+                    _append_profile_to_session_cache(session, prof)
                     session["profiles_count"] = int(session.get("profiles_count", 0) + profiles_to_add)
                     # Keep full acquisition points for analysis fidelity.
                     # Visualization endpoints apply their own max_points downsampling.
-                    session["last_profile_distance_mm"] = last_profile_distance + profiling_distance_mm * profiles_to_add
+                    session["last_profile_distance_mm"] = distance_mm
                 _record_session_stage(session, "recording_stack", (time.perf_counter() - t_stack) * 1000.0)
     except Exception:
-        pass
+        session.setdefault("quality_issues", set()).add("acquisition_error")
+        logger.exception("Acquisition update failed")
     finally:
         loop_ms = (time.perf_counter() - t_loop_start) * 1000.0
         perf_loop = session.get("perf_loop_ms")
@@ -672,6 +666,11 @@ def _run_acquisition_loop(app):
             time.sleep(0.05)
 
 def start_trigger_session(app):
+    with _session_lock:
+        return _start_trigger_session_locked(app)
+
+
+def _start_trigger_session_locked(app):
     """Start acquisition session (profile recording) for internal calls."""
     session = _get_session_from_app(app)
     if session.get("recording"):
@@ -687,6 +686,11 @@ def start_trigger_session(app):
     session["recording"] = True
     session["distance_mm"] = 0.0
     session["last_update_ts"] = time.time()
+    session["capture_started_ts"] = time.time()
+    session["last_motion_monotonic"] = time.monotonic()
+    session["consumed_frames"] = {}
+    session["quality_issues"] = set()
+    session["analysis_pending"] = False
     session["captured_profiles"] = []
     session["captured_points_count"] = 0
     session["pending_recording_frames"] = []
@@ -711,10 +715,13 @@ def start_trigger_session(app):
     session["archive_last_error"] = None
     session["last_points_np"] = None
     session["last_points_emit_ts"] = 0.0
-    session["start_delay_mm_remaining"] = 0.0
+    tdc_cfg = device_manager.tdc_settings or {}
+    session["start_delay_mm_remaining"] = (
+        float(tdc_cfg.get("start_delay_mm", 0) or 0)
+        if tdc_cfg.get("enabled") and tdc_cfg.get("start_delay_mode") == "distance" else 0.0
+    )
     session["devices"] = [d.device_id for d in device_manager.get_all_devices() if d.enabled]
     _sync_encoder_worker(session)
-    _update_session_once(session, app.state.receiver_manager)
     return session
 
 
@@ -741,13 +748,7 @@ def _run_analysis_for_session(session: dict, app):
         t0 = time.time()
         points_np = _get_captured_full_points_np(session)
         points = points_np.tolist() if isinstance(points_np, np.ndarray) and points_np.shape[0] > 0 else []
-        # If no accumulated profiles were created (e.g. encoder mode without enough
-        # movement), use latest cloud as fallback so analysis reflects current run.
-        if not points:
-            latest = session.get("last_points") or []
-            if latest:
-                points = latest
-                session["profiles_count"] = max(1, int(session.get("profiles_count", 0) or 0))
+        # A preview without measured motion is not a valid length measurement.
         profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
         analysis_cfg = device_manager.analysis_settings or {}
         analysis_app = str(analysis_cfg.get("active_app", "log") or "log").strip().lower()
@@ -831,6 +832,7 @@ def _run_analysis_for_session(session: dict, app):
                 "distance_mm": session.get("distance_mm", 0.0),
                 "devices": session.get("devices", []),
                 "analysis_duration_ms": session.get("analysis_duration_ms"),
+                "quality_issues": sorted(session.get("quality_issues", set())),
             }
             _save_measurement_async(session, payload)
             logger.info(
@@ -847,6 +849,7 @@ def _run_analysis_for_session(session: dict, app):
             session["analysis_timestamp_ms"] = None
             logger.info("Analysis skipped: no points available for current session")
     except Exception:
+        logger.exception("Session analysis failed")
         session["analysis_metrics"] = None
         session["analysis_points"] = []
         session["analysis_duration_ms"] = None
@@ -854,6 +857,11 @@ def _run_analysis_for_session(session: dict, app):
 
 
 def stop_trigger_session(app):
+    with _session_lock:
+        return _stop_trigger_session_locked(app)
+
+
+def _stop_trigger_session_locked(app):
     """Stop acquisition session for internal calls."""
     session = _get_session_from_app(app)
     if not session.get("recording"):
@@ -866,10 +874,23 @@ def stop_trigger_session(app):
         pass
     session["recording"] = False
     _sync_encoder_worker(session)
-    stop_event = session.get("worker_stop_event")
-    if stop_event:
-        stop_event.set()
-    _run_analysis_for_session(session, app)
+    # Analyze an isolated snapshot so trigger polling can continue immediately.
+    snapshot = dict(session)
+    snapshot["captured_profiles"] = list(session.get("captured_profiles", []))
+    snapshot["quality_issues"] = set(session.get("quality_issues", set()))
+    capture_id = session.get("capture_started_ts")
+    session["analysis_pending"] = True
+
+    def analyze():
+        _run_analysis_for_session(snapshot, app)
+        with _session_lock:
+            if session.get("capture_started_ts") == capture_id:
+                session["analysis_pending"] = False
+                for key in ("analysis_metrics", "analysis_points", "analysis_duration_ms",
+                            "analysis_timestamp_ms", "analysis_app"):
+                    session[key] = snapshot.get(key)
+
+    threading.Thread(target=analyze, daemon=True, name="capture-analysis").start()
     session["pending_recording_frames"] = []
     return session
 
@@ -1483,6 +1504,8 @@ async def trigger_status(request: Request):
         "points_count": len(session.get("last_points") or []),
         "last_update_ts": session.get("last_update_ts"),
         "tdc_input_state": tdc_label,
+        "analysis_pending": bool(session.get("analysis_pending", False)),
+        "quality_issues": sorted(session.get("quality_issues", set())),
         "trigger_source": session.get("trigger_source", "manual"),
         "devices_online": len(availability["online_ids"]),
         "devices_enabled": availability["enabled_total"],
@@ -1510,6 +1533,8 @@ async def trigger_status_stream(request: Request):
                 "points_count": len(session.get("last_points") or []),
                 "last_update_ts": session.get("last_update_ts"),
                 "tdc_input_state": tdc_label,
+                "analysis_pending": bool(session.get("analysis_pending", False)),
+                "quality_issues": sorted(session.get("quality_issues", set())),
                 "trigger_source": session.get("trigger_source", "manual"),
                 "archive_pending": bool(session.get("archive_pending", False)),
                 "archive_last_error": session.get("archive_last_error"),

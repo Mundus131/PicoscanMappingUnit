@@ -198,6 +198,9 @@ async def shutdown_event():
         if app.state.tdc_monitor:
             app.state.tdc_monitor.stop()
         acquisition.stop_encoder_monitor(app)
+        session = getattr(app.state, "acquisition_session", None) or {}
+        if session.get("worker_stop_event"):
+            session["worker_stop_event"].set()
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 

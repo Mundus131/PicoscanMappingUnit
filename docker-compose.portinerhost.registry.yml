@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   backend:
-    image: ghcr.io/mundus131/picocan-backend:arm64
+    image: ghcr.io/mundus131/picoscan-backend:arm64
     container_name: picocan-backend
     restart: unless-stopped
     network_mode: host
@@ -27,7 +27,7 @@ services:
       # - ./backend/config/picoscans_config.json:/app/config/picoscans_config.json
 
   frontend:
-    image: ghcr.io/mundus131/picocan-frontend:arm64
+    image: ghcr.io/mundus131/picoscan-frontend:arm64
     container_name: picocan-frontend
     restart: unless-stopped
     dns:
@@ -46,8 +46,17 @@ services:
     container_name: picocan-mqtt-broker
     restart: unless-stopped
     network_mode: host
-    volumes:
-      - ./integrations/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat >/mosquitto/config/mosquitto.conf <<'EOF'
+        listener 1883 0.0.0.0
+        allow_anonymous true
+        persistence false
+        log_dest stdout
+        EOF
+        exec /docker-entrypoint.sh /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
 
   opcua-server:
     image: ghcr.io/mundus131/picocan-opcua-server:arm64

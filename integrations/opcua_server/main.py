@@ -67,7 +67,7 @@ async def main():
         print(f"[opcua-server] listening on {OPCUA_ENDPOINT}", flush=True)
         while True:
             try:
-                bundle = fetch_bundle()
+                bundle = await asyncio.to_thread(fetch_bundle)
                 node_map = bundle.get("opcua_nodes") or {}
                 for full_name, meta in node_map.items():
                     if not isinstance(meta, dict):

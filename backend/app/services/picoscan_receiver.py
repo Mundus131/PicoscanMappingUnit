@@ -1132,6 +1132,8 @@ class PicoscanReceiverManager:
             pts = info.get("latest_points")
         else:
             with lock:
+                frame = int(info.get("frame_counter", 0))
+                ts = info.get("latest_update_ts")
                 src = info.get("latest_points")
                 if src is not None:
                     pts = np.array(src, copy=True)

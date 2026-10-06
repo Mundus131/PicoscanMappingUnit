@@ -1,6 +1,7 @@
 import logging
 from fastapi import APIRouter, HTTPException, Request
 from app.core.device_manager import device_manager
+from app.services.tdc_trigger_monitor import TdcTriggerMonitor
 from app.schemas.device import (
     AutoCalibrationRequest,
     AutoCalibrationResponse,
@@ -721,7 +722,7 @@ async def update_analysis_settings(req: AnalysisSettings):
 
 
 @router.put("/tdc-settings")
-async def update_tdc_settings(req: TdcSettings):
+async def update_tdc_settings(req: TdcSettings, request: Request):
     device_manager.tdc_settings = {
         "enabled": req.enabled,
         "ip_address": req.ip_address,
@@ -742,4 +743,18 @@ async def update_tdc_settings(req: TdcSettings):
         "stop_delay_mm": req.stop_delay_mm or 0.0,
     }
     device_manager._save_to_json()
+
+    current_monitor = getattr(request.app.state, "tdc_monitor", None)
+    if bool(req.enabled):
+        if not current_monitor or not getattr(current_monitor, "_thread", None) or not current_monitor._thread.is_alive():
+            monitor = TdcTriggerMonitor(request.app)
+            monitor.start()
+            request.app.state.tdc_monitor = monitor
+    else:
+        if current_monitor:
+            current_monitor.stop()
+            request.app.state.tdc_monitor = None
+        request.app.state.tdc_input_state = None
+        request.app.state.tdc_input_ts = None
+
     return device_manager.tdc_settings
