@@ -2,13 +2,15 @@
 
 import React, { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
+import MeasurementQualityNotice from '@/components/controls/MeasurementQualityNotice';
+import type { MeasurementQuality } from '@/lib/measurementQuality';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
 import { SynInteropButton, SynInteropCheckbox } from '@/components/synergy/SynInterop';
 import { decodePointCloudPayload } from '@/lib/pointCloudPayload';
 import { Play, Square, RefreshCw } from 'lucide-react';
 
-interface TriggerStatus {
+interface TriggerStatus extends MeasurementQuality {
   recording: boolean;
   distance_mm: number;
   speed_mps: number | null;
@@ -466,6 +468,7 @@ export default function AcquisitionPage() {
   return (
     <Layout>
       <div className="space-y-6">
+        <MeasurementQualityNotice quality={status} />
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">Acquisition</h1>

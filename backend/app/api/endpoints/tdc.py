@@ -24,6 +24,8 @@ async def tdc_status(request: Request):
         "input_ts": getattr(request.app.state, "tdc_input_ts", None),
         "encoder_rpm": session.get("encoder_rpm"),
         "encoder_speed_mps": session.get("encoder_speed_mps"),
+        "encoder_error": session.get("encoder_error") or "",
+        "encoder_error_message": session.get("encoder_error_message") or "",
         "poll_interval_ms": cfg.get("poll_interval_ms"),
     }
 

@@ -49,8 +49,85 @@ def variant_type_for(data_type: str) -> ua.VariantType:
     return mapping.get(data_type, ua.VariantType.String)
 
 
-async def set_variable_value(node, value: Any, data_type: str):
-    await node.write_value(ua.DataValue(ua.Variant(value, variant_type_for(data_type))))
+async def set_variable_value(node, value: Any, data_type: str, status_code: int = ua.StatusCodes.Good):
+    await node.write_value(ua.DataValue(
+        ua.Variant(value, variant_type_for(data_type)),
+        StatusCode_=ua.StatusCode(status_code),
+    ))
+
+
+def result_status_code(full_name: str, meta: dict[str, Any]) -> int:
+    if full_name.startswith("Applications.") and meta.get("data_type") in {"Double", "Int64"}:
+        quality = meta.get("quality_status", "unknown")
+        if quality == "invalid":
+            return ua.StatusCodes.BadDataLost
+        if quality != "valid":
+            return ua.StatusCodes.Uncertain
+    return ua.StatusCodes.Good
+
+
+class BundleWriter:
+    def __init__(self, objects, namespace_idx: int):
+        self.objects = objects
+        self.namespace_idx = namespace_idx
+        self.folders: dict[str, Any] = {}
+        self.variables: dict[str, Any] = {}
+        self.last_values: dict[str, dict[str, Any]] = {}
+
+    async def mark_unavailable(self, names=None):
+        # Do not read the old DataValue: reads can raise for an already bad node.
+        for name in list(self.variables) if names is None else names:
+            meta = self.last_values[name]
+            value = meta["value"]
+            if name.endswith((".result_ready", ".measurement_valid")):
+                value = False
+            try:
+                await set_variable_value(
+                    self.variables[name], value, meta["data_type"], ua.StatusCodes.BadNoCommunication,
+                )
+            except Exception as exc:
+                # Continue invalidating other nodes even if one write fails.
+                print(f"[opcua-server] cannot invalidate {name}: {exc}", flush=True)
+
+    async def apply(self, bundle: dict[str, Any]):
+        try:
+            node_map = bundle.get("opcua_nodes")
+            if not isinstance(node_map, dict):
+                raise ValueError("Bundle must contain an opcua_nodes mapping")
+            updated = set()
+            for full_name, meta in node_map.items():
+                if not isinstance(meta, dict):
+                    continue
+                parts = str(full_name or "").split(".")
+                if len(parts) < 2 or "value" not in meta:
+                    continue
+                data_type = str(meta.get("data_type") or "String")
+                value = meta["value"]
+                node = self.variables.get(full_name)
+                if node is None:
+                    parent = await ensure_path(self.objects, ".".join(parts[:-1]), self.namespace_idx, self.folders)
+                    node = await parent.add_variable(
+                        self.namespace_idx, parts[-1], ua.Variant(value, variant_type_for(data_type)),
+                    )
+                    self.variables[full_name] = node
+                cached = {"value": value, "data_type": data_type}
+                self.last_values.setdefault(full_name, cached)
+                await set_variable_value(node, value, data_type, result_status_code(full_name, meta))
+                self.last_values[full_name] = cached
+                updated.add(full_name)
+            await self.mark_unavailable(set(self.variables) - updated)
+        except Exception:
+            await self.mark_unavailable()
+            raise
+
+    async def poll(self):
+        try:
+            bundle = await asyncio.to_thread(fetch_bundle)
+            await self.apply(bundle)
+            return bundle
+        except Exception:
+            await self.mark_unavailable()
+            raise
 
 
 async def main():
@@ -60,32 +137,14 @@ async def main():
     server.set_server_name("PicoScan Mapping Unit OPC UA")
     namespace_idx = await server.register_namespace(NAMESPACE_URI)
     objects = server.nodes.objects
-    folders: dict[str, Any] = {}
-    variables: dict[str, Any] = {}
+    writer = BundleWriter(objects, namespace_idx)
 
     async with server:
         print(f"[opcua-server] listening on {OPCUA_ENDPOINT}", flush=True)
         while True:
             try:
-                bundle = await asyncio.to_thread(fetch_bundle)
+                bundle = await writer.poll()
                 node_map = bundle.get("opcua_nodes") or {}
-                for full_name, meta in node_map.items():
-                    if not isinstance(meta, dict):
-                        continue
-                    parts = str(full_name or "").split(".")
-                    if len(parts) < 2:
-                        continue
-                    folder_path = ".".join(parts[:-1])
-                    leaf = parts[-1]
-                    parent = await ensure_path(objects, folder_path, namespace_idx, folders)
-                    node = variables.get(full_name)
-                    value = meta.get("value")
-                    data_type = str(meta.get("data_type") or "String")
-                    if node is None:
-                        node = await parent.add_variable(namespace_idx, leaf, value)
-                        await node.set_writable(False)
-                        variables[full_name] = node
-                    await set_variable_value(node, value, data_type)
                 print(
                     f"[opcua-server] updated {len(node_map)} node(s), active_app={bundle.get('active_app')}",
                     flush=True,

@@ -4,6 +4,7 @@ import json
 import os
 import time
 from typing import Any, Dict, List
+from app.analysis.measurement_quality import measurement_quality
 
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "data", "history")
 
@@ -27,6 +28,7 @@ def save_measurement(payload: Dict[str, Any], keep_last: int = 10) -> Dict[str, 
         "id": meas_id,
         "created_at": ts,
         **payload,
+        **measurement_quality(payload),
     }
     path = os.path.join(HISTORY_DIR, f"{meas_id}.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -59,6 +61,7 @@ def list_measurements() -> List[Dict[str, Any]]:
                 "augmented_points_count": len(data.get("augmented_points") or []),
                 "analysis_duration_ms": data.get("analysis_duration_ms"),
                 "metrics": data.get("metrics"),
+                **measurement_quality(data),
             })
         except Exception:
             continue
@@ -73,6 +76,7 @@ def get_measurement(meas_id: str) -> Dict[str, Any] | None:
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return {**data, **measurement_quality(data)}
     except Exception:
         return None

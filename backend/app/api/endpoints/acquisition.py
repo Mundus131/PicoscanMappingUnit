@@ -6,10 +6,13 @@ from app.core.device_manager import device_manager
 from app.analysis.log_measurement import compute_log_metrics, build_augmented_cloud
 from app.analysis.conveyor_measurement import compute_conveyor_object_metrics, build_conveyor_augmented_cloud
 from app.analysis.history_store import save_measurement, list_measurements, get_measurement
+from app.analysis.measurement_quality import measurement_quality
 from app.services.picoscan_receiver import PicoscanReceiver, PicoscanReceiverManager
 from app.services.lms4000_receiver import Lms4000Receiver
 from app.services.point_cloud_processor import PointCloudProcessor, PointCloud
 from app.services import tdc_rest
+from app.services.capture_pipeline import MotionHistory, FrameSynchronizer
+from collections import deque
 import logging
 import json
 import time
@@ -17,6 +20,7 @@ import asyncio
 import numpy as np
 import threading
 import base64
+import copy
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -387,7 +391,7 @@ def _get_captured_full_points_np(session: dict) -> np.ndarray:
 def _calc_speed_from_encoder_rpm(rpm: float, motion: dict) -> float | None:
     encoder_mode = motion.get("encoder_wheel_mode", "diameter") or "diameter"
     encoder_value_mm = float(motion.get("encoder_wheel_value_mm", 0.0) or 0.0)
-    if encoder_value_mm <= 0:
+    if not np.isfinite(encoder_value_mm) or encoder_value_mm <= 0:
         return None
     if encoder_mode == "circumference":
         circ_m = encoder_value_mm / 1000.0
@@ -410,13 +414,23 @@ def _extract_encoder_rpm(payload: dict) -> float | None:
         )
         if raw is None:
             return None
-        return float(raw)
+        value = float(raw)
+        return value if np.isfinite(value) else None
     except Exception:
         return None
 
 
+def _set_encoder_error(session, code, message):
+    if session.get("encoder_error") != code:
+        logger.warning("Encoder status: %s: %s", code, message)
+    session["encoder_error"] = code
+    session["encoder_error_message"] = message
+
+
 def _run_encoder_loop(session: dict):
     stop_event = session.get("encoder_stop_event")
+    history = session.setdefault("motion_history", MotionHistory())
+    previous_config = None
     while stop_event and not stop_event.is_set():
         motion = device_manager.motion_settings or {}
         if (motion.get("mode", "fixed") or "fixed") != "encoder":
@@ -426,25 +440,51 @@ def _run_encoder_loop(session: dict):
             continue
 
         tdc_cfg = device_manager.tdc_settings or {}
+        config = (motion.get("encoder_wheel_mode"), motion.get("encoder_wheel_value_mm"),
+                  tdc_cfg.get("ip_address"), tdc_cfg.get("encoder_port"))
+        if previous_config is not None and config != previous_config:
+            history.add(time.monotonic(), None)
+        previous_config = config
         poll_interval_ms = max(50, int(tdc_cfg.get("poll_interval_ms", 200) or 200))
         if not bool(tdc_cfg.get("enabled", False)):
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
+            history.add(time.monotonic(), None)
+            _set_encoder_error(session, "encoder_disabled", "TDC encoder polling is disabled.")
             time.sleep(poll_interval_ms / 1000.0)
             continue
 
         try:
+            request_started = time.monotonic()
             payload = tdc_rest.fetch_encoder_process_data(data_format="iodd")
+            received = time.monotonic()
             rpm = _extract_encoder_rpm(payload)
             speed_mps = _calc_speed_from_encoder_rpm(rpm, motion) if rpm is not None else None
+            if rpm is None:
+                _set_encoder_error(session, "encoder_velocity_missing",
+                    "Missing decoded Velocity. Check encoder IODD on TDC and IO-Link port; byteArray is not a speed reading.")
+            elif speed_mps is None or not np.isfinite(speed_mps):
+                speed_mps = None
+                _set_encoder_error(session, "encoder_wheel_invalid", "Encoder wheel circumference/diameter must be finite and positive.")
+            elif speed_mps < 0:
+                _set_encoder_error(session, "reverse_motion", "Reverse encoder motion is not supported for length measurement.")
+            elif received - request_started > 0.5:
+                speed_mps = None
+                _set_encoder_error(session, "encoder_latency", "Encoder response exceeded 500 ms; sample timing is unreliable.")
+            else:
+                session["encoder_error"] = None
+                session["encoder_error_message"] = None
+            # Response receipt is a host-time estimate, not a hardware encoder timestamp.
+            history.add(received, speed_mps)
             session["encoder_last_data"] = payload
             session["encoder_rpm"] = rpm
             session["encoder_speed_mps"] = speed_mps
-            session["encoder_sample_monotonic"] = time.monotonic()
+            session["encoder_sample_monotonic"] = received
             # Keep live speed visible even when trigger recording is stopped.
             session["speed_mps"] = speed_mps
         except Exception as exc:
-            logger.debug("Encoder poll failed: %s", exc)
+            history.add(time.monotonic(), None)
+            _set_encoder_error(session, "encoder_read_failed", "TDC encoder read failed (" + type(exc).__name__ + "). Check connection, token and IO-Link port.")
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
 
@@ -499,159 +539,165 @@ def _update_session_once(session: dict, receiver_manager):
             _update_session_locked(session, receiver_manager)
 
 
+def _capture_quality(session):
+    return measurement_quality(session)
+
+
+def _position_for_frame(session, stamp):
+    motion = session["capture_motion"]
+    start = session["capture_started_monotonic"]
+    if motion.get("mode", "fixed") == "fixed":
+        speed = motion.get("fixed_speed_mps")
+        if speed is None or not np.isfinite(speed) or speed < 0:
+            return None, "motion_configuration_invalid"
+        return (stamp - start) * float(speed) * 1000, None
+    history = session["motion_history"]
+    origin = session.get("capture_motion_origin")
+    if origin is None:
+        origin, error = history.position(start)
+        if error:
+            return None, error
+        session["capture_motion_origin"] = origin
+    target, error = history.position(stamp)
+    if error:
+        return None, error
+    if origin[1] != target[1]:
+        return None, "encoder_history_gap"
+    return target[0] - origin[0], None
+
+
+def _consume_positioned_groups(session, final=False):
+    issues = session.setdefault("quality_issues", set())
+    pending = session["pending_profile_groups"]
+    added = 0
+    while pending:
+        group = pending[0]
+        positions = {}
+        errors = []
+        for device_id, frame in group.items():
+            position, error = _position_for_frame(session, frame["received_monotonic"])
+            positions[device_id] = position
+            if error:
+                errors.append(error)
+        if "pending" in errors and not final:
+            break  # Wait for the next encoder sample instead of extrapolating speed.
+        pending.popleft()
+        if errors:
+            issues.update("encoder_unbracketed_frame" if e == "pending" else e for e in errors)
+            continue
+        distance = sum(positions.values()) / len(positions)
+        session["distance_mm"] = max(session.get("distance_mm", 0.0), distance)
+        spacing = session["profiling_distance_mm"]
+        if distance < session.get("start_delay_mm_remaining", 0.0):
+            continue
+        if distance - session.get("last_profile_distance_mm", 0.0) < spacing:
+            continue
+        clouds = []
+        for device_id, frame in group.items():
+            calibration = session["capture_calibrations"].get(device_id)
+            if calibration is None:
+                issues.add("device_configuration_missing")
+                break
+            merged = PointCloudProcessor.merge_point_clouds([(frame["points"], calibration)])
+            points = np.asarray(merged.points, dtype=np.float32).copy()
+            if not len(points):
+                issues.add("empty_scanner_frame")
+                break
+            if getattr(merged, "intensities", None) is not None and len(merged.intensities) == len(points):
+                points = np.column_stack([points, merged.intensities])
+            elif points.shape[1] == 3:
+                points = np.column_stack([points, np.zeros(len(points), dtype=np.float32)])
+            # Each scanner retains its own interpolated position, including pairing skew.
+            points[:, 1] = positions[device_id]
+            clouds.append(points)
+        else:
+            profile = np.vstack(clouds).astype(np.float32)
+            _append_profile_to_session_cache(session, profile)
+            session.setdefault("captured_profile_positions", []).append(distance)
+            session["profiles_count"] = session.get("profiles_count", 0) + 1
+            session["last_profile_distance_mm"] = distance
+            session["last_points_np"] = profile
+            added += 1
+    return added
+
+
 def _update_session_locked(session: dict, receiver_manager):
     if receiver_manager is None:
         return
-
     t_loop_start = time.perf_counter()
-    profiles_added_in_cycle = 0
-    _sync_encoder_worker(session)
-
-    # update distance based on motion settings
-    motion = device_manager.motion_settings or {}
-    mode = motion.get("mode", "fixed")
-    fixed_speed = motion.get("fixed_speed_mps", 0.0) or 0.0
-    encoder_rps = motion.get("encoder_rps", 0.0) or 0.0
-    encoder_mode = motion.get("encoder_wheel_mode", "diameter") or "diameter"
-    encoder_value_mm = motion.get("encoder_wheel_value_mm", 0.0) or 0.0
-    profiling_distance_mm = motion.get("profiling_distance_mm", None)
-    if profiling_distance_mm is None:
-        profiling_distance_mm = 10.0
-
-    now = time.monotonic()
-    last_ts = session.get("last_motion_monotonic")
-    current_speed_mps = None
-    if mode == "fixed":
-        current_speed_mps = fixed_speed
-    elif mode == "encoder":
-        encoder_live_speed = session.get("encoder_speed_mps")
-        age = now - session.get("encoder_sample_monotonic", float("-inf"))
-        if encoder_live_speed is not None and age <= 0.5:
-            current_speed_mps = float(encoder_live_speed)
-        else:
-            session.setdefault("quality_issues", set()).add("encoder_stale")
-    if current_speed_mps is not None and current_speed_mps < 0:
-        session.setdefault("quality_issues", set()).add("reverse_motion")
-        current_speed_mps = None
-
-    if last_ts is not None:
-        dt = max(0.0, now - last_ts)
-        if mode == "encoder" and dt > 0.5:
-            session.setdefault("quality_issues", set()).add("motion_timing_gap")
-            current_speed_mps = None
-        if current_speed_mps is not None:
-            session["distance_mm"] = float(session.get("distance_mm", 0.0) + current_speed_mps * dt * 1000.0)
-    session["last_motion_monotonic"] = now
-    session["last_update_ts"] = time.time()
-    session["speed_mps"] = current_speed_mps
-    session["profiling_distance_mm"] = profiling_distance_mm
-
-    # fetch point clouds and merge
+    issues = session.setdefault("quality_issues", set())
     try:
-        t_fetch = time.perf_counter()
-        point_clouds = {}
-        consumed = session.setdefault("consumed_frames", {})
-        for device_id in session.get("devices", []):
-            latest = receiver_manager.get_latest_point_cloud(device_id)
-            if not latest or consumed.get(device_id) == latest["frame"]:
-                continue
-            previous_frame = consumed.get(device_id)
-            if previous_frame is not None and latest["frame"] > previous_frame + 1:
-                session.setdefault("quality_issues", set()).add("frames_skipped")
-            consumed[device_id] = latest["frame"]
-            if latest["timestamp"] < session.get("capture_started_ts", 0):
-                continue
-            if time.time() - latest["timestamp"] > 0.15:
-                session.setdefault("quality_issues", set()).add("scanner_stale")
-                continue
-            point_clouds[device_id] = latest["points"]
-        _record_session_stage(session, "fetch_clouds", (time.perf_counter() - t_fetch) * 1000.0)
-        point_clouds_to_merge = []
-        for device_id, points in point_clouds.items():
-            device = device_manager.get_device(device_id)
-            if not device:
-                continue
-            if points is None or len(points) == 0:
-                continue
-            point_clouds_to_merge.append((points, device.calibration))
-
-        if point_clouds_to_merge:
-            t_merge = time.perf_counter()
-            merged = PointCloudProcessor.merge_point_clouds(point_clouds_to_merge)
-            _record_session_stage(session, "merge_clouds", (time.perf_counter() - t_merge) * 1000.0)
-            pts = merged.points
-            if getattr(merged, "intensities", None) is not None:
-                try:
-                    if len(merged.intensities) == len(merged.points):
-                        pts = np.column_stack([merged.points, merged.intensities])
-                except Exception:
-                    pts = merged.points
-            t_filter = time.perf_counter()
-            pts = _apply_configured_preview_filters(pts)
-            _record_session_stage(session, "preview_filters", (time.perf_counter() - t_filter) * 1000.0)
-            # Normalize RSSI to 0-100 if present
-            if isinstance(pts, np.ndarray) and pts.shape[1] >= 4:
-                try:
-                    rssi = pts[:, 3].astype(np.float32)
-                    rssi_min = np.nanmin(rssi)
-                    rssi_max = np.nanmax(rssi)
-                    if np.isfinite(rssi_min) and np.isfinite(rssi_max) and rssi_max > rssi_min:
-                        pts[:, 3] = (rssi - rssi_min) / (rssi_max - rssi_min) * 100.0
-                    else:
-                        pts[:, 3] = 0.0
-                except Exception:
-                    pass
-            session["last_points_np"] = np.asarray(pts, dtype=np.float32)
-            # Avoid expensive list conversion on every loop iteration.
-            # UI does not need 20Hz full serialization.
-            now_emit = time.time()
-            last_emit = float(session.get("last_points_emit_ts", 0.0) or 0.0)
-            if (now_emit - last_emit) >= 0.15:
-                t_serialize = time.perf_counter()
-                session["last_points"] = pts.tolist()
-                _record_session_stage(session, "serialize_points", (time.perf_counter() - t_serialize) * 1000.0)
-                session["last_points_emit_ts"] = now_emit
-            if session.get("recording") and current_speed_mps is not None:
-                t_stack = time.perf_counter()
-                session["pending_recording_frames"] = []
-
-            # Build 3D stack along Z based on traveled distance
-            if session.get("recording") and current_speed_mps is not None:
-                last_profile_distance = float(session.get("last_profile_distance_mm", 0.0))
-                distance_mm = float(session.get("distance_mm", 0.0))
-                delta = distance_mm - last_profile_distance
-                # apply distance-based start delay by skipping accumulation
-                delay_remaining = float(session.get("start_delay_mm_remaining", 0.0))
-                if distance_mm < delay_remaining:
-                    return
-                if profiling_distance_mm > 0 and delta >= profiling_distance_mm:
-                    profiles_to_add = 1
-                    profiles_added_in_cycle = profiles_to_add
-                    prof = np.array(pts, dtype=np.float32, copy=True)
-                    prof[:, 1] = distance_mm
-                    _append_profile_to_session_cache(session, prof)
-                    session["profiles_count"] = int(session.get("profiles_count", 0) + profiles_to_add)
-                    # Keep full acquisition points for analysis fidelity.
-                    # Visualization endpoints apply their own max_points downsampling.
-                    session["last_profile_distance_mm"] = distance_mm
-                _record_session_stage(session, "recording_stack", (time.perf_counter() - t_stack) * 1000.0)
+        _sync_encoder_worker(session)
+        now = time.monotonic()
+        motion = session["capture_motion"]
+        if dict(device_manager.motion_settings or {}) != motion:
+            issues.add("motion_configuration_changed")
+        session["last_update_ts"] = time.time()
+        if motion.get("mode", "fixed") == "encoder":
+            age = now - session.get("encoder_sample_monotonic", float("-inf"))
+            speed = session.get("encoder_speed_mps")
+            if age > 0.5 or speed is None:
+                issues.add("encoder_stale")
+                if session.get("encoder_error"):
+                    issues.add(session["encoder_error"])
+                speed = None
+            session["speed_mps"] = speed
+        else:
+            session["speed_mps"] = motion.get("fixed_speed_mps")
+        sync = session["frame_synchronizer"]
+        health = receiver_manager.get_health_snapshot()
+        for device_id in session["devices"]:
+            current = health.get(device_id, {})
+            baseline = session["receiver_health_baseline"].get(device_id, {})
+            for counter, issue in (("incomplete_frames_dropped", "incomplete_frame"),
+                                   ("queue_overflows", "frame_queue_overflow"),
+                                   ("late_complete_frames_dropped", "late_frame"),
+                                   ("device_frame_gaps", "frames_skipped"),
+                                   ("device_frame_regressions", "scanner_restarted"),
+                                   ("pattern_learning_frames_dropped", "segment_pattern_unverified")):
+                if current.get(counter, 0) > baseline.get(counter, 0):
+                    issues.add(issue)
+            frames = receiver_manager.drain_point_clouds(device_id)
+            stop_stamp = session.get("capture_stopped_monotonic")
+            if stop_stamp is not None:
+                frames = [f for f in frames if f.get("received_monotonic", float("inf")) <= stop_stamp]
+            if frames:
+                session["device_last_frame_monotonic"][device_id] = max(
+                    frame.get("received_monotonic", 0.0) for frame in frames)
+            if now - session["device_last_frame_monotonic"].get(device_id, session["capture_started_monotonic"]) > 0.5:
+                issues.add("scanner_missing")
+            sync.add(device_id, frames, session["capture_started_monotonic"], issues)
+        groups = sync.ready(now, issues)
+        pending = session["pending_profile_groups"]
+        for group in groups:
+            if len(pending) >= 256:
+                pending.popleft()
+                issues.add("position_queue_overflow")
+            pending.append(group)
+        added = _consume_positioned_groups(session)
+        stamp = now if motion.get("mode", "fixed") == "fixed" else session.get("encoder_sample_monotonic", now)
+        if session.get("capture_stopped_monotonic") is not None:
+            stamp = min(stamp, session["capture_stopped_monotonic"])
+        if stamp >= session["capture_started_monotonic"]:
+            distance, error = _position_for_frame(session, stamp)
+            if error and error != "pending":
+                issues.add(error)
+            elif distance is not None:
+                session["distance_mm"] = max(session.get("distance_mm", 0.0), distance)
+        session["perf_last_profiles_added"] = added
+        session["perf_max_profiles_per_cycle"] = max(session.get("perf_max_profiles_per_cycle", 0), added)
+        # Filtering affects only a copy for display, never captured measurement arrays.
+        if now - session.get("last_points_emit_monotonic", 0.0) >= 0.15:
+            points = session.get("last_points_np")
+            if points is not None:
+                session["last_points"] = _apply_configured_preview_filters(points.copy()).tolist()
+            session["last_points_emit_monotonic"] = now
     except Exception:
-        session.setdefault("quality_issues", set()).add("acquisition_error")
-        logger.exception("Acquisition update failed")
+        issues.add("acquisition_error")
+        logger.exception("Acquisition pipeline failed")
     finally:
-        loop_ms = (time.perf_counter() - t_loop_start) * 1000.0
-        perf_loop = session.get("perf_loop_ms")
-        if not isinstance(perf_loop, list):
-            perf_loop = []
-            session["perf_loop_ms"] = perf_loop
-        perf_loop.append(loop_ms)
-        if len(perf_loop) > 400:
-            del perf_loop[:-400]
-        session["perf_total_updates"] = int(session.get("perf_total_updates", 0) + 1)
-        session["perf_last_profiles_added"] = int(profiles_added_in_cycle)
-        session["perf_max_profiles_per_cycle"] = int(
-            max(int(session.get("perf_max_profiles_per_cycle", 0) or 0), int(profiles_added_in_cycle))
-        )
+        _record_session_stage(session, "cycle", (time.perf_counter() - t_loop_start) * 1000)
+        session["perf_total_updates"] = session.get("perf_total_updates", 0) + 1
 
 
 def _run_acquisition_loop(app):
@@ -687,9 +733,24 @@ def _start_trigger_session_locked(app):
     session["distance_mm"] = 0.0
     session["last_update_ts"] = time.time()
     session["capture_started_ts"] = time.time()
+    session["capture_started_monotonic"] = time.monotonic()
+    session["capture_stopped_monotonic"] = None
+    session["capture_motion_origin"] = None
+    session["captured_profile_positions"] = []
+    session.pop("measurement_encoder_error", None)
+    session.pop("measurement_encoder_error_message", None)
+    session["capture_motion"] = dict(device_manager.motion_settings or {})
+    if session["capture_motion"].get("mode", "fixed") == "fixed":
+        session["encoder_error"] = None
+        session["encoder_error_message"] = None
+    session.setdefault("motion_history", MotionHistory())
+    session["pending_profile_groups"] = deque()
+    session["device_last_frame_monotonic"] = {}
+    session["profiling_distance_mm"] = float(session["capture_motion"].get("profiling_distance_mm") or 10.0)
     session["last_motion_monotonic"] = time.monotonic()
     session["consumed_frames"] = {}
     session["quality_issues"] = set()
+    session["measurement_valid"] = False
     session["analysis_pending"] = False
     session["captured_profiles"] = []
     session["captured_points_count"] = 0
@@ -721,11 +782,32 @@ def _start_trigger_session_locked(app):
         if tdc_cfg.get("enabled") and tdc_cfg.get("start_delay_mode") == "distance" else 0.0
     )
     session["devices"] = [d.device_id for d in device_manager.get_all_devices() if d.enabled]
+    session["capture_calibrations"] = {
+        d.device_id: copy.deepcopy(d.calibration) for d in device_manager.get_all_devices() if d.enabled
+    }
+    session["frame_synchronizer"] = FrameSynchronizer(session["devices"])
+    session["receiver_health_baseline"] = app.state.receiver_manager.get_health_snapshot()
+    if not session["devices"]:
+        session["quality_issues"].add("no_devices")
+    # Discard idle backlog. Samples received after start remain timestamp-gated.
+    for device_id in session["devices"]:
+        frames = app.state.receiver_manager.drain_point_clouds(device_id)
+        session["frame_synchronizer"].add(device_id, frames, session["capture_started_monotonic"], session["quality_issues"])
     _sync_encoder_worker(session)
     return session
 
 
 def _save_measurement_async(session: dict, payload: dict):
+    def publish_archive_state():
+        target = session.get("archive_live_session")
+        if target is None:
+            return
+        with _session_lock:
+            if target.get("capture_started_ts") == session.get("capture_started_ts"):
+                for key in ("archive_pending", "archive_last_duration_ms", "archive_last_points_count",
+                            "archive_last_ts", "archive_last_error"):
+                    target[key] = session.get(key)
+
     def worker():
         t_archive_start = time.perf_counter()
         try:
@@ -738,8 +820,10 @@ def _save_measurement_async(session: dict, payload: dict):
             session["archive_last_error"] = str(exc)
         finally:
             session["archive_pending"] = False
+            publish_archive_state()
 
     session["archive_pending"] = True
+    publish_archive_state()
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -769,6 +853,10 @@ def _run_analysis_for_session(session: dict, app):
                     min_points=int(analysis_cfg.get("log_min_points", 50) or 50),
                     y_min=y_min,
                     y_max=y_max,
+                    profile_positions=session.get("captured_profile_positions"),
+                    profile_ids=(np.repeat(np.arange(len(session.get("captured_profiles", []))),
+                        [len(p) for p in session.get("captured_profiles", [])])
+                        if session.get("captured_profile_positions") else None),
                 )
                 session["analysis_metrics"] = metrics
                 metrics_for_save = metrics
@@ -811,12 +899,13 @@ def _run_analysis_for_session(session: dict, app):
                 session["analysis_points"] = []
                 metrics_for_save = None
             session["analysis_duration_ms"] = int((time.time() - t0) * 1000)
+            session["measurement_valid"] = not bool(session.get("quality_issues"))
             try:
                 notifier = app.state.tcp_notifier
             except Exception:
                 notifier = None
             output_cfg = dict(device_manager.output_settings or {})
-            if notifier and bool(output_cfg.get("enabled", False)) and analysis_app != "none":
+            if notifier and bool(output_cfg.get("enabled", False)) and analysis_app != "none" and _capture_quality(session)["measurement_valid"]:
                 values = _flatten_output_values(session, analysis_app, metrics_for_save or session.get("analysis_metrics"))
                 values = _apply_output_units(values, output_cfg)
                 payload = _format_output_payload(values, output_cfg)
@@ -829,10 +918,12 @@ def _run_analysis_for_session(session: dict, app):
                 "analysis_timestamp_ms": session.get("analysis_timestamp_ms"),
                 "profiling_distance_mm": profiling_distance_mm,
                 "profiles_count": session.get("profiles_count", 0),
+                "profile_positions_mm": session.get("captured_profile_positions", []),
+                "profile_point_counts": [len(p) for p in session.get("captured_profiles", [])],
                 "distance_mm": session.get("distance_mm", 0.0),
                 "devices": session.get("devices", []),
                 "analysis_duration_ms": session.get("analysis_duration_ms"),
-                "quality_issues": sorted(session.get("quality_issues", set())),
+                **_capture_quality(session),
             }
             _save_measurement_async(session, payload)
             logger.info(
@@ -843,17 +934,34 @@ def _run_analysis_for_session(session: dict, app):
                 session.get("analysis_duration_ms"),
             )
         else:
+            session.setdefault("quality_issues", set()).add("no_profiles")
+            session["measurement_valid"] = False
             session["analysis_metrics"] = None
             session["analysis_points"] = []
             session["analysis_duration_ms"] = None
             session["analysis_timestamp_ms"] = None
+            _save_measurement_async(session, {
+                "analysis_app": analysis_app, "metrics": None, "original_points": [],
+                "augmented_points": [], "profiles_count": 0,
+                "distance_mm": session.get("distance_mm", 0.0),
+                "devices": session.get("devices", []), **_capture_quality(session),
+            })
             logger.info("Analysis skipped: no points available for current session")
     except Exception:
         logger.exception("Session analysis failed")
+        session.setdefault("quality_issues", set()).add("analysis_failed")
+        session["measurement_valid"] = False
         session["analysis_metrics"] = None
         session["analysis_points"] = []
         session["analysis_duration_ms"] = None
         session["analysis_timestamp_ms"] = None
+        _save_measurement_async(session, {
+            "analysis_app": session.get("analysis_app", "none"), "metrics": None,
+            "original_points": _get_captured_full_points_np(session).tolist(), "augmented_points": [],
+            "profiles_count": session.get("profiles_count", 0),
+            "distance_mm": session.get("distance_mm", 0.0),
+            "devices": session.get("devices", []), **_capture_quality(session),
+        })
 
 
 def stop_trigger_session(app):
@@ -866,6 +974,7 @@ def _stop_trigger_session_locked(app):
     session = _get_session_from_app(app)
     if not session.get("recording"):
         return session
+    session["capture_stopped_monotonic"] = time.monotonic()
     # Try one final data pull while still recording to reduce chance of missing
     # the last profile at stop edge.
     try:
@@ -873,22 +982,62 @@ def _stop_trigger_session_locked(app):
     except Exception:
         pass
     session["recording"] = False
+    session["measurement_encoder_error"] = session.get("encoder_error")
+    session["measurement_encoder_error_message"] = session.get("encoder_error_message")
     _sync_encoder_worker(session)
     # Analyze an isolated snapshot so trigger polling can continue immediately.
     snapshot = dict(session)
+    snapshot["archive_live_session"] = session
     snapshot["captured_profiles"] = list(session.get("captured_profiles", []))
+    snapshot["captured_profile_positions"] = list(session.get("captured_profile_positions", []))
     snapshot["quality_issues"] = set(session.get("quality_issues", set()))
+    snapshot["pending_profile_groups"] = deque(session.get("pending_profile_groups", []))
+    sync = session["frame_synchronizer"]
+    if any(q and q[0]["received_monotonic"] < session["capture_stopped_monotonic"] - sync.tolerance
+           for q in sync.queues.values()):
+        snapshot["quality_issues"].add("scanner_unmatched_at_stop")
+    snapshot["analysis_pending"] = False
     capture_id = session.get("capture_started_ts")
     session["analysis_pending"] = True
 
     def analyze():
-        _run_analysis_for_session(snapshot, app)
-        with _session_lock:
-            if session.get("capture_started_ts") == capture_id:
-                session["analysis_pending"] = False
-                for key in ("analysis_metrics", "analysis_points", "analysis_duration_ms",
-                            "analysis_timestamp_ms", "analysis_app"):
-                    session[key] = snapshot.get(key)
+        try:
+            # Wait only for encoder bracketing, never invent a final speed sample.
+            deadline = time.monotonic() + 0.6
+            while time.monotonic() < deadline:
+                _consume_positioned_groups(snapshot)
+                stop_distance, stop_error = _position_for_frame(snapshot, snapshot["capture_stopped_monotonic"])
+                if not snapshot["pending_profile_groups"] and stop_error != "pending":
+                    break
+                time.sleep(0.02)
+            _consume_positioned_groups(snapshot, final=True)
+            stop_distance, stop_error = _position_for_frame(snapshot, snapshot["capture_stopped_monotonic"])
+            if stop_error:
+                snapshot["quality_issues"].add("encoder_unbracketed_stop" if stop_error == "pending" else stop_error)
+            else:
+                snapshot["distance_mm"] = stop_distance
+        except Exception:
+            logger.exception("Capture finalization failed")
+            snapshot["quality_issues"].add("capture_finalization_failed")
+            snapshot["measurement_valid"] = False
+        try:
+            if not snapshot.get("profiles_count"):
+                snapshot["quality_issues"].add("no_profiles")
+            _run_analysis_for_session(snapshot, app)
+        finally:
+            with _session_lock:
+                if session.get("capture_started_ts") == capture_id:
+                    session["analysis_pending"] = False
+                    for key in ("analysis_metrics", "analysis_points", "analysis_duration_ms",
+                                "analysis_timestamp_ms", "analysis_app", "quality_issues", "measurement_valid",
+                                "captured_profiles", "captured_profile_positions", "captured_points_count",
+                                "captured_full_points_np", "captured_full_cache_dirty",
+                                "captured_preview_points_np", "profiles_count", "distance_mm"):
+                        session[key] = snapshot.get(key)
+                    # Snapshot may have encoded a different cloud: never reuse the old blob.
+                    session["captured_preview_cache_dirty"] = True
+                    session["captured_preview_blob_b64"] = ""
+
 
     threading.Thread(target=analyze, daemon=True, name="capture-analysis").start()
     session["pending_recording_frames"] = []
@@ -1432,6 +1581,7 @@ async def stop_trigger(request: Request):
 async def analytics_results(request: Request):
     session = _get_session(request)
     return {
+        **_capture_quality(session),
         "analysis_app": session.get("analysis_app", (device_manager.analysis_settings or {}).get("active_app", "log")),
         "metrics": session.get("analysis_metrics"),
         "has_points": bool(session.get("analysis_points")),
@@ -1443,10 +1593,11 @@ async def analytics_results(request: Request):
 @router.post("/analytics/recompute")
 async def analytics_recompute(request: Request):
     session = _get_session(request)
-    if bool(session.get("recording", False)):
+    if bool(session.get("recording", False)) or session.get("analysis_pending"):
         raise HTTPException(status_code=400, detail="Stop acquisition before recompute")
     _run_analysis_for_session(session, request.app)
     return {
+        **_capture_quality(session),
         "analysis_app": session.get("analysis_app", (device_manager.analysis_settings or {}).get("active_app", "log")),
         "metrics": session.get("analysis_metrics"),
         "has_points": bool(session.get("analysis_points")),
@@ -1505,7 +1656,7 @@ async def trigger_status(request: Request):
         "last_update_ts": session.get("last_update_ts"),
         "tdc_input_state": tdc_label,
         "analysis_pending": bool(session.get("analysis_pending", False)),
-        "quality_issues": sorted(session.get("quality_issues", set())),
+        **_capture_quality(session),
         "trigger_source": session.get("trigger_source", "manual"),
         "devices_online": len(availability["online_ids"]),
         "devices_enabled": availability["enabled_total"],
@@ -1534,12 +1685,13 @@ async def trigger_status_stream(request: Request):
                 "last_update_ts": session.get("last_update_ts"),
                 "tdc_input_state": tdc_label,
                 "analysis_pending": bool(session.get("analysis_pending", False)),
-                "quality_issues": sorted(session.get("quality_issues", set())),
+                **_capture_quality(session),
                 "trigger_source": session.get("trigger_source", "manual"),
                 "archive_pending": bool(session.get("archive_pending", False)),
                 "archive_last_error": session.get("archive_last_error"),
                 "pipeline_timing_ms": _summarize_session_stage_timings(session),
             }
+            payload.update(_capture_quality(session))
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(0.5)
 
@@ -1631,6 +1783,7 @@ async def trigger_latest_cloud(
                 **preview_payload,
             }
     _record_session_stage(session, "latest_cloud_request", (time.perf_counter() - t_req) * 1000.0)
+    payload.update(_capture_quality(session))
     return payload
 
 
@@ -1672,6 +1825,7 @@ async def trigger_latest_cloud_stream(
                     **preview_payload,
                 }
             _record_session_stage(session, "latest_cloud_stream_request", (time.perf_counter() - t_req) * 1000.0)
+            payload.update(_capture_quality(session))
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(1.0)
 

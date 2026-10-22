@@ -43,7 +43,7 @@ def main() -> int:
                     topic = str(item.get("topic") or "").strip()
                     if not topic:
                         continue
-                    payload = json.dumps(item.get("payload") or {}, ensure_ascii=False)
+                    payload = json.dumps(item.get("payload"), ensure_ascii=False)
                     qos = int(item.get("qos", 1) or 1)
                     retain = bool(item.get("retain", True))
                     result = client.publish(topic, payload=payload, qos=qos, retain=retain)

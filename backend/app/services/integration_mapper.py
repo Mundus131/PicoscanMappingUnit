@@ -7,10 +7,20 @@ from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
+from app.analysis.measurement_quality import measurement_quality
 
 
 DEFAULT_TOPIC_ROOT = "picocan/pmu"
 DEFAULT_NAMESPACE_URI = "urn:picocan:mapping-unit"
+QUALITY_FIELDS = (
+    "measurement_valid", "quality_status", "quality_issues", "encoder_error",
+    "encoder_error_message", "recording", "analysis_pending",
+)
+NODE_ROOTS = {
+    "log": "Applications.Log",
+    "conveyor_object": "Applications.ConveyorObject",
+    "diagnostics": "Diagnostics",
+}
 
 
 CATALOG = {
@@ -355,13 +365,21 @@ def build_snapshot(
     if normalized_app not in {"log", "conveyor_object", "diagnostics"}:
         normalized_app = "diagnostics"
     payload = _payload_for_app(normalized_app, session, availability, tdc_input_state)
+    payload.update(measurement_quality(session))
+    if normalized_app == "diagnostics":
+        payload["encoder_error"] = str(session.get("encoder_error") or "")
+        payload["encoder_error_message"] = str(session.get("encoder_error_message") or "")
+    if "result_ready" in payload:
+        payload["result_ready"] = bool(payload["result_ready"] and payload["measurement_valid"])
+    payload["recording"] = bool(session.get("recording", False))
+    payload["analysis_pending"] = bool(session.get("analysis_pending", False))
     mqtt_topic = f"{str(topic_root or DEFAULT_TOPIC_ROOT).rstrip('/')}/{normalized_app}/{'status' if normalized_app == 'diagnostics' else 'result'}"
-    node_root = {
-        "log": "Applications.Log",
-        "conveyor_object": "Applications.ConveyorObject",
-        "diagnostics": "Diagnostics",
-    }[normalized_app]
+    node_root = NODE_ROOTS[normalized_app]
     opcua_nodes = _flatten_opcua_nodes(node_root, payload)
+    if normalized_app != "diagnostics":
+        for meta in opcua_nodes.values():
+            if meta["data_type"] in {"Double", "Int64"}:
+                meta["quality_status"] = payload["quality_status"]
     mqtt_messages = _flatten_mqtt_messages(mqtt_topic, payload)
     return {
         "application": normalized_app,
@@ -422,9 +440,11 @@ def build_catalog(topic_root: str = DEFAULT_TOPIC_ROOT, namespace_uri: str = DEF
                 "application": app_name,
                 "description": meta["description"],
                 "mqtt_topic": f"{str(topic_root or DEFAULT_TOPIC_ROOT).rstrip('/')}/{app_name}/{'status' if app_name == 'diagnostics' else 'result'}",
-                "mqtt_fields": meta["mqtt_fields"],
+                "mqtt_fields": list(dict.fromkeys(meta["mqtt_fields"] + list(QUALITY_FIELDS))),
                 "opcua_namespace_uri": namespace_uri or DEFAULT_NAMESPACE_URI,
-                "opcua_nodes": meta["opcua_nodes"],
+                "opcua_nodes": meta["opcua_nodes"] + [
+                    f"{NODE_ROOTS[app_name]}.{field}" for field in QUALITY_FIELDS
+                ],
             }
         )
     return {

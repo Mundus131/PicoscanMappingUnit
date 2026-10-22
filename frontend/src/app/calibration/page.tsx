@@ -81,6 +81,8 @@ interface IoStateResponse {
 }
 
 interface TdcStatusResponse {
+  encoder_error?: string | null;
+  encoder_error_message?: string | null;
   poll_interval_ms?: number | null;
   grpc_available?: boolean | null;
   token?: { has_token?: boolean | null } | null;
@@ -1779,6 +1781,12 @@ export default function CalibrationPage() {
                   <div>token: {tdcStatus.token?.has_token ? 'ok' : 'no token'}</div>
                   <div>input: {tdcStatus.input_state === 2 ? 'HIGH' : tdcStatus.input_state === 1 ? 'LOW' : 'UNKNOWN'}</div>
                   <div>encoder port: {tdcStatus.encoder_port || '-'}</div>
+                  {(tdcStatus.encoder_error || tdcStatus.encoder_error_message) && (
+                    <div role="alert" className="col-span-2 text-rose-700">
+                      Encoder error: {tdcStatus.encoder_error || 'unknown'}
+                      {tdcStatus.encoder_error_message && `: ${tdcStatus.encoder_error_message}`}
+                    </div>
+                  )}
                   <div>encoder speed: {liveEncoderSpeedMps !== null ? `${liveEncoderSpeedMps.toFixed(3)} m/s` : '-'}</div>
                   <div>encoder rpm: {acquisitionLiveStatus?.encoder_rpm !== null && acquisitionLiveStatus?.encoder_rpm !== undefined ? acquisitionLiveStatus.encoder_rpm.toFixed(1) : '-'}</div>
                 </div>

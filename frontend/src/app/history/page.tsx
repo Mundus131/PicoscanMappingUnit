@@ -3,11 +3,13 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
+import MeasurementQualityNotice from '@/components/controls/MeasurementQualityNotice';
+import type { MeasurementQuality } from '@/lib/measurementQuality';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
 import { SynInteropCheckbox } from '@/components/synergy/SynInterop';
 
-interface HistoryItem {
+interface HistoryItem extends MeasurementQuality {
   id: string;
   created_at: number;
   profiles_count?: number;
@@ -20,7 +22,7 @@ interface HistoryItem {
 export default function HistoryPage() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [selected, setSelected] = useState<HistoryItem | null>(null);
-  const [details, setDetails] = useState<{
+  const [details, setDetails] = useState<MeasurementQuality & {
     original_points?: number[][];
     augmented_points?: number[][];
     metrics?: unknown;
@@ -91,6 +93,7 @@ export default function HistoryPage() {
   return (
     <Layout>
       <div className="space-y-6">
+        <MeasurementQualityNotice quality={details} />
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">History</h1>
@@ -113,6 +116,7 @@ export default function HistoryPage() {
                   onClick={() => setSelected(item)}
                 >
                   <div className="font-semibold">#{item.id}</div>
+                  <MeasurementQualityNotice quality={item} />
                   <div className="text-xs text-gray-500">{item.created_at ? new Date(item.created_at).toLocaleString() : ''}</div>
                   <div className="mt-1 text-xs text-gray-500">
                     points: {item.points_count ?? 0} | augmented: {item.augmented_points_count ?? 0}
@@ -186,7 +190,10 @@ export default function HistoryPage() {
             <syn-card className="app-card">
               <h2 className="text-xl font-semibold text-slate-900">Results</h2>
               {!metrics && <div className="text-sm text-gray-500">No metrics available.</div>}
-              {metrics && (
+              {metrics && !metrics.diameter_mm && (
+                <pre className="overflow-auto text-xs">{JSON.stringify(metrics, null, 2)}</pre>
+              )}
+              {metrics?.diameter_mm && (
                 <div className="mt-3 grid grid-cols-1 gap-3 text-sm text-gray-500 sm:grid-cols-2">
                   <div>
                     <div className="text-xs text-gray-400">Slices</div>

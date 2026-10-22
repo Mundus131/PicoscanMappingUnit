@@ -21,14 +21,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt ./
 
-ARG GIT_SSL_NO_VERIFY=0
-ARG PIP_TRUSTED_HOSTS=""
+# Keep certificate verification enabled for both pip and the Git dependency.
+# Print pip's detailed file log on failure; failed layers cannot be inspected later.
+RUN python -m pip install --verbose --log /tmp/pip-upgrade.log --upgrade pip \
+    || { status=$?; cat /tmp/pip-upgrade.log; exit "$status"; }
 
-RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
-    && PIP_TRUSTED_FLAGS="" \
-    && for h in ${PIP_TRUSTED_HOSTS}; do PIP_TRUSTED_FLAGS="${PIP_TRUSTED_FLAGS} --trusted-host ${h}"; done \
-    && pip install --upgrade pip ${PIP_TRUSTED_FLAGS} \
-    && pip install -r requirements.txt ${PIP_TRUSTED_FLAGS}
+RUN python -m pip install --verbose --log /tmp/pip-install.log -r requirements.txt \
+    || { status=$?; cat /tmp/pip-install.log; exit "$status"; }
+
+RUN python -m pip check && rm -f /tmp/pip-upgrade.log /tmp/pip-install.log
 
 COPY . .
 

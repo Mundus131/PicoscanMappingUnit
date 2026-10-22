@@ -2,13 +2,15 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
+import MeasurementQualityNotice from '@/components/controls/MeasurementQualityNotice';
+import type { MeasurementQuality } from '@/lib/measurementQuality';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
 import { SynInteropButton, SynInteropDropdown } from '@/components/synergy/SynInterop';
 import { decodePointCloudPayload } from '@/lib/pointCloudPayload';
 import { Play, Square, RefreshCw, Wand2, Plus, Trash2, ArrowUp, ArrowDown, X } from 'lucide-react';
 
-interface TriggerStatus {
+interface TriggerStatus extends MeasurementQuality {
   recording: boolean;
   distance_mm: number;
   speed_mps: number | null;
@@ -785,10 +787,13 @@ export default function AnalyticsPage() {
     }
   };
 
+  const [analysisQuality, setAnalysisQuality] = useState<MeasurementQuality | null>(null);
+
   const fetchAnalysis = async (opts?: { forceCloud?: boolean; full?: boolean }) => {
     try {
       const res = await api.get('/acquisition/analytics/results');
       setAnalysis(res.data?.metrics || null);
+      setAnalysisQuality(res.data);
       const ts = typeof res.data?.analysis_timestamp_ms === 'number' ? res.data.analysis_timestamp_ms : null;
       const changed = ts !== null && ts !== lastAnalysisTsRef.current;
       setAnalysisTimestampMs(ts);
@@ -809,6 +814,7 @@ export default function AnalyticsPage() {
       }
     } catch {
       setAnalysis(null);
+      setAnalysisQuality(null);
       setAnalysisTimestampMs(null);
       setAugmentedPoints([]);
       setAnalysisDuration(null);
@@ -1014,6 +1020,7 @@ export default function AnalyticsPage() {
   return (
     <Layout>
       <div className="space-y-6">
+        <MeasurementQualityNotice quality={{ ...analysisQuality, recording: status.recording, analysis_pending: status.analysis_pending }} label="Analysis quality" />
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">Analytics</h1>

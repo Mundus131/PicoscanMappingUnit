@@ -5,6 +5,10 @@ from pathlib import Path
 import threading
 import types
 import unittest
+import sys
+from collections import deque
+sys.path.insert(0, str(Path(__file__).parents[1]))
+from app.services.capture_pipeline import MotionHistory, FrameSynchronizer
 
 import numpy as np
 
@@ -17,8 +21,13 @@ class CaptureRegressionTests(unittest.TestCase):
         self.session = dict(recording=True, last_motion_monotonic=0., distance_mm=0.,
                             last_profile_distance_mm=0., devices=["scanner"], profiles=[])
         cloud = np.array([[1., 0., 2.], [2., 0., 3.]])
-        self.receiver = types.SimpleNamespace(get_latest_point_cloud=lambda _: {
-            "frame": self.frame, "timestamp": self.clock, "points": cloud})
+        self.receiver = types.SimpleNamespace(drain_point_clouds=lambda _: [{
+            "frame": self.frame, "timestamp": self.clock, "received_monotonic": self.clock,
+            "complete": True, "points": cloud}], get_health_snapshot=lambda: {})
+        self.session.update(capture_motion=self.motion, capture_started_monotonic=0.,
+            capture_calibrations={"scanner": {}}, receiver_health_baseline={}, device_last_frame_monotonic={},
+            frame_synchronizer=FrameSynchronizer(["scanner"]), pending_profile_groups=deque(),
+            motion_history=MotionHistory(), profiling_distance_mm=5.)
         manager = types.SimpleNamespace(motion_settings=self.motion,
                                        get_device=lambda _: types.SimpleNamespace(calibration={}))
         self.ns = dict(np=np, logger=logging.getLogger(__name__),
@@ -32,7 +41,7 @@ class CaptureRegressionTests(unittest.TestCase):
                            types.SimpleNamespace(points=cloud.copy(), intensities=None)))
         path = Path(__file__).parents[1] / 'app/api/endpoints/acquisition.py'
         tree = ast.parse(path.read_text(encoding='utf-8-sig'))
-        names = {'_update_session_once', '_update_session_locked', '_calc_speed_from_encoder_rpm'}
+        names = {'_update_session_once', '_update_session_locked', '_calc_speed_from_encoder_rpm', '_position_for_frame', '_consume_positioned_groups', '_extract_encoder_rpm'}
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), self.ns)
 
@@ -72,7 +81,7 @@ class CaptureRegressionTests(unittest.TestCase):
         self.motion['fixed_speed_mps'] = 0.
         for t in range(100):
             self.update(float(t))
-        self.assertEqual(self.session['pending_recording_frames'], [])
+        self.assertEqual(list(self.session['pending_profile_groups']), [])
         self.assertEqual(self.session['profiles'], [])
 
     def test_reverse_rpm_preserves_sign(self):
@@ -90,6 +99,66 @@ class CaptureRegressionTests(unittest.TestCase):
         self.update(1.)
         self.assertEqual(self.session['distance_mm'], 0.)
         self.assertEqual(self.session['profiles'], [])
+
+    def test_all_queued_frames_have_their_own_position(self):
+        cloud = np.array([[1., 0., 2.]])
+        self.receiver.drain_point_clouds = lambda _: [dict(frame=i, received_monotonic=t,
+            complete=True, points=cloud) for i, t in enumerate((.1, .2, .3), 1)]
+        self.update(.4)
+        self.assertEqual(len(self.session['profiles']), 3)
+        np.testing.assert_allclose([p[0, 1] for p in self.session['profiles']], [20, 40, 60])
+
+    def test_preview_filters_cannot_remove_measurement_points(self):
+        self.ns['_apply_configured_preview_filters'] = lambda p: p[:0]
+        self.update(1.)
+        self.assertEqual(self.session['last_points'], [])
+        self.assertEqual(len(self.session['profiles'][0]), 2)
+
+    def test_frame_waits_for_following_encoder_sample(self):
+        self.motion['mode'] = 'encoder'
+        history = self.session['motion_history']
+        history.add(0, .2)
+        self.session.update(encoder_speed_mps=.2, encoder_sample_monotonic=0.)
+        self.update(.1)
+        self.assertEqual(self.session['profiles'], [])
+        history.add(.2, .4)
+        self.session['encoder_sample_monotonic'] = .2
+        self.receiver.drain_point_clouds = lambda _: []
+        self.update(.2)
+        self.assertAlmostEqual(self.session['profiles'][0][0, 1], 25.)
+
+    def test_two_scanners_keep_their_own_encoder_position(self):
+        self.session['devices'] = ['a', 'b']
+        self.session['capture_calibrations'] = {'a': {}, 'b': {}}
+        self.session['frame_synchronizer'] = FrameSynchronizer(['a', 'b'])
+        self.receiver.drain_point_clouds = lambda d: [dict(frame=1, complete=True,
+            received_monotonic=.1 if d == 'a' else .11, points=np.array([[1., 0., 2.]]))]
+        self.update(.2)
+        self.assertEqual(len(self.session['profiles']), 1)
+        np.testing.assert_allclose(self.session['profiles'][0][:, 1], [20, 20, 22, 22])
+
+    def test_origin_survives_bounded_history_eviction(self):
+        self.motion['mode'] = 'encoder'
+        history = MotionHistory(capacity=2)
+        self.session['motion_history'] = history
+        history.add(0, .2)
+        history.add(.1, .2)
+        self.assertAlmostEqual(self.ns['_position_for_frame'](self.session, .1)[0], 20)
+        history.add(.2, .2)
+        self.assertAlmostEqual(self.ns['_position_for_frame'](self.session, .2)[0], 40)
+
+    def test_stop_timestamp_excludes_frames_after_stop(self):
+        self.session['capture_stopped_monotonic'] = .1
+        self.update(.2)
+        self.assertEqual(self.session['profiles'], [])
+
+    def test_byte_array_is_not_speed_and_nan_rejected(self):
+        extract = self.ns['_extract_encoder_rpm']
+        self.assertIsNone(extract({'data': {'getData': {'iolink': {'value': [0, 1, 2]}}}}))
+        def payload(value):
+            return {'data': {'getData': {'iolink': {'value': {'Velocity': {'value': value}}}}}}
+        self.assertEqual(extract(payload(60)), 60)
+        self.assertIsNone(extract(payload('nan')))
 
 
 if __name__ == '__main__':

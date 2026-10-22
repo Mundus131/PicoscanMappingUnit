@@ -11,7 +11,23 @@ permissions:
   packages: write
 
 jobs:
+  test-capture:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install isolated regression-test dependencies
+        run: python -m pip install numpy==1.26.2 -r integrations/opcua_server/requirements.txt
+      - name: Test capture, quality and OPC UA contracts
+        run: |
+          python -m unittest discover -s backend/tests
+          python -m unittest discover -s integrations/opcua_server -p test_quality.py
+          python -m compileall -q backend/app integrations
+
   build-backend:
+    needs: test-capture
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -22,6 +38,11 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # Allow detailed pip diagnostics without BuildKit's small default log cap.
+          driver-opts: |
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=52428800
+            env.BUILDKIT_STEP_LOG_MAX_SPEED=1048576
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -31,23 +52,37 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build backend image (arm64) and push to GHCR
-        run: >
-          docker buildx build
-          --platform linux/arm64/v8
-          -t ghcr.io/mundus131/picoscan-backend:arm64
-          -t ghcr.io/mundus131/picoscan-backend:sha-${{ github.sha }}
-          -f backend/Dockerfile
-          backend
-          --push
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          docker buildx build --progress=plain \
+            --platform linux/arm64/v8 \
+            -t ghcr.io/mundus131/picoscan-backend:arm64 \
+            -t ghcr.io/mundus131/picoscan-backend:sha-${{ github.sha }} \
+            -f backend/Dockerfile \
+            backend --push 2>&1 | tee build-logs/backend-push.log
 
       - name: Build backend image (arm64) and export tar
-        run: >
-          docker buildx build
-          --platform linux/arm64/v8
-          -t picocan-backend:arm64
-          -f backend/Dockerfile
-          backend
-          --output type=docker,dest=backend-arm64.tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          docker buildx build --progress=plain \
+            --platform linux/arm64/v8 \
+            -t picocan-backend:arm64 \
+            -f backend/Dockerfile \
+            backend --output type=docker,dest=backend-arm64.tar \
+            2>&1 | tee build-logs/backend-export.log
+
+      - name: Upload backend build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build-logs
+          path: build-logs/*.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload backend artifact
         uses: actions/upload-artifact@v4
@@ -56,6 +91,7 @@ jobs:
           path: backend-arm64.tar
 
   build-opcua:
+    needs: test-capture
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout

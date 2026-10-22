@@ -45,6 +45,8 @@ def compute_log_metrics(
     min_points: int = 50,
     y_min: float | None = None,
     y_max: float | None = None,
+    profile_positions: list[float] | None = None,
+    profile_ids: np.ndarray | None = None,
 ) -> Dict[str, Any]:
     """
     Compute log metrics by fitting circles on X/Z plane over windows of profiles.
@@ -60,7 +62,12 @@ def compute_log_metrics(
     if profiling_distance_mm <= 0:
         raise ValueError("profiling_distance_mm must be > 0")
 
-    profile_index = np.rint(pts[:, 1] / profiling_distance_mm).astype(int)
+    if profile_ids is not None:
+        profile_index = np.asarray(profile_ids, dtype=int)
+        if len(profile_index) != len(pts):
+            raise ValueError("Profile IDs must match captured point count")
+    else:
+        profile_index = np.rint(pts[:, 1] / profiling_distance_mm).astype(int)
     unique_profiles = np.unique(profile_index)
     unique_profiles.sort()
 
@@ -82,7 +89,10 @@ def compute_log_metrics(
         diameter = 2.0 * r
         area = math.pi * r * r
         circumference = 2.0 * math.pi * r
-        pos_mm = float(np.mean(window) * profiling_distance_mm)
+        if profile_ids is not None and profile_positions is not None:
+            pos_mm = float(np.mean([profile_positions[i] for i in window]))
+        else:
+            pos_mm = float(np.mean(window) * profiling_distance_mm)
         slices.append(SliceResult(
             position_mm=pos_mm,
             center_mm=(cx, cz),
