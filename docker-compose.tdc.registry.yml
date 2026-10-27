@@ -1,0 +1,76 @@
+# Docker Compose / Portainer standalone stack for the ARM64 TDC host.
+# Use prepare-tdc.sh before replacing the existing stack.
+services:
+  backend:
+    image: ghcr.io/mundus131/picoscan-backend:${IMAGE_TAG:?Set the successfully built sha-COMMIT tag}
+    platform: linux/arm64
+    container_name: picocan-backend
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: '8000'
+      DEBUG: 'false'
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PICOSCAN_DEVICES_CONFIG: /app/data/picoscans_config.json
+      CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000","http://${TDC_IP:-192.168.0.100}:3000"]'
+      MQTT_PUBLISH_ENABLED: 'true'
+      MQTT_HOST: 127.0.0.1
+      MQTT_PORT: '1883'
+      MQTT_TOPIC_ROOT: picocan/pmu
+      OPCUA_NAMESPACE_URI: urn:picocan:mapping-unit
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    # Refuse to start with an absent migrated configuration.
+    command: ["/bin/sh", "-ec", "test -s /app/data/picoscans_config.json || { echo 'Missing persisted configuration: run prepare-tdc.sh first'; exit 1; }; exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+
+  frontend:
+    image: ghcr.io/mundus131/picoscan-frontend:${IMAGE_TAG:?Set the successfully built sha-COMMIT tag}
+    platform: linux/arm64
+    container_name: picocan-frontend
+    restart: unless-stopped
+    ports:
+      - '3000:3000/tcp'
+    depends_on:
+      - backend
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    platform: linux/arm64
+    container_name: picocan-mqtt-broker
+    restart: unless-stopped
+    network_mode: host
+    # Local backend is the only MQTT client needed by this stack.
+    # External MQTT clients require authenticated broker configuration.
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        printf '%s\n' 'listener 1883 127.0.0.1' 'allow_anonymous true' 'persistence false' 'log_dest stdout' > /mosquitto/config/mosquitto.conf
+        exec /docker-entrypoint.sh /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+
+  opcua-server:
+    image: ghcr.io/mundus131/picocan-opcua-server:${IMAGE_TAG:?Set the successfully built sha-COMMIT tag}
+    platform: linux/arm64
+    container_name: picocan-opcua-server
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      BACKEND_BASE_URL: http://127.0.0.1:8000/api/v1
+      MQTT_TOPIC_ROOT: picocan/pmu
+      OPCUA_NAMESPACE_URI: urn:picocan:mapping-unit
+      OPCUA_ENDPOINT: opc.tcp://0.0.0.0:4840/freeopcua/server/
+      POLL_INTERVAL_S: '1.0'
+    depends_on:
+      - backend
+      - mqtt-broker
+
+# Explicit existing names prevent accidentally creating empty project volumes.
+volumes:
+  backend_logs:
+    external: true
+    name: ${BACKEND_LOGS_VOLUME:?Set the existing backend logs volume}
+  backend_data:
+    external: true
+    name: ${BACKEND_DATA_VOLUME:?Set the existing backend data volume}

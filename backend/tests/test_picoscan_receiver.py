@@ -244,6 +244,26 @@ class ReceiverTests(unittest.TestCase):
         self.assertFalse(self.info['pattern_locked'])
         self.assertEqual(self.info['incomplete_frames_dropped'], 8)
 
+    def test_learning_transition_releases_buffered_complete_frames_before_newer_frame(self):
+        self.info.update(expected_segment_pattern=None, pattern_locked=False)
+        for frame in range(4):
+            self.feed(self.segment(frame, 7), self.segment(frame, 8))
+            self.now += .4
+            self.feed()
+        for frame in range(4, 7):
+            self.feed(self.segment(frame, 7), self.segment(frame, 8))
+            self.now += .1
+        self.now += .06  # Only frame 4 has reached the learning timeout.
+        self.feed(self.segment(7, 7))
+        self.assertEqual([f['device_frame'] for f in self.drain()], [4, 5, 6])
+        self.feed(self.segment(7, 8))
+        self.assertEqual([f['device_frame'] for f in self.drain()], [7])
+        self.now += .4
+        self.feed()
+        self.assertEqual(self.drain(), [])
+        self.assertEqual(self.info['late_complete_frames_dropped'], 0)
+        self.assertEqual(self.info['device_frame_gaps'], 0)
+
     def prepare_final_learning_frame(self):
         self.info.update(expected_segment_pattern=None, pattern_locked=False)
         for frame in range(4):

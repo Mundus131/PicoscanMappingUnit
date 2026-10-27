@@ -1026,9 +1026,17 @@ class PicoscanReceiverManager:
             })
 
         def expire(stamp):
+            learning = info.get("expected_segment_pattern") is None
             for frame in list(pending):
                 if stamp - receipts[frame][1] >= timeout:
                     close(frame)
+            expected = info.get("expected_segment_pattern")
+            if learning and expected is not None:
+                # Frames buffered while learning are already complete. Release
+                # them before a newer frame can overtake them and make them late.
+                for frame in sorted(pending, key=lambda f: receipts[f][1]):
+                    if sorted(pending[frame]) == expected:
+                        close(frame)
 
         for segment in segment_list:
             # Expire in receipt-time order, not parsing/batch-return time. A slow
