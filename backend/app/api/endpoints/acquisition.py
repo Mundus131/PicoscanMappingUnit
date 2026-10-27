@@ -434,12 +434,13 @@ def _run_encoder_loop(session: dict):
     stop_event = session.get("encoder_stop_event")
     history = session.setdefault("motion_history", MotionHistory())
     previous_config = None
+    previous_request_started = None
     while stop_event and not stop_event.is_set():
         motion = device_manager.motion_settings or {}
         if (motion.get("mode", "fixed") or "fixed") != "encoder":
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
-            time.sleep(0.2)
+            stop_event.wait(0.2)
             continue
 
         tdc_cfg = device_manager.tdc_settings or {}
@@ -448,19 +449,27 @@ def _run_encoder_loop(session: dict):
         if previous_config is not None and config != previous_config:
             history.add(time.monotonic(), None)
         previous_config = config
-        poll_interval_ms = max(50, int(tdc_cfg.get("poll_interval_ms", 200) or 200))
+        # Encoder cadence is independent of digital trigger polling.
+        poll_interval_s = min(200, max(50, int(tdc_cfg.get("encoder_poll_interval_ms", 200) or 200))) / 1000.0
         if not bool(tdc_cfg.get("enabled", False)):
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
             history.add(time.monotonic(), None)
             _set_encoder_error(session, "encoder_disabled", "TDC encoder polling is disabled.")
-            time.sleep(poll_interval_ms / 1000.0)
+            stop_event.wait(poll_interval_s)
             continue
 
+        request_started = time.monotonic()
+        if previous_request_started is not None:
+            session["encoder_poll_gap_ms"] = (request_started - previous_request_started) * 1000.0
+        previous_request_started = request_started
         try:
-            request_started = time.monotonic()
             payload = tdc_rest.fetch_encoder_process_data(data_format="iodd")
             received = time.monotonic()
+            session["encoder_request_ms"] = (received - request_started) * 1000.0
+            session["encoder_request_max_ms"] = max(session.get("encoder_request_max_ms", 0.0), session["encoder_request_ms"])
+            previous_sample = session.get("encoder_sample_monotonic")
+            session["encoder_sample_gap_ms"] = (received - previous_sample) * 1000.0 if previous_sample is not None else None
             rpm = _extract_encoder_rpm(payload)
             speed_mps = _calc_speed_from_encoder_rpm(rpm, motion) if rpm is not None else None
             if rpm is None:
@@ -473,7 +482,7 @@ def _run_encoder_loop(session: dict):
                 _set_encoder_error(session, "reverse_motion", "Reverse encoder motion is not supported for length measurement.")
             elif received - request_started > 0.5:
                 speed_mps = None
-                _set_encoder_error(session, "encoder_latency", "Encoder response exceeded 500 ms; sample timing is unreliable.")
+                _set_encoder_error(session, "encoder_latency", f"Encoder response took {session['encoder_request_ms']:.0f} ms (limit 500 ms); sample timing is unreliable.")
             else:
                 session["encoder_error"] = None
                 session["encoder_error_message"] = None
@@ -486,12 +495,15 @@ def _run_encoder_loop(session: dict):
             # Keep live speed visible even when trigger recording is stopped.
             session["speed_mps"] = speed_mps
         except Exception as exc:
+            session["encoder_request_ms"] = (time.monotonic() - request_started) * 1000.0
+            session["encoder_request_max_ms"] = max(session.get("encoder_request_max_ms", 0.0), session["encoder_request_ms"])
             history.add(time.monotonic(), None)
             _set_encoder_error(session, "encoder_read_failed", "TDC encoder read failed (" + type(exc).__name__ + "). Check connection, token and IO-Link port.")
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
 
-        time.sleep(poll_interval_ms / 1000.0)
+        # Slow requests do not add another full polling interval or spawn catch-up reads.
+        stop_event.wait(max(0.0, poll_interval_s - (time.monotonic() - request_started)))
 
 
 def _sync_encoder_worker(session: dict):

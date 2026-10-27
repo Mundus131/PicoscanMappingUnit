@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Any, Dict, List, Optional
 
 class CalibrationData(BaseModel):
@@ -242,6 +242,7 @@ class TdcSettings(BaseModel):
     realm: str | None = None
     trigger_input: str
     poll_interval_ms: int
+    encoder_poll_interval_ms: int = Field(default=200, ge=50, le=200)
     token_refresh_interval_s: float | None = None
     grpc_timeout_s: float | None = None
     encoder_port: str | None = None  # "1".."4"

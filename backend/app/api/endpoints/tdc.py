@@ -27,7 +27,12 @@ async def tdc_status(request: Request):
         "encoder_speed_mps": session.get("encoder_speed_mps"),
         "encoder_error": session.get("encoder_error") or "",
         "encoder_error_message": session.get("encoder_error_message") or "",
-        "poll_interval_ms": cfg.get("poll_interval_ms"),
+        "encoder_request_ms": session.get("encoder_request_ms"),
+        "encoder_request_max_ms": session.get("encoder_request_max_ms"),
+        "encoder_poll_gap_ms": session.get("encoder_poll_gap_ms"),
+        "encoder_sample_gap_ms": session.get("encoder_sample_gap_ms"),
+        "poll_interval_ms": min(200, max(50, int(cfg.get("poll_interval_ms", 200)))),
+        "encoder_poll_interval_ms": min(200, max(50, int(cfg.get("encoder_poll_interval_ms", 200) or 200))),
     }
 
 

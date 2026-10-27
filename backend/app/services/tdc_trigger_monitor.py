@@ -116,7 +116,8 @@ class TdcTriggerMonitor:
                     self.app.state.tdc_input_state = state
                     self.app.state.tdc_trigger_error = 'trigger_waiting_for_low'
 
-            self._stop_event.wait(min(200, poll_interval) / 1000.0)
+            self._stop_event.wait(max(0.0, min(200, poll_interval) / 1000.0
+                                      - (time.monotonic() - started)))
 
     def _handle_state(self, state, config):
         if state in (1, 2):

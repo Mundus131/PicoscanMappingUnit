@@ -83,7 +83,12 @@ interface IoStateResponse {
 interface TdcStatusResponse {
   encoder_error?: string | null;
   encoder_error_message?: string | null;
+  encoder_request_ms?: number | null;
+  encoder_request_max_ms?: number | null;
+  encoder_poll_gap_ms?: number | null;
+  encoder_sample_gap_ms?: number | null;
   poll_interval_ms?: number | null;
+  encoder_poll_interval_ms?: number | null;
   grpc_available?: boolean | null;
   token?: { has_token?: boolean | null } | null;
   input_state?: number | null;
@@ -231,6 +236,7 @@ export default function CalibrationPage() {
   const [tdcPassword, setTdcPassword] = useState('Welcome1!');
   const [tdcTriggerInput, setTdcTriggerInput] = useState<TriggerInputName>('DI_A');
   const [tdcPollInterval, setTdcPollInterval] = useState(200);
+  const [tdcEncoderPollInterval, setTdcEncoderPollInterval] = useState(200);
   const [tdcEncoderPort, setTdcEncoderPort] = useState<'1' | '2' | '3' | '4'>('1');
   const [tdcStartDelayMode, setTdcStartDelayMode] = useState<'time' | 'distance'>('time');
   const [tdcStartDelayMs, setTdcStartDelayMs] = useState(0);
@@ -574,6 +580,7 @@ export default function CalibrationPage() {
           (TRIGGER_INPUT_OPTIONS.includes(triggerInput as TriggerInputName) ? triggerInput : 'DI_A') as TriggerInputName
         );
         setTdcPollInterval(Number(res.data.poll_interval_ms ?? 200));
+        setTdcEncoderPollInterval(Number(res.data.encoder_poll_interval_ms ?? 200));
         setTdcEncoderPort((res.data.encoder_port ?? '1') as '1' | '2' | '3' | '4');
         setTdcStartDelayMode(res.data.start_delay_mode === 'distance' ? 'distance' : 'time');
         setTdcStartDelayMs(Number(res.data.start_delay_ms ?? 0));
@@ -776,6 +783,7 @@ export default function CalibrationPage() {
         password: tdcPassword,
         trigger_input: tdcTriggerInput,
         poll_interval_ms: tdcPollInterval,
+        encoder_poll_interval_ms: tdcEncoderPollInterval,
         encoder_port: tdcEncoderPort,
         start_delay_mode: tdcStartDelayMode,
         start_delay_ms: tdcStartDelayMs,
@@ -1674,14 +1682,23 @@ export default function CalibrationPage() {
                 </select>
               </div>
               <div>
-                <label className="text-xs text-gray-600">Poll interval (ms)</label>
+                <label className="text-xs text-gray-600">Digital trigger polling (ms, 50-200)</label>
                 <input
                   className="input mt-1"
                   type="number"
                   step="10"
                   value={tdcPollInterval}
-                  onChange={(e) => setTdcPollInterval(parseInt(e.target.value))}
+                  min={50}
+                  max={200}
+                  onChange={(e) => setTdcPollInterval(Math.min(200, Math.max(50, Number(e.target.value) || 200)))}
                 />
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Encoder speed polling (ms, 50-200)</label>
+                <input className="input mt-1" type="number" step="10" min={50} max={200}
+                  value={tdcEncoderPollInterval}
+                  onChange={(e) => setTdcEncoderPollInterval(Math.min(200, Math.max(50, Number(e.target.value) || 200)))} />
+                <p className="text-xs text-gray-500 mt-1">Independent of trigger polling. Default: 200 ms. Slow responses remain invalid.</p>
               </div>
               <div>
                 <label className="text-xs text-gray-600">Encoder port</label>
@@ -1774,13 +1791,19 @@ export default function CalibrationPage() {
               <div className="mt-4 rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 p-3 text-xs text-gray-600">
                 <div className="flex items-center justify-between">
                   <div className="font-semibold text-gray-700 dark:text-gray-300">TDC Status</div>
-                  <div className="text-[11px] text-gray-500">poll: {tdcStatus.poll_interval_ms ?? '-'} ms</div>
+                  <div className="text-[11px] text-gray-500">trigger: {tdcStatus.poll_interval_ms ?? '-'} ms | encoder: {tdcStatus.encoder_poll_interval_ms ?? '-'} ms</div>
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div>grpc: {tdcStatus.grpc_available ? 'ok' : 'missing'}</div>
                   <div>token: {tdcStatus.token?.has_token ? 'ok' : 'no token'}</div>
                   <div>input: {tdcStatus.input_state === 2 ? 'HIGH' : tdcStatus.input_state === 1 ? 'LOW' : 'UNKNOWN'}</div>
                   <div>encoder port: {tdcStatus.encoder_port || '-'}</div>
+                  <div className="text-xs text-gray-600 mt-2">
+                    Encoder request: {tdcStatus.encoder_request_ms?.toFixed(0) ?? '-'} ms
+                    {' | max: '}{tdcStatus.encoder_request_max_ms?.toFixed(0) ?? '-'} ms
+                    {' | poll gap: '}{tdcStatus.encoder_poll_gap_ms?.toFixed(0) ?? '-'} ms
+                    {' | sample gap: '}{tdcStatus.encoder_sample_gap_ms?.toFixed(0) ?? '-'} ms
+                  </div>
                   {(tdcStatus.encoder_error || tdcStatus.encoder_error_message) && (
                     <div role="alert" className="col-span-2 text-rose-700">
                       Encoder error: {tdcStatus.encoder_error || 'unknown'}

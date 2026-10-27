@@ -232,6 +232,7 @@ class DeviceManager:
                 self.tdc_settings["trigger_input"] = "DI1"
             if "poll_interval_ms" not in self.tdc_settings:
                 self.tdc_settings["poll_interval_ms"] = 200
+            self.tdc_settings.setdefault("encoder_poll_interval_ms", 200)
             if "token_refresh_interval_s" not in self.tdc_settings:
                 self.tdc_settings["token_refresh_interval_s"] = 300
             if "grpc_timeout_s" not in self.tdc_settings:
