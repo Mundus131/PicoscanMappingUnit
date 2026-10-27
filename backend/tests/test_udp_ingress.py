@@ -7,6 +7,24 @@ from app.services.udp_ingress import ProcessUDPHandler
 
 
 class IngressTests(unittest.TestCase):
+    def test_recovers_from_old_backlog_and_counts_discarded_packets(self):
+        transport = ProcessUDPHandler('127.0.0.1', 0)
+        try:
+            self.send(transport.port, 20)
+            self.wait_received(transport, 20)
+            time.sleep(1.1)
+            self.send(transport.port, 1)
+            self.wait_received(transport, 21)
+            time.sleep(0.05)
+            transport.receive_new_scan_segment()
+            metrics = transport.get_metrics()
+            self.assertEqual(metrics['ingress_stale_dropped'], 20)
+            self.assertEqual(metrics['ingress_queue_dropped'], 20)
+            self.assertEqual(metrics['ingress_queue_depth'], 0)
+            self.assertLess(metrics['ingress_queue_age_s'], 1)
+        finally:
+            transport.close()
+
     def test_sustained_150_datagrams_per_second_with_consumer_stalls(self):
         import threading
         transport = ProcessUDPHandler("127.0.0.1", 0)

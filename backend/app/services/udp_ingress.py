@@ -47,6 +47,7 @@ class ProcessUDPHandler:
         self._stop = ctx.Event()
         self._stats = ctx.Array("q", 2)
         self._consumed = 0
+        self._stale_dropped = 0
         self.queue_capacity = queue_capacity
         self.last_host_receipt = None
         self.last_queue_age_s = 0.0
@@ -87,6 +88,18 @@ class ProcessUDPHandler:
                 raise RuntimeError("transport_layer ingress process stopped")
             raise TimeoutError(self.last_error_message)
         self._consumed += 1
+        # A saturated parser must recover to current data rather than spend
+        # seconds reconstructing an already incomplete backlog. Count every loss.
+        for _ in range(self.queue_capacity):
+            if time.monotonic() - monotonic <= 1.0:
+                break
+            try:
+                newer = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._consumed += 1
+            self._stale_dropped += 1
+            data, sender, wall, monotonic = newer
         self.counter += 1
         self.no_error_flag = True
         self.last_host_receipt = (wall, monotonic)
@@ -106,7 +119,8 @@ class ProcessUDPHandler:
     def get_metrics(self):
         with self._stats.get_lock():
             received, dropped = self._stats[:]
-        return {"datagrams_received": received, "ingress_queue_dropped": dropped,
+        return {"datagrams_received": received, "ingress_queue_dropped": dropped + self._stale_dropped,
+                "ingress_overflow_dropped": dropped, "ingress_stale_dropped": self._stale_dropped,
                 "ingress_queue_depth": max(0, received - dropped - self._consumed),
                 "ingress_queue_capacity": self.queue_capacity,
                 "ingress_queue_age_s": self.last_queue_age_s,

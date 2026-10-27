@@ -14,6 +14,7 @@ import time
 from app.services.lms4000_receiver import Lms4000Receiver
 from app.core.device_manager import device_manager
 from app.services.udp_ingress import ProcessUDPHandler
+from app.services.compact_numpy import read_beam_data
 
 # Importy z ScanSegmentAPI
 try:
@@ -40,6 +41,7 @@ def _scansegment_print(*args, **kwargs):
 # Module globals affect only these libraries' bare print calls. Never redirect
 # process stdout or hold a shared lock across independent blocking socket reads.
 CompactApi.print = _scansegment_print
+CompactApi._read_beam_data = read_beam_data
 MsgpackApi.print = _scansegment_print
 
 UDP_RCVBUF_BYTES = 4 * 1024 * 1024
@@ -1272,6 +1274,8 @@ class PicoscanReceiverManager:
                     data_hz = float((len(data_ts) - 1) / dt)
             latest_ts = info.get("latest_update_ts")
             age_s = (now - latest_ts) if latest_ts else None
+            if age_s is not None and age_s > 2.5:
+                data_hz = 0.0
             transport = getattr(info.get("receiver"), "transport_layer", None)
             ingress = transport.get_metrics() if hasattr(transport, "get_metrics") else {}
             snapshot[device_id] = {
