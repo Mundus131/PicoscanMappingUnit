@@ -88,6 +88,44 @@ class ReceiverTests(unittest.TestCase):
     def segment(self, frame, counter, **extra):
         return dict(Modules=[dict(FrameNumber=frame, SegmentCounter=counter)], **extra)
 
+    def test_parser_backlog_does_not_expire_timely_received_segments(self):
+        first = self.segment(20, 0, _host_received_wall=1001,
+                             _host_received_monotonic=1.0)
+        second = self.segment(20, 1, _host_received_wall=1001.01,
+                              _host_received_monotonic=1.01)
+        self.assertEqual(self.manager._assemble_complete_frame_segments(self.info, [first]), [])
+        result = self.manager._assemble_complete_frame_segments(self.info, [second])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['received_monotonic'], 1.0)
+        self.assertEqual(self.info['incomplete_frames_dropped'], 0)
+
+    def test_unset_device_segment_count_uses_global_default(self):
+        for global_count, device_count, expected in ((10, None, 10), (5, None, 5), (10, 2, 2)):
+            with self.subTest(global_count=global_count, device_count=device_count):
+                self.ns['device_manager'].point_cloud_settings = {'segments_per_scan': global_count}
+                info = self.manager._build_receiver_info(
+                    receiver=self.receiver, receiver_type='picoscan', device_id='b', device_type='picoscan',
+                    format_type='compact', listen_ip='0.0.0.0', listen_port=2115,
+                    segments_per_scan=device_count, fallback_enabled=False,
+                    fallback_listen_ip=None, fallback_listen_port=None, fallback_formats=[])
+                self.assertEqual(info['segments_per_scan_hint'], expected)
+
+    def test_unset_device_count_can_learn_and_deliver_complete_frames(self):
+        self.ns['device_manager'].point_cloud_settings = {'segments_per_scan': 2}
+        info = self.manager._build_receiver_info(
+            receiver=self.receiver, receiver_type='picoscan', device_id='a', device_type='picoscan',
+            format_type='compact', listen_ip='0.0.0.0', listen_port=2115,
+            segments_per_scan=None, fallback_enabled=False,
+            fallback_listen_ip=None, fallback_listen_port=None, fallback_formats=[])
+        self.info = info
+        self.manager.receivers['a'] = info
+        for frame in range(5):
+            self.feed(self.segment(frame, 0), self.segment(frame, 1))
+            self.now += .4
+            self.feed()
+        self.assertEqual([f['device_frame'] for f in self.drain()], [4])
+        self.assertEqual(info['incomplete_frames_dropped'], 0)
+
     def feed(self, *segments):
         return self.manager._convert_completed_frames(self.info, self.receiver, list(segments))
 

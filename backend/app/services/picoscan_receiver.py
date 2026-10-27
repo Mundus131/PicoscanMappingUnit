@@ -13,6 +13,7 @@ import threading
 import time
 from app.services.lms4000_receiver import Lms4000Receiver
 from app.core.device_manager import device_manager
+from app.services.udp_ingress import ProcessUDPHandler
 
 # Importy z ScanSegmentAPI
 try:
@@ -105,20 +106,13 @@ class PicoscanReceiver:
         with self._io_lock:
             try:
                 # UDP Handler nas??uchuje na porcie
-                self.transport_layer = _TimestampedUDPHandler(
+                if self.transport_layer is not None:
+                    self.transport_layer.close()
+                self.transport_layer = ProcessUDPHandler(
                     self.listen_ip,
                     self.listen_port,
                     65535  # Max packet size
                 )
-                try:
-                    self.transport_layer.client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RCVBUF_BYTES)
-                except Exception as sock_exc:
-                    logger.debug(
-                        "Failed to increase UDP receive buffer on %s:%s: %s",
-                        self.listen_ip,
-                        self.listen_port,
-                        sock_exc,
-                    )
 
                 if self.format_type == "msgpack":
                     self.receiver = MsgpackApi.Receiver(self.transport_layer)
@@ -145,6 +139,8 @@ class PicoscanReceiver:
             try:
                 if self.receiver:
                     self.receiver.close_connection()
+                if self.transport_layer:
+                    self.transport_layer.close()
                 self.receiver = None
                 self.transport_layer = None
                 self.connected = False
@@ -182,6 +178,8 @@ class PicoscanReceiver:
                     self.transport_layer.last_host_receipt = None
                     try:
                         batch = self.receiver.receive_segments(1)
+                    except TimeoutError:
+                        break
                     except Exception:
                         if not segments:
                             raise
@@ -257,7 +255,8 @@ class PicoscanReceiver:
             "total_frames_received": self.total_frames_received,
             "last_frame_number": self.last_frame_number,
             "last_segment_counter": self.last_segment_counter,
-            "last_receive_ts": self.last_receive_ts
+            "last_receive_ts": self.last_receive_ts,
+            "ingress": self.transport_layer.get_metrics() if self.transport_layer else {}
         }
     
     def segments_to_point_cloud(self, segments: List[dict]) -> np.ndarray:
@@ -427,6 +426,8 @@ class PicoscanReceiverManager:
         fallback_formats: list[str],
         segment_pattern: list[int] | None = None,
     ) -> dict:
+        if segments_per_scan is None:
+            segments_per_scan = int((device_manager.point_cloud_settings or {}).get("segments_per_scan") or 10)
         # Counters identify angular sectors; partial FOV need not start at zero.
         expected_pattern = None
         if segment_pattern is not None:
@@ -1069,7 +1070,9 @@ class PicoscanReceiverManager:
                 close(frame)
             while len(pending) > CAPTURE_QUEUE_MAX:
                 close(next(iter(pending)), invalid=True)
-        expire(time.monotonic())
+        # Do not expire buffered frames against parser time while queued packets
+        # still carry earlier receipt times. Empty reads advance the watermark.
+        expire(receipt[1] if segment_list else time.monotonic())
         return sorted(completed, key=lambda frame: frame["received_monotonic"])
 
     def _enqueue_point_cloud(self, info: dict, points, receipt: dict):
@@ -1269,7 +1272,11 @@ class PicoscanReceiverManager:
                     data_hz = float((len(data_ts) - 1) / dt)
             latest_ts = info.get("latest_update_ts")
             age_s = (now - latest_ts) if latest_ts else None
+            transport = getattr(info.get("receiver"), "transport_layer", None)
+            ingress = transport.get_metrics() if hasattr(transport, "get_metrics") else {}
             snapshot[device_id] = {
+                "ingress": ingress,
+                "ingress_queue_dropped": ingress.get("ingress_queue_dropped", 0),
                 "device_id": device_id,
                 "type": info.get("type"),
                 "active_stream": info.get("active_stream"),

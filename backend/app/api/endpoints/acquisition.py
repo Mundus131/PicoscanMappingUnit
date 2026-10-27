@@ -650,6 +650,7 @@ def _update_session_locked(session: dict, receiver_manager):
             current = health.get(device_id, {})
             baseline = session["receiver_health_baseline"].get(device_id, {})
             for counter, issue in (("incomplete_frames_dropped", "incomplete_frame"),
+                                   ("ingress_queue_dropped", "udp_ingress_overflow"),
                                    ("queue_overflows", "frame_queue_overflow"),
                                    ("late_complete_frames_dropped", "late_frame"),
                                    ("device_frame_gaps", "frames_skipped"),
