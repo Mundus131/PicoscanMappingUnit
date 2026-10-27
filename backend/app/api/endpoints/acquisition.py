@@ -211,6 +211,9 @@ def _resolve_tdc_label(app) -> str:
     if not tdc_enabled:
         return "DISABLED"
     tdc_state = getattr(app.state, "tdc_input_state", None)
+    stamp = getattr(app.state, 'tdc_input_monotonic', None)
+    if stamp is None or time.monotonic() - stamp > 0.5:
+        return 'UNKNOWN'
     if tdc_state == 2:
         return "HIGH"
     if tdc_state == 1:
@@ -649,8 +652,12 @@ def _update_session_locked(session: dict, receiver_manager):
         for device_id in session["devices"]:
             current = health.get(device_id, {})
             baseline = session["receiver_health_baseline"].get(device_id, {})
+            if (baseline.get('stream_epoch') is not None
+                    and current.get('stream_epoch') != baseline['stream_epoch']):
+                issues.add('scanner_restarted')
             for counter, issue in (("incomplete_frames_dropped", "incomplete_frame"),
                                    ("ingress_queue_dropped", "udp_ingress_overflow"),
+                                   ("processing_queue_dropped", "scanner_processing_overflow"),
                                    ("queue_overflows", "frame_queue_overflow"),
                                    ("late_complete_frames_dropped", "late_frame"),
                                    ("device_frame_gaps", "frames_skipped"),
@@ -1658,6 +1665,7 @@ async def trigger_status(request: Request):
         "points_count": len(session.get("last_points") or []),
         "last_update_ts": session.get("last_update_ts"),
         "tdc_input_state": tdc_label,
+        "trigger_error": getattr(request.app.state, "tdc_trigger_error", None),
         "analysis_pending": bool(session.get("analysis_pending", False)),
         **_capture_quality(session),
         "trigger_source": session.get("trigger_source", "manual"),
@@ -1687,6 +1695,7 @@ async def trigger_status_stream(request: Request):
                 "points_count": len(session.get("last_points") or []),
                 "last_update_ts": session.get("last_update_ts"),
                 "tdc_input_state": tdc_label,
+                "trigger_error": getattr(request.app.state, "tdc_trigger_error", None),
                 "analysis_pending": bool(session.get("analysis_pending", False)),
                 **_capture_quality(session),
                 "trigger_source": session.get("trigger_source", "manual"),

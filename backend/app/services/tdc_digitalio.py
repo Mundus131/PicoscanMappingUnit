@@ -109,13 +109,14 @@ class TdcDigitalIOClient:
             return []
         return [("authorization", f"Bearer {token}")]
 
-    def read(self, name: str) -> Optional[int]:
+    def read(self, name: str, timeout_s: float | None = None) -> Optional[int]:
         with self._lock:
             self._ensure_channel()
             config = self._config_cache
             req = self._pb2.DigitalIOReadRequest(name=name)
             try:
-                resp = self._stub.Read(req, metadata=self._metadata(), timeout=config["timeout_s"])
+                resp = self._stub.Read(req, metadata=self._metadata(),
+                    timeout=min(config["timeout_s"], timeout_s) if timeout_s is not None else config["timeout_s"])
                 return int(resp.state)
             except Exception as exc:
                 logger.warning("TDC DigitalIO read failed: %s", exc)

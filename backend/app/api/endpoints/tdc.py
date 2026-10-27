@@ -22,6 +22,7 @@ async def tdc_status(request: Request):
         "token": tdc_token_manager.get_status(),
         "input_state": getattr(request.app.state, "tdc_input_state", None),
         "input_ts": getattr(request.app.state, "tdc_input_ts", None),
+        "trigger_error": getattr(request.app.state, "tdc_trigger_error", None),
         "encoder_rpm": session.get("encoder_rpm"),
         "encoder_speed_mps": session.get("encoder_speed_mps"),
         "encoder_error": session.get("encoder_error") or "",

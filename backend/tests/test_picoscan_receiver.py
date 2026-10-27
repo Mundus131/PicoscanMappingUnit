@@ -110,6 +110,20 @@ class ReceiverTests(unittest.TestCase):
         self.manager._assemble_complete_frame_segments(self.info, [self.segment(4099, 0)])
         self.assertEqual(self.info['duplicate_segments'], before + 1)
 
+    def test_process_bridge_keeps_all_frame_positions_and_latest_preview(self):
+        stop = threading.Event()
+        frames = [dict(points=np.ones((2, 4))*i, timestamp=1000+i,
+                       received_monotonic=float(i), device_frame=i,
+                       timestamp_source='host_socket_read') for i in (1, 2)]
+        def receive():
+            stop.set()
+            return dict(frames=frames, health={'availability': 'online'}, stats={'beams': 600})
+        self.info['receiver'] = types.SimpleNamespace(receive_packet=receive)
+        self.manager._process_bridge_loop('a', stop)
+        drained = self.manager.drain_point_clouds('a')
+        self.assertEqual([f['received_monotonic'] for f in drained], [1., 2.])
+        np.testing.assert_array_equal(self.info['latest_points'], frames[-1]['points'])
+
     def test_unset_device_segment_count_uses_global_default(self):
         for global_count, device_count, expected in ((10, None, 10), (5, None, 5), (10, 2, 2)):
             with self.subTest(global_count=global_count, device_count=device_count):

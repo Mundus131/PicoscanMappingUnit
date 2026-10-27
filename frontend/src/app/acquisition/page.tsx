@@ -22,6 +22,7 @@ interface TriggerStatus extends MeasurementQuality {
   last_update_ts: number | null;
   tdc_input_state?: string;
   trigger_source?: string;
+  trigger_error?: string | null;
   devices_online?: number;
   devices_enabled?: number;
 }
@@ -629,6 +630,13 @@ export default function AcquisitionPage() {
                 <div>
                   <p className="text-xs text-gray-500">Trigger source</p>
                   <p className="text-2xl font-semibold text-slate-900">{status.trigger_source || 'manual'}</p>
+                  {status.trigger_error && (
+                    <p className="mt-2 text-sm text-red-700" role="alert">
+                      {status.trigger_error === 'trigger_waiting_for_low'
+                        ? 'Trigger requires LOW before a new HIGH can start recording.'
+                        : `Trigger unavailable: ${status.trigger_error}`}
+                    </p>
+                  )}
                 </div>
                 <div>
                   <p className="text-xs text-gray-500">Distance</p>

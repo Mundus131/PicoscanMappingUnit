@@ -16,6 +16,7 @@ from app.core.device_manager import device_manager
 from app.services.udp_ingress import ProcessUDPHandler
 from app.services.compact_numpy import read_beam_data
 from app.services.scan_logging import quiet_segment_progress
+from app.services.scan_process import ScanProcessReceiver
 
 # Importy z ScanSegmentAPI
 try:
@@ -629,7 +630,12 @@ class PicoscanReceiverManager:
                     )
                     return False
 
-            receiver = PicoscanReceiver(listen_ip, listen_port, format_type=format_type)
+            process_config = dict(receiver_type="picoscan", device_id=device_id,
+                device_type=dev_type, format_type=fmt, listen_ip=listen_ip,
+                listen_port=listen_port, segments_per_scan=segments_per_scan,
+                segment_pattern=segment_pattern, fallback_enabled=False,
+                fallback_listen_ip=None, fallback_listen_port=None, fallback_formats=[])
+            receiver = ScanProcessReceiver(process_config, device_manager.point_cloud_settings)
             if receiver.start_listening():
                 self.receivers[device_id] = self._build_receiver_info(
                     receiver=receiver,
@@ -699,9 +705,33 @@ class PicoscanReceiverManager:
                 return
         stop_event = threading.Event()
         self._worker_stops[device_id] = stop_event
-        worker = threading.Thread(target=self._worker_loop, args=(device_id, stop_event), daemon=True)
+        receiver = self.receivers[device_id].get("receiver")
+        target = self._process_bridge_loop if hasattr(receiver, "receive_packet") else self._worker_loop
+        worker = threading.Thread(target=target, args=(device_id, stop_event), daemon=True)
         self._worker_threads[device_id] = worker
         worker.start()
+
+    def _process_bridge_loop(self, device_id, stop_event):
+        info = self.receivers[device_id]
+        receiver = info['receiver']
+        while not stop_event.is_set():
+            packet = receiver.receive_packet()
+            if packet is None:
+                if not receiver.connected:
+                    info['availability'] = 'offline'
+                    info['last_error'] = receiver.last_error
+                    break
+                continue
+            info['process_health'] = packet['health']
+            info['process_health_received'] = time.time()
+            info['last_segment_stats'] = packet['stats']
+            for frame in packet['frames']:
+                self._enqueue_point_cloud(info, frame['points'], frame)
+                with info['lock']:
+                    info['latest_points'] = frame['points']
+                    info['latest_update_ts'] = frame['timestamp']
+                    info['frame_counter'] += 1
+            info['availability'] = packet['health']['availability']
 
     def _stop_fallback_receiver(self, info: dict):
         fb = info.get("fallback_receiver")
@@ -1274,6 +1304,20 @@ class PicoscanReceiverManager:
             if not isinstance(info, dict):
                 continue
             device_cfg = device_manager.get_device(device_id)
+            if 'process_health' in info:
+                remote = dict(info['process_health'])
+                remote['stream_epoch'] = info['receiver'].stream_epoch
+                age = remote.get('latest_data_age_s')
+                if age is not None:
+                    remote['latest_data_age_s'] = age + max(0, now - info['process_health_received'])
+                    if remote['latest_data_age_s'] > 2.5:
+                        remote['data_rate_hz'] = 0.0
+                remote['queue_overflows'] = remote.get('queue_overflows', 0) + info.get('queue_overflows', 0)
+                remote['connected'] = bool(info['receiver'].connected)
+                if not remote['connected']:
+                    remote.update(availability='offline', data_rate_hz=0.0, last_error=info.get('last_error'))
+                snapshot[device_id] = remote
+                continue
             configured_segments = getattr(device_cfg, "segments_per_scan", None) if device_cfg else None
             data_ts = info.get("data_timestamps")
             data_hz = None

@@ -1,5 +1,6 @@
 """Bounded UDP ingress isolated from parser and application GIL contention."""
 import multiprocessing as mp
+import os
 import queue
 import socket
 import time
@@ -7,12 +8,18 @@ import time
 
 def _receive(address, port, packet_size, capacity_bytes, output, stop, ready, stats):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    parent_pid = os.getppid()
+    parent_check_at = time.monotonic() + 1
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, capacity_bytes)
         sock.bind((address, port))
         sock.settimeout(0.1)
         ready.send((True, sock.getsockname()[1], sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)))
         while not stop.is_set():
+            if time.monotonic() >= parent_check_at:
+                if os.getppid() != parent_pid:
+                    break
+                parent_check_at = time.monotonic() + 1
             try:
                 data, sender = sock.recvfrom(packet_size)
             except socket.timeout:
@@ -41,7 +48,7 @@ class ProcessUDPHandler:
     """ScanSegmentAPI transport contract with timestamps captured in the child."""
 
     def __init__(self, address, port, packet_size=65535, queue_capacity=512,
-                 receive_buffer_bytes=4 * 1024 * 1024):
+                 receive_buffer_bytes=4 * 1024 * 1024, max_queue_age_s=1.0):
         ctx = mp.get_context("spawn")
         self._queue = ctx.Queue(maxsize=queue_capacity)
         self._stop = ctx.Event()
@@ -49,6 +56,7 @@ class ProcessUDPHandler:
         self._consumed = 0
         self._stale_dropped = 0
         self.queue_capacity = queue_capacity
+        self.max_queue_age_s_limit = max_queue_age_s
         self.last_host_receipt = None
         self.last_queue_age_s = 0.0
         self.max_queue_age_s = 0.0
@@ -91,7 +99,7 @@ class ProcessUDPHandler:
         # A saturated parser must recover to current data rather than spend
         # seconds reconstructing an already incomplete backlog. Count every loss.
         for _ in range(self.queue_capacity):
-            if time.monotonic() - monotonic <= 1.0:
+            if time.monotonic() - monotonic <= self.max_queue_age_s_limit:
                 break
             try:
                 newer = self._queue.get_nowait()

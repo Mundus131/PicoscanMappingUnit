@@ -27,7 +27,7 @@ class IngressTests(unittest.TestCase):
 
     def test_sustained_150_datagrams_per_second_with_consumer_stalls(self):
         import threading
-        transport = ProcessUDPHandler("127.0.0.1", 0)
+        transport = ProcessUDPHandler("127.0.0.1", 0, max_queue_age_s=10)
         count = 1500
         def produce():
             start = time.monotonic()
@@ -43,7 +43,7 @@ class IngressTests(unittest.TestCase):
                 if i % 150 == 0:
                     time.sleep(0.4)
                 payload, _ = transport.receive_new_scan_segment()
-                self.assertEqual(int.from_bytes(payload[:4], 'little'), i)
+                self.assertEqual(int.from_bytes(payload[:4], 'little'), i, transport.get_metrics())
             producer.join(timeout=2)
             self.assertEqual(transport.get_metrics()['ingress_queue_dropped'], 0)
         finally:
@@ -63,7 +63,7 @@ class IngressTests(unittest.TestCase):
         self.assertEqual(transport.get_metrics()["datagrams_received"], count)
 
     def test_slow_consumer_preserves_order_and_original_receipt_time(self):
-        transport = ProcessUDPHandler("127.0.0.1", 0)
+        transport = ProcessUDPHandler("127.0.0.1", 0, max_queue_age_s=10)
         try:
             self.send(transport.port, 150)
             self.wait_received(transport, 150)
