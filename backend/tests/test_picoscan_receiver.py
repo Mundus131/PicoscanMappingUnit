@@ -99,6 +99,17 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(result[0]['received_monotonic'], 1.0)
         self.assertEqual(self.info['incomplete_frames_dropped'], 0)
 
+    def test_closed_frame_index_stays_bounded_and_tracks_eviction(self):
+        for frame in range(4100):
+            self.manager._assemble_complete_frame_segments(self.info,
+                [self.segment(frame, 0), self.segment(frame, 1)])
+        self.assertEqual(len(self.info['closed_frame_index']), 4096)
+        self.assertEqual(self.info['closed_frame_index'], set(self.info['closed_frames']))
+        self.assertNotIn(0, self.info['closed_frame_index'])
+        before = self.info['duplicate_segments']
+        self.manager._assemble_complete_frame_segments(self.info, [self.segment(4099, 0)])
+        self.assertEqual(self.info['duplicate_segments'], before + 1)
+
     def test_unset_device_segment_count_uses_global_default(self):
         for global_count, device_count, expected in ((10, None, 10), (5, None, 5), (10, 2, 2)):
             with self.subTest(global_count=global_count, device_count=device_count):

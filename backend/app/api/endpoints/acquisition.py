@@ -948,9 +948,11 @@ def _run_analysis_for_session(session: dict, app):
                 "devices": session.get("devices", []), **_capture_quality(session),
             })
             logger.info("Analysis skipped: no points available for current session")
-    except Exception:
+    except Exception as exc:
         logger.exception("Session analysis failed")
-        session.setdefault("quality_issues", set()).add("analysis_failed")
+        issue = ("analysis_insufficient_data" if isinstance(exc, ValueError)
+                 and str(exc) == "Insufficient data for circle fitting." else "analysis_failed")
+        session.setdefault("quality_issues", set()).add(issue)
         session["measurement_valid"] = False
         session["analysis_metrics"] = None
         session["analysis_points"] = []

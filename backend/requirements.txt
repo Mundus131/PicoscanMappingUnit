@@ -16,5 +16,5 @@ python-multipart==0.0.6
 psutil==5.9.8
 pytest==7.4.3
 pytest-asyncio==0.21.1
-scansegmentapi @ git+https://github.com/SICKAG/ScanSegmentAPI
+scansegmentapi @ git+https://github.com/SICKAG/ScanSegmentAPI@8ee5ad75803a5c7d0ab4bfbf86a0b688181b0e65
 open3d==0.18.0

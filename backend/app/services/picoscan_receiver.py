@@ -15,6 +15,7 @@ from app.services.lms4000_receiver import Lms4000Receiver
 from app.core.device_manager import device_manager
 from app.services.udp_ingress import ProcessUDPHandler
 from app.services.compact_numpy import read_beam_data
+from app.services.scan_logging import quiet_segment_progress
 
 # Importy z ScanSegmentAPI
 try:
@@ -43,6 +44,8 @@ def _scansegment_print(*args, **kwargs):
 CompactApi.print = _scansegment_print
 CompactApi._read_beam_data = read_beam_data
 MsgpackApi.print = _scansegment_print
+quiet_segment_progress(CompactApi)
+quiet_segment_progress(MsgpackApi)
 
 UDP_RCVBUF_BYTES = 4 * 1024 * 1024
 PATTERN_OBSERVATION_WINDOW = 40
@@ -987,12 +990,18 @@ class PicoscanReceiverManager:
         pending = info.setdefault("frame_segments_pending", {})
         receipts = info.setdefault("frame_pending_ts", {})
         closed = info.setdefault("closed_frames", deque(maxlen=4096))
+        closed_index = info.get("closed_frame_index")
+        if closed_index is None:
+            closed_index = info["closed_frame_index"] = set(closed)
         completed = []
 
         def close(frame, invalid=False):
             bucket = pending.pop(frame)
             wall, monotonic = receipts.pop(frame)
+            if len(closed) == closed.maxlen:
+                closed_index.discard(closed[0])
             closed.append(frame)
+            closed_index.add(frame)
             pattern = sorted(bucket)
             expected = info.get("expected_segment_pattern")
             full = pattern == [-1]
@@ -1054,7 +1063,7 @@ class PicoscanReceiverManager:
             if frame is None:
                 info["incomplete_frames_dropped"] += 1
                 continue
-            if frame in closed:
+            if frame in closed_index:
                 info["duplicate_segments"] += 1
                 continue
             bucket = pending.setdefault(frame, {})

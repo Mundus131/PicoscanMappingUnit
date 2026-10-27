@@ -1,8 +1,12 @@
 FROM python:3.10-slim
 
+# Small least-squares fits must not monopolize all ARM cores during capture.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
 
 WORKDIR /app
 
