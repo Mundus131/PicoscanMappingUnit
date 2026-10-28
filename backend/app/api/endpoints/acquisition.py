@@ -263,10 +263,8 @@ def _downsample_points_np(points: np.ndarray | None, max_points: int) -> np.ndar
         return np.empty((0, 4), dtype=np.float32)
     if max_points <= 0 or len(arr) <= max_points:
         return np.array(arr, copy=True)
-    step = max(1, len(arr) // max_points)
-    sampled = arr[::step]
-    if len(sampled) > max_points:
-        sampled = sampled[:max_points]
+    # Include both ends instead of truncating every newly appended profile.
+    sampled = arr[np.linspace(0, len(arr) - 1, max_points, dtype=np.int64)]
     return np.array(sampled, copy=True)
 
 
@@ -894,6 +892,28 @@ def _save_measurement_async(session: dict, payload: dict):
 
 
 def _run_analysis_for_session(session: dict, app):
+    from app.services.analysis_process import analyze_capture
+    session['archive_pending'] = True
+    try:
+        result = analyze_capture(session, dict(device_manager.analysis_settings or {}))
+        session.update(result)
+        output_cfg = dict(device_manager.output_settings or {})
+        notifier = getattr(app.state, 'tcp_notifier', None)
+        if notifier and output_cfg.get('enabled') and session.get('analysis_app') != 'none' and _capture_quality(session)['measurement_valid']:
+            values = _flatten_output_values(session, session['analysis_app'], session.get('analysis_metrics') or {})
+            notifier.broadcast(_format_output_payload(_apply_output_units(values, output_cfg), output_cfg))
+    except Exception:
+        logger.exception('Isolated analysis/archive failed')
+        session.setdefault('quality_issues', set()).add('analysis_failed')
+        session['measurement_valid'] = False
+        session['analysis_metrics'] = None
+        session['analysis_points'] = []
+        session['archive_last_error'] = 'Isolated analysis/archive failed; capture remains in memory.'
+    finally:
+        session['archive_pending'] = False
+
+
+def _run_analysis_local(session: dict, app):
     try:
         t0 = time.time()
         points_np = _get_captured_full_points_np(session)
@@ -1101,6 +1121,9 @@ def _stop_trigger_session_locked(app):
                                 "captured_profiles", "captured_profile_positions", "captured_points_count",
                                 "captured_full_points_np", "captured_full_cache_dirty",
                                 "captured_preview_points_np", "profiles_count", "distance_mm"):
+                        session[key] = snapshot.get(key)
+                    for key in ('archive_pending', 'archive_last_error', 'archive_last_duration_ms',
+                                'archive_last_points_count', 'archive_last_ts'):
                         session[key] = snapshot.get(key)
                     # Snapshot may have encoded a different cloud: never reuse the old blob.
                     session["captured_preview_cache_dirty"] = True
