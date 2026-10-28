@@ -88,6 +88,23 @@ class ReceiverTests(unittest.TestCase):
     def segment(self, frame, counter, **extra):
         return dict(Modules=[dict(FrameNumber=frame, SegmentCounter=counter)], **extra)
 
+    def test_auto_pattern_change_is_marked_unverified(self):
+        self.info['auto_segment_pattern'] = True
+        for frame in range(35):
+            stamp = frame * .4
+            self.manager._assemble_complete_frame_segments(self.info, [
+                self.segment(frame, 0, _host_received_monotonic=stamp)])
+        self.assertEqual(self.info['expected_segment_pattern'], [0])
+        self.assertTrue(self.info['segment_pattern_inferred'])
+
+    def test_short_partial_burst_cannot_change_pattern(self):
+        self.info['auto_segment_pattern'] = True
+        for frame in range(10):
+            self.manager._assemble_complete_frame_segments(self.info, [
+                self.segment(frame, 0, _host_received_monotonic=frame*.4)])
+        self.assertEqual(self.info['expected_segment_pattern'], [0, 1])
+        self.assertFalse(self.info.get('segment_pattern_inferred', False))
+
     def test_parser_backlog_does_not_expire_timely_received_segments(self):
         first = self.segment(20, 0, _host_received_wall=1001,
                              _host_received_monotonic=1.0)

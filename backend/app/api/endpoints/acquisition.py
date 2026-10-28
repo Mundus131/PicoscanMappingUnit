@@ -438,6 +438,8 @@ def _run_encoder_process_loop(session: dict):
 
 
 def _run_encoder_loop(session: dict, source=None):
+    from app.services.encoder_continuity import EncoderContinuity
+    continuity = EncoderContinuity()
     stop_event = session.get("encoder_stop_event")
     history = session.setdefault("motion_history", MotionHistory())
     previous_config = None
@@ -456,6 +458,7 @@ def _run_encoder_loop(session: dict, source=None):
         config = (motion.get("encoder_wheel_mode"), motion.get("encoder_wheel_value_mm"),
                   tdc_cfg.get("ip_address"), tdc_cfg.get("encoder_port"))
         if previous_config is not None and config != previous_config:
+            continuity = EncoderContinuity()
             history.add(time.monotonic(), None)
             if source is not None:
                 source.close()
@@ -463,6 +466,7 @@ def _run_encoder_loop(session: dict, source=None):
         # Encoder cadence is independent of digital trigger polling.
         poll_interval_s = min(200, max(50, int(tdc_cfg.get("encoder_poll_interval_ms", 200) or 200))) / 1000.0
         if not bool(tdc_cfg.get("enabled", False)):
+            continuity = EncoderContinuity()
             if source is not None:
                 source.close()
             session["encoder_rpm"] = None
@@ -499,10 +503,15 @@ def _run_encoder_loop(session: dict, source=None):
                 session['encoder_poll_gap_ms'] = packet['poll_gap_ms']
                 session['encoder_delivery_ms'] = (time.monotonic() - received) * 1000
                 if packet.get('error'):
-                    history.add(received, None)
+                    held_speed, estimated = continuity.record(history, received, None,
+                        allow_hold=packet['error'] in ('ReadTimeout', 'ConnectTimeout'))
+                    session['encoder_speed_estimated'] = estimated
+                    if estimated and session.get('recording'):
+                        session.setdefault('quality_issues', set()).add('encoder_speed_estimated')
                     session['encoder_rpm'] = None
-                    session['encoder_speed_mps'] = None
-                    session['speed_mps'] = None
+                    session['encoder_speed_mps'] = held_speed
+                    session['speed_mps'] = held_speed
+                    session['encoder_sample_monotonic'] = received
                     _set_encoder_error(session, 'encoder_read_failed', 'Encoder HTTP read failed: ' + packet['error'])
                     continue
                 payload = packet['payload']
@@ -518,8 +527,6 @@ def _run_encoder_loop(session: dict, source=None):
             elif speed_mps is None or not np.isfinite(speed_mps):
                 speed_mps = None
                 _set_encoder_error(session, "encoder_wheel_invalid", "Encoder wheel circumference/diameter must be finite and positive.")
-            elif speed_mps < 0:
-                _set_encoder_error(session, "reverse_motion", "Reverse encoder motion is not supported for length measurement.")
             elif received - request_started > 0.5:
                 speed_mps = None
                 _set_encoder_error(session, "encoder_latency", f"Encoder response took {session['encoder_request_ms']:.0f} ms (limit 500 ms); sample timing is unreliable.")
@@ -527,7 +534,11 @@ def _run_encoder_loop(session: dict, source=None):
                 session["encoder_error"] = None
                 session["encoder_error_message"] = None
             # Response receipt is a host-time estimate, not a hardware encoder timestamp.
-            history.add(received, speed_mps)
+            speed_mps, estimated = continuity.record(history, received, speed_mps,
+                allow_hold=session.get('encoder_error') == 'encoder_latency')
+            session['encoder_speed_estimated'] = estimated
+            if estimated and session.get('recording'):
+                session.setdefault('quality_issues', set()).add('encoder_speed_estimated')
             session["encoder_last_data"] = payload
             session["encoder_rpm"] = rpm
             session["encoder_speed_mps"] = speed_mps
@@ -537,6 +548,8 @@ def _run_encoder_loop(session: dict, source=None):
         except Exception as exc:
             if source is not None:
                 source.close()
+            continuity = EncoderContinuity()
+            session['encoder_speed_estimated'] = False
             session["encoder_request_ms"] = (time.monotonic() - request_started) * 1000.0
             session["encoder_request_max_ms"] = max(session.get("encoder_request_max_ms", 0.0), session["encoder_request_ms"])
             history.add(time.monotonic(), None)
@@ -645,11 +658,13 @@ def _consume_positioned_groups(session, final=False):
             issues.update("encoder_unbracketed_frame" if e == "pending" else e for e in errors)
             continue
         distance = sum(positions.values()) / len(positions)
-        session["distance_mm"] = max(session.get("distance_mm", 0.0), distance)
+        session["distance_mm"] = distance
         spacing = session["profiling_distance_mm"]
-        if distance < session.get("start_delay_mm_remaining", 0.0):
-            continue
-        if distance - session.get("last_profile_distance_mm", 0.0) < spacing:
+        if not session.get('profile_start_reached'):
+            if session.get('start_delay_mm_remaining', 0.0) > 0 and distance < session['start_delay_mm_remaining']:
+                continue
+            session['profile_start_reached'] = True
+        if abs(distance - session.get("last_profile_distance_mm", 0.0)) < spacing:
             continue
         clouds = []
         for device_id, frame in group.items():
@@ -693,6 +708,8 @@ def _update_session_locked(session: dict, receiver_manager):
             issues.add("motion_configuration_changed")
         session["last_update_ts"] = time.time()
         if motion.get("mode", "fixed") == "encoder":
+            if session.get('encoder_speed_estimated'):
+                issues.add('encoder_speed_estimated')
             age = now - session.get("encoder_sample_monotonic", float("-inf"))
             speed = session.get("encoder_speed_mps")
             if age > 0.5 or speed is None:
@@ -707,6 +724,8 @@ def _update_session_locked(session: dict, receiver_manager):
         health = receiver_manager.get_health_snapshot()
         for device_id in session["devices"]:
             current = health.get(device_id, {})
+            if current.get('segment_pattern_inferred'):
+                issues.add('segment_pattern_unverified')
             baseline = session["receiver_health_baseline"].get(device_id, {})
             if (baseline.get('stream_epoch') is not None
                     and current.get('stream_epoch') != baseline['stream_epoch']):
@@ -726,6 +745,8 @@ def _update_session_locked(session: dict, receiver_manager):
             if stop_stamp is not None:
                 frames = [f for f in frames if f.get("received_monotonic", float("inf")) <= stop_stamp]
             if frames:
+                from app.services.raw_capture import retain
+                retain(session, device_id, frames)
                 session["device_last_frame_monotonic"][device_id] = max(
                     frame.get("received_monotonic", 0.0) for frame in frames)
             if now - session["device_last_frame_monotonic"].get(device_id, session["capture_started_monotonic"]) > 0.5:
@@ -747,7 +768,7 @@ def _update_session_locked(session: dict, receiver_manager):
             if error and error != "pending":
                 issues.add(error)
             elif distance is not None:
-                session["distance_mm"] = max(session.get("distance_mm", 0.0), distance)
+                session["distance_mm"] = distance
         session["perf_last_profiles_added"] = added
         session["perf_max_profiles_per_cycle"] = max(session.get("perf_max_profiles_per_cycle", 0), added)
         # Filtering affects only a copy for display, never captured measurement arrays.
@@ -817,6 +838,10 @@ def _start_trigger_session_locked(app):
     session["measurement_valid"] = False
     session["analysis_pending"] = False
     session["captured_profiles"] = []
+    session['raw_frames'] = []
+    session['raw_frames_received'] = 0
+    session['raw_frames_dropped'] = 0
+    session['raw_capture_bytes'] = 0
     session["captured_points_count"] = 0
     session["pending_recording_frames"] = []
     session["captured_full_points_np"] = None
@@ -827,6 +852,7 @@ def _start_trigger_session_locked(app):
     session["captured_preview_cache_dirty"] = False
     session["captured_preview_last_encode_ts"] = 0.0
     session["last_profile_distance_mm"] = 0.0
+    session['profile_start_reached'] = False
     session["profiles_count"] = 0
     # Clear previous run analysis state to avoid stale results being shown.
     session["analysis_metrics"] = None
@@ -1077,6 +1103,7 @@ def _stop_trigger_session_locked(app):
     snapshot = dict(session)
     snapshot["archive_live_session"] = session
     snapshot["captured_profiles"] = list(session.get("captured_profiles", []))
+    snapshot['raw_frames'] = list(session.get('raw_frames', []))
     snapshot["captured_profile_positions"] = list(session.get("captured_profile_positions", []))
     snapshot["quality_issues"] = set(session.get("quality_issues", set()))
     snapshot["pending_profile_groups"] = deque(session.get("pending_profile_groups", []))
@@ -1245,23 +1272,23 @@ def _estimate_speed_capability(session: dict, receiver_manager) -> dict:
     loop_arr = np.asarray(perf_loop, dtype=np.float64)
     loop_mean_ms = float(np.mean(loop_arr))
     loop_p95_ms = float(np.percentile(loop_arr, 95))
-    # Acquisition loop sleeps 50 ms after each update.
-    loop_period_s = max(0.001, (loop_p95_ms / 1000.0) + 0.05)
+    # The recording loop sleeps 10 ms and can drain multiple complete frames.
+    loop_period_s = max(0.001, (loop_p95_ms / 1000.0) + 0.01)
     loop_rate_hz = 1.0 / loop_period_s
-    # Quality-oriented limit: <= 1 profile per update cycle.
-    max_profiles_quality = loop_rate_hz
-    max_speed_quality_mps = (profiling_distance_mm / 1000.0) * max_profiles_quality
-    recommended_speed_mps = max(0.0, max_speed_quality_mps * 0.8)
 
     max_profiles_per_cycle = int(session.get("perf_max_profiles_per_cycle", 0) or 0)
     if max_profiles_per_cycle > 1:
         overload_note = (
-            "Wykryto wiele profili dopisywanych w jednej iteracji, co oznacza że układ okresowo nie nadążał."
+            "Wiele profili w jednej iteracji jest dozwolone; o stratach informuja liczniki kolejek i ramek."
         )
     else:
         overload_note = "Nie wykryto zaległości profilowania w pojedynczej iteracji."
 
     availability = _device_availability_summary(receiver_manager)
+    rates = [float((h or {}).get('data_rate_hz') or 0) for h in availability['health'].values()]
+    received_scan_hz = min(rates) if rates else 0.0
+    max_speed_quality_mps = profiling_distance_mm / 1000.0 * received_scan_hz
+    recommended_speed_mps = max_speed_quality_mps * 0.8
     online_count = len(availability["online_ids"])
     enabled_total = int(availability["enabled_total"])
     online_ratio = (online_count / enabled_total) if enabled_total > 0 else 0.0
@@ -1287,6 +1314,8 @@ def _estimate_speed_capability(session: dict, receiver_manager) -> dict:
             "max_profiles_per_cycle_seen": max_profiles_per_cycle,
         },
         "speed_limits": {
+            "received_scan_hz": received_scan_hz,
+            "required_scan_hz": abs(float(session.get('speed_mps') or 0)) * 1000.0 / profiling_distance_mm,
             "max_quality_mps": max_speed_quality_mps,
             "recommended_mps": recommended_speed_mps,
             "max_quality_mmps": max_speed_quality_mps * 1000.0,
@@ -1310,7 +1339,7 @@ def _estimate_speed_capability(session: dict, receiver_manager) -> dict:
         "receiver_pipeline": receiver_pipeline,
         "validation_notes": [
             overload_note,
-            "Limit jakościowy liczony dla zasady 1 profil / iteracja pętli akwizycji.",
+            "Limit odstepu profili liczony z aktualnej czestotliwosci odebranych pelnych skanow; nie gwarantuje dokladnosci.",
             "Dla bezpieczeństwa operacyjnego zalecane jest 80% limitu jakościowego.",
         ],
     }
@@ -1736,6 +1765,10 @@ async def trigger_status(request: Request):
     availability = _device_availability_summary(receiver_manager)
     tdc_label = _resolve_tdc_label(request.app)
     return {
+        "encoder_speed_estimated": session.get('encoder_speed_estimated', False),
+        "raw_frames_received": session.get('raw_frames_received', 0),
+        "raw_frames_retained": len(session.get('raw_frames', [])),
+        "raw_frames_dropped": session.get('raw_frames_dropped', 0),
         "recording": session.get("recording", False),
         "distance_mm": session.get("distance_mm", 0.0),
         "speed_mps": session.get("speed_mps"),
@@ -1766,6 +1799,10 @@ async def trigger_status_stream(request: Request):
             _sync_encoder_worker(session)
             tdc_label = _resolve_tdc_label(request.app)
             payload = {
+                "raw_frames_received": session.get('raw_frames_received', 0),
+                "encoder_speed_estimated": session.get('encoder_speed_estimated', False),
+                "raw_frames_retained": len(session.get('raw_frames', [])),
+                "raw_frames_dropped": session.get('raw_frames_dropped', 0),
                 "recording": session.get("recording", False),
                 "distance_mm": session.get("distance_mm", 0.0),
                 "speed_mps": session.get("speed_mps"),

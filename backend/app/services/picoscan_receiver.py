@@ -452,6 +452,7 @@ class PicoscanReceiverManager:
             "listen_port": listen_port,
             "segments": [],
             "segments_per_scan_hint": segments_per_scan,
+            "auto_segment_pattern": segment_pattern is None,
             "expected_segment_pattern": expected_pattern,
             "dominant_segment_pattern": expected_pattern,
             "dominant_pattern_samples": 0,
@@ -1007,12 +1008,10 @@ class PicoscanReceiverManager:
             return None, None
 
     def _assemble_complete_frame_segments(self, info: dict, segment_list: list):
-        """Assemble configured-count scans, never infer a smaller count.
+        """Explicit patterns are strict; auto mode observes timeout-closed frames.
 
-        Without an explicit pattern, wait for timeout-closed frames and lock
-        after five matching, exactly configured-count patterns. Lock is frozen
-        until restart. This cannot prove scanner configuration: the operator
-        must configure the correct count for the scanner's transmitted FOV.
+        A changed contiguous pattern requires 30 matching observations and is
+        flagged as inferred, never silently treated as verified measurement data.
         """
         timeout = float((device_manager.point_cloud_settings or {}).get(
             "incomplete_frame_timeout_s", 0.35) or 0.35)
@@ -1026,6 +1025,7 @@ class PicoscanReceiverManager:
         completed = []
 
         def close(frame, invalid=False):
+            nonlocal count
             bucket = pending.pop(frame)
             wall, monotonic = receipts.pop(frame)
             if len(closed) == closed.maxlen:
@@ -1034,6 +1034,18 @@ class PicoscanReceiverManager:
             closed_index.add(frame)
             pattern = sorted(bucket)
             expected = info.get("expected_segment_pattern")
+            if info.get('auto_segment_pattern') and not invalid and pattern != [-1]:
+                contiguous = pattern == list(range(len(pattern)))
+                samples = info.get('auto_pattern_samples', 0) + 1 if info.get('auto_pattern_candidate') == pattern else 1
+                info['auto_pattern_candidate'] = pattern
+                info['auto_pattern_samples'] = samples if contiguous else 0
+                if contiguous and samples >= 30 and len(pattern) != count:
+                    count = len(pattern)
+                    info['segments_per_scan_hint'] = count
+                    expected = info['expected_segment_pattern'] = pattern
+                    info['pattern_locked'] = True
+                    info['segment_pattern_inferred'] = True
+                    info['pattern_switch_count'] = info.get('pattern_switch_count', 0) + 1
             full = pattern == [-1]
             valid = not invalid and (full or (count > 0 and len(pattern) == count))
             if valid and not full and expected is None:
@@ -1103,7 +1115,11 @@ class PicoscanReceiverManager:
                 continue
             bucket[counter] = segment
             expected = info.get("expected_segment_pattern")
-            if (counter < -1 or (counter != -1 and count <= 0)
+            if info.get('auto_segment_pattern') and counter >= 0:
+                # Close on receipt-time timeout to observe the whole pattern,
+                # including additional segments after a scanner mode change.
+                pass
+            elif (counter < -1 or (counter != -1 and count <= 0)
                     or (expected is not None and counter != -1 and counter not in expected)
                     or (count > 0 and len(bucket) > count)):
                 close(frame, invalid=True)
@@ -1363,6 +1379,7 @@ class PicoscanReceiverManager:
                 "device_frame_regressions": info.get("device_frame_regressions", 0),
                 "device_frame_tracking_supported": info.get("device_frame_tracking_supported", False),
                 "pattern_locked": info.get("pattern_locked", False),
+                "segment_pattern_inferred": info.get('segment_pattern_inferred', False),
                 "pattern_learning_frames_dropped": info.get("pattern_learning_frames_dropped", 0),
                 "last_partial_frame_number": info.get("last_partial_frame_number"),
                 "last_partial_segment_counters": info.get("last_partial_segment_counters") or [],

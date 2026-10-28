@@ -25,6 +25,7 @@ async def tdc_status(request: Request):
         "trigger_error": getattr(request.app.state, "tdc_trigger_error", None),
         "encoder_rpm": session.get("encoder_rpm"),
         "encoder_speed_mps": session.get("encoder_speed_mps"),
+        "encoder_speed_estimated": session.get('encoder_speed_estimated', False),
         "encoder_error": session.get("encoder_error") or "",
         "encoder_error_message": session.get("encoder_error_message") or "",
         "encoder_request_ms": session.get("encoder_request_ms"),

@@ -28,12 +28,20 @@ class MotionTests(unittest.TestCase):
         self.assertEqual(h.distance(0, .3)[1], 'encoder_history_gap')
         self.assertEqual(h.distance(.1, .2)[1], 'encoder_invalid')
 
-    def test_long_gap_reverse_and_nan_are_invalid(self):
+    def test_long_gap_and_nan_are_invalid(self):
         for speed in (-.2, float('nan'), float('inf'), .2):
             h = MotionHistory()
             h.add(0, .2)
             h.add(1, speed)
             self.assertIsNone(h.distance(0, .5)[0])
+
+    def test_reverse_reduces_position(self):
+        h = MotionHistory()
+        for t, v in ((0, 1), (.2, 1), (.4, -1), (.6, -1)):
+            h.add(t, v)
+        self.assertAlmostEqual(h.distance(0, .2)[0], 200)
+        self.assertAlmostEqual(h.distance(0, .6)[0], 0)
+        self.assertIsNone(h.distance(0, .6)[1])
 
     def test_history_bound(self):
         h = MotionHistory(capacity=2)

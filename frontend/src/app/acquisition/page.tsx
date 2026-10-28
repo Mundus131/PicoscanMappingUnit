@@ -16,8 +16,12 @@ interface TriggerStatus extends MeasurementQuality {
   speed_mps: number | null;
   encoder_rpm?: number | null;
   encoder_speed_mps?: number | null;
+  encoder_speed_estimated?: boolean;
   profiling_distance_mm: number | null;
   profiles_count?: number;
+  raw_frames_received?: number;
+  raw_frames_retained?: number;
+  raw_frames_dropped?: number;
   points_count: number;
   last_update_ts: number | null;
   tdc_input_state?: string;
@@ -606,7 +610,7 @@ export default function AcquisitionPage() {
                   <p className="text-2xl font-semibold text-slate-900">{status.recording ? 'ON' : 'OFF'}</p>
                 </div>
                 <div>
-                  <p className="text-xs text-gray-500">Speed</p>
+                  <p className="text-xs text-gray-500">Speed{status.encoder_speed_estimated ? ' (ESTIMATED, max 1 s hold)' : ''}</p>
                   <p className="text-2xl font-semibold text-slate-900">{speedLabel}</p>
                   {status.encoder_rpm !== null && status.encoder_rpm !== undefined && (
                     <p className="text-xs text-gray-400">Encoder: {status.encoder_rpm.toFixed(1)} rpm</p>
@@ -652,6 +656,7 @@ export default function AcquisitionPage() {
                 <div>
                   <p className="text-xs text-gray-500">Profiles collected</p>
                   <p className="text-2xl font-semibold text-slate-900">{status.profiles_count ?? 0}</p>
+                  <p className="text-xs text-gray-500">Raw scanner frames: {status.raw_frames_retained ?? 0} retained / {status.raw_frames_received ?? 0} received; {status.raw_frames_dropped ?? 0} dropped. Raw frames have no assigned motion position.</p>
                 </div>
               </div>
 

@@ -12,7 +12,9 @@ _pool = None
 
 INPUT_KEYS = ('captured_profiles', 'captured_profile_positions', 'profiling_distance_mm',
               'profiles_count', 'distance_mm', 'devices', 'quality_issues', 'measurement_valid',
-              'measurement_encoder_error', 'measurement_encoder_error_message')
+              'measurement_encoder_error', 'measurement_encoder_error_message',
+              'raw_frames', 'raw_frames_received', 'raw_frames_dropped',
+              'capture_calibrations', 'capture_motion')
 OUTPUT_KEYS = ('analysis_metrics', 'analysis_points', 'analysis_duration_ms',
                'analysis_timestamp_ms', 'analysis_app', 'quality_issues', 'measurement_valid',
                'archive_last_error', 'archive_last_duration_ms', 'archive_last_points_count',
@@ -29,6 +31,8 @@ def _analyze(snapshot, settings):
     def save(session, payload):
         started = time.monotonic()
         try:
+            from app.services.raw_capture import archive_fields
+            payload.update(archive_fields(session))
             save_measurement(payload)
             session['archive_last_error'] = None
             session['archive_last_points_count'] = len(payload.get('original_points') or [])

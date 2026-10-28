@@ -25,6 +25,7 @@ class AnalysisProcessTests(unittest.TestCase):
                         captured_profile_positions=[10], profiles_count=1, distance_mm=20,
                         profiling_distance_mm=10, quality_issues={'encoder_history_gap'},
                         measurement_encoder_error='encoder_read_failed', devices=['test'])
+        snapshot['raw_frames'] = [dict(points=np.ones((3, 4)), position_mm=None)]
         with tempfile.TemporaryDirectory() as directory:
             with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn')) as pool:
                 result = pool.submit(smoke_analysis, directory, snapshot).result(timeout=60)
@@ -34,6 +35,8 @@ class AnalysisProcessTests(unittest.TestCase):
             self.assertEqual(len(files), 1)
             saved = json.loads(files[0].read_text())
             self.assertEqual(len(saved['original_points']), 2)
+            self.assertEqual(len(saved['raw_frames'][0]['points']), 3)
+            self.assertIsNone(saved['raw_frames'][0]['position_mm'])
             self.assertEqual(saved['encoder_error'], 'encoder_read_failed')
             self.assertFalse(saved['measurement_valid'])
 

@@ -11,7 +11,7 @@ class MotionHistory:
         self.lock = threading.Lock()
 
     def add(self, timestamp, speed):
-        if speed is not None and (not math.isfinite(speed) or speed < 0):
+        if speed is not None and not math.isfinite(speed):
             speed = None
         with self.lock:
             if self.samples and timestamp <= self.samples[-1][0]:

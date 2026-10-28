@@ -51,6 +51,16 @@ class CaptureRegressionTests(unittest.TestCase):
             self.frame += 1
         self.ns['_update_session_once'](self.session, self.receiver)
 
+    def test_reverse_profile_is_kept_at_decreasing_position(self):
+        self.session.update(profiling_distance_mm=10, capture_calibrations={'scanner': {}},
+                            last_profile_distance_mm=100, profile_start_reached=True)
+        self.ns['_position_for_frame'] = lambda session, stamp: (50, None)
+        self.session['pending_profile_groups'].append({'scanner': dict(
+            received_monotonic=1, points=np.ones((2, 4)))})
+        self.assertEqual(self.ns['_consume_positioned_groups'](self.session), 1)
+        self.assertEqual(self.session['distance_mm'], 50)
+        self.assertTrue(np.all(self.session['profiles'][0][:, 1] == 50))
+
     def test_delayed_cycle_does_not_invent_profiles(self):
         self.update(1.)
         self.assertEqual(len(self.session['profiles']), 1)
