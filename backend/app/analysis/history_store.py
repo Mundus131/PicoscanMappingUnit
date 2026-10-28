@@ -86,8 +86,8 @@ def list_measurements() -> List[Dict[str, Any]]:
                     summary_pending=True, metrics=None, **measurement_quality({})))
         except Exception:
             continue
-    # newest first
-    items.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
+    # IDs carry nanosecond precision; created_at alone can tie on fast disks.
+    items.sort(key=lambda x: (x.get("created_at") or 0, str(x.get("id") or "")), reverse=True)
     return items
 
 

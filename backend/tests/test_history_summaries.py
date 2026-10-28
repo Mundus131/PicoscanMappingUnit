@@ -7,6 +7,16 @@ from app.analysis import history_store as history
 
 
 class HistorySummaryTests(unittest.TestCase):
+    def test_latest_first_when_timestamps_share_one_millisecond(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(history, 'HISTORY_DIR', directory), \
+                patch.object(history.time, 'time', return_value=1700000000), \
+                patch.object(history.time, 'time_ns', side_effect=[1700000000000000001, 1700000000000000002]):
+            old = history.save_measurement({'measurement_valid': False})
+            new = history.save_measurement({'measurement_valid': True})
+            items = history.list_measurements()
+            self.assertEqual([item['id'] for item in items], [new['id'], old['id']])
+            self.assertTrue(items[0]['measurement_valid'])
+
     def test_listing_does_not_parse_full_archives(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(history, 'HISTORY_DIR', directory):
             saved = history.save_measurement(dict(original_points=[[1, 2, 3]], metrics={'length': 10}))
