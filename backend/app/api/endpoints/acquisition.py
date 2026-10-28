@@ -430,7 +430,16 @@ def _set_encoder_error(session, code, message):
     session["encoder_error_message"] = message
 
 
-def _run_encoder_loop(session: dict):
+def _run_encoder_process_loop(session: dict):
+    from app.services.encoder_process import EncoderProcess
+    source = EncoderProcess()
+    try:
+        _run_encoder_loop(session, source)
+    finally:
+        source.close()
+
+
+def _run_encoder_loop(session: dict, source=None):
     stop_event = session.get("encoder_stop_event")
     history = session.setdefault("motion_history", MotionHistory())
     previous_config = None
@@ -438,6 +447,8 @@ def _run_encoder_loop(session: dict):
     while stop_event and not stop_event.is_set():
         motion = device_manager.motion_settings or {}
         if (motion.get("mode", "fixed") or "fixed") != "encoder":
+            if source is not None:
+                source.close()
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
             stop_event.wait(0.2)
@@ -448,10 +459,14 @@ def _run_encoder_loop(session: dict):
                   tdc_cfg.get("ip_address"), tdc_cfg.get("encoder_port"))
         if previous_config is not None and config != previous_config:
             history.add(time.monotonic(), None)
+            if source is not None:
+                source.close()
         previous_config = config
         # Encoder cadence is independent of digital trigger polling.
         poll_interval_s = min(200, max(50, int(tdc_cfg.get("encoder_poll_interval_ms", 200) or 200))) / 1000.0
         if not bool(tdc_cfg.get("enabled", False)):
+            if source is not None:
+                source.close()
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
             history.add(time.monotonic(), None)
@@ -464,8 +479,35 @@ def _run_encoder_loop(session: dict):
             session["encoder_poll_gap_ms"] = (request_started - previous_request_started) * 1000.0
         previous_request_started = request_started
         try:
-            payload = tdc_rest.fetch_encoder_process_data(data_format="iodd")
-            received = time.monotonic()
+            if source is None:
+                payload = tdc_rest.fetch_encoder_process_data(data_format="iodd")
+                received = time.monotonic()
+            else:
+                token_started = time.monotonic()
+                token = tdc_rest.tdc_token_manager.get_token()
+                session['encoder_token_ms'] = (time.monotonic() - token_started) * 1000
+                if stop_event.is_set():
+                    return
+                if not token:
+                    raise RuntimeError('Encoder token unavailable')
+                source.configure(tdc_rest.build_process_url(str(tdc_cfg.get('encoder_port') or '1')), token, poll_interval_s)
+                packet = source.receive()
+                if packet is None:
+                    continue
+                request_started, received = packet['started'], packet['received']
+                session['encoder_http_ms'] = (received - request_started) * 1000
+                session['encoder_request_ms'] = session['encoder_http_ms']
+                session['encoder_request_max_ms'] = max(session.get('encoder_request_max_ms', 0.0), session['encoder_http_ms'])
+                session['encoder_poll_gap_ms'] = packet['poll_gap_ms']
+                session['encoder_delivery_ms'] = (time.monotonic() - received) * 1000
+                if packet.get('error'):
+                    history.add(received, None)
+                    session['encoder_rpm'] = None
+                    session['encoder_speed_mps'] = None
+                    session['speed_mps'] = None
+                    _set_encoder_error(session, 'encoder_read_failed', 'Encoder HTTP read failed: ' + packet['error'])
+                    continue
+                payload = packet['payload']
             session["encoder_request_ms"] = (received - request_started) * 1000.0
             session["encoder_request_max_ms"] = max(session.get("encoder_request_max_ms", 0.0), session["encoder_request_ms"])
             previous_sample = session.get("encoder_sample_monotonic")
@@ -495,15 +537,21 @@ def _run_encoder_loop(session: dict):
             # Keep live speed visible even when trigger recording is stopped.
             session["speed_mps"] = speed_mps
         except Exception as exc:
+            if source is not None:
+                source.close()
             session["encoder_request_ms"] = (time.monotonic() - request_started) * 1000.0
             session["encoder_request_max_ms"] = max(session.get("encoder_request_max_ms", 0.0), session["encoder_request_ms"])
             history.add(time.monotonic(), None)
             _set_encoder_error(session, "encoder_read_failed", "TDC encoder read failed (" + type(exc).__name__ + "). Check connection, token and IO-Link port.")
             session["encoder_rpm"] = None
             session["encoder_speed_mps"] = None
+            session["speed_mps"] = None
+            if source is not None:
+                stop_event.wait(poll_interval_s)
 
         # Slow requests do not add another full polling interval or spawn catch-up reads.
-        stop_event.wait(max(0.0, poll_interval_s - (time.monotonic() - request_started)))
+        if source is None:
+            stop_event.wait(max(0.0, poll_interval_s - (time.monotonic() - request_started)))
 
 
 def _sync_encoder_worker(session: dict):
@@ -516,15 +564,14 @@ def _sync_encoder_worker(session: dict):
     if should_run and not running:
         stop_event = threading.Event()
         session["encoder_stop_event"] = stop_event
-        worker = threading.Thread(target=_run_encoder_loop, args=(session,), daemon=True)
+        worker = threading.Thread(target=_run_encoder_process_loop, args=(session,), daemon=True)
         session["encoder_thread"] = worker
         worker.start()
     elif (not should_run) and running:
         stop_event = session.get("encoder_stop_event")
         if stop_event:
             stop_event.set()
-        session["encoder_thread"] = None
-        session["encoder_stop_event"] = None
+        # Keep the worker reference until it exits, preventing overlapping readers.
         session["encoder_rpm"] = None
         session["encoder_speed_mps"] = None
 
@@ -539,8 +586,7 @@ def stop_encoder_monitor(app):
     stop_event = session.get("encoder_stop_event")
     if stop_event:
         stop_event.set()
-    session["encoder_thread"] = None
-    session["encoder_stop_event"] = None
+    # The worker closes its subprocess in finally; do not permit an overlapping restart.
     session["encoder_rpm"] = None
     session["encoder_speed_mps"] = None
 

@@ -6,10 +6,10 @@ from unittest.mock import Mock
 
 
 class EncoderPollingTests(unittest.TestCase):
-    def run_cycle(self, duration, failure=False, enabled=True, encoder_interval=None):
+    def run_cycle(self, duration, failure=False, enabled=True, encoder_interval=None, packet=None):
         clock = [10.0]
         stop = Mock()
-        stop.is_set.side_effect = [False, True]
+        stop.is_set.side_effect = [False, False, True] if packet is not None else [False, True]
         history = Mock()
         errors = []
         settings = {'enabled': enabled, 'poll_interval_ms': 50}
@@ -28,7 +28,9 @@ class EncoderPollingTests(unittest.TestCase):
                 tdc_settings=settings),
             MotionHistory=lambda: history,
             time=SimpleNamespace(monotonic=lambda: clock[0]),
-            tdc_rest=SimpleNamespace(fetch_encoder_process_data=fetch),
+            tdc_rest=SimpleNamespace(fetch_encoder_process_data=fetch,
+                tdc_token_manager=SimpleNamespace(get_token=lambda: 'test'),
+                build_process_url=lambda _: 'http://localhost/test'),
             _extract_encoder_rpm=lambda _: 60,
             _calc_speed_from_encoder_rpm=lambda *_: 0.2,
             np=SimpleNamespace(isfinite=lambda _: True),
@@ -40,8 +42,26 @@ class EncoderPollingTests(unittest.TestCase):
                     and n.name == '_run_encoder_loop')
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), ns)
         self.session = {'encoder_stop_event': stop}
-        ns['_run_encoder_loop'](self.session)
-        return stop.wait.call_args.args[0], history, errors
+        source = Mock() if packet is not None else None
+        if source is not None:
+            source.receive.return_value = packet
+        ns['_run_encoder_loop'](self.session, source)
+        return stop.wait.call_args.args[0] if stop.wait.called else None, history, errors
+
+    def test_process_timestamp_not_parent_delivery_time_is_used(self):
+        _, history, errors = self.run_cycle(0, packet=dict(started=9.0, received=9.1,
+            poll_gap_ms=200, payload={}))
+        self.assertEqual(history.add.call_args.args, (9.1, 0.2))
+        self.assertAlmostEqual(self.session['encoder_http_ms'], 100)
+        self.assertAlmostEqual(self.session['encoder_delivery_ms'], 900)
+        self.assertEqual(errors, [])
+
+    def test_process_http_failure_invalidates_history(self):
+        _, history, errors = self.run_cycle(0, packet=dict(started=9.0, received=9.5,
+            poll_gap_ms=200, error='ReadTimeout'))
+        self.assertEqual(history.add.call_args.args, (9.5, None))
+        self.assertEqual(errors, ['encoder_read_failed'])
+        self.assertIsNone(self.session['speed_mps'])
 
     def test_request_time_is_part_of_200ms_cycle(self):
         delay, _, errors = self.run_cycle(0.08)

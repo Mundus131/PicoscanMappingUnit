@@ -84,6 +84,9 @@ interface TdcStatusResponse {
   encoder_error?: string | null;
   encoder_error_message?: string | null;
   encoder_request_ms?: number | null;
+  encoder_http_ms?: number | null;
+  encoder_token_ms?: number | null;
+  encoder_delivery_ms?: number | null;
   encoder_request_max_ms?: number | null;
   encoder_poll_gap_ms?: number | null;
   encoder_sample_gap_ms?: number | null;
@@ -1803,6 +1806,9 @@ export default function CalibrationPage() {
                     {' | max: '}{tdcStatus.encoder_request_max_ms?.toFixed(0) ?? '-'} ms
                     {' | poll gap: '}{tdcStatus.encoder_poll_gap_ms?.toFixed(0) ?? '-'} ms
                     {' | sample gap: '}{tdcStatus.encoder_sample_gap_ms?.toFixed(0) ?? '-'} ms
+                    {' | HTTP: '}{tdcStatus.encoder_http_ms?.toFixed(0) ?? '-'} ms
+                    {' | token: '}{tdcStatus.encoder_token_ms?.toFixed(0) ?? '-'} ms
+                    {' | delivery: '}{tdcStatus.encoder_delivery_ms?.toFixed(0) ?? '-'} ms
                   </div>
                   {(tdcStatus.encoder_error || tdcStatus.encoder_error_message) && (
                     <div role="alert" className="col-span-2 text-rose-700">
