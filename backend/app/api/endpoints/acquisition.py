@@ -497,6 +497,7 @@ def _run_encoder_loop(session: dict, source=None):
                 if packet is None:
                     continue
                 request_started, received = packet['started'], packet['received']
+                session['encoder_http_retries_total'] = session.get('encoder_http_retries_total', 0) + packet.get('retries', 0)
                 session['encoder_http_ms'] = (received - request_started) * 1000
                 session['encoder_request_ms'] = session['encoder_http_ms']
                 session['encoder_request_max_ms'] = max(session.get('encoder_request_max_ms', 0.0), session['encoder_http_ms'])
@@ -506,6 +507,7 @@ def _run_encoder_loop(session: dict, source=None):
                     held_speed, estimated = continuity.record(history, received, None,
                         allow_hold=packet['error'] in ('ReadTimeout', 'ConnectTimeout'))
                     session['encoder_speed_estimated'] = estimated
+                    session['encoder_hold_reason'] = continuity.reason
                     if estimated and session.get('recording'):
                         session.setdefault('quality_issues', set()).add('encoder_speed_estimated')
                     session['encoder_rpm'] = None
@@ -537,6 +539,7 @@ def _run_encoder_loop(session: dict, source=None):
             speed_mps, estimated = continuity.record(history, received, speed_mps,
                 allow_hold=session.get('encoder_error') == 'encoder_latency')
             session['encoder_speed_estimated'] = estimated
+            session['encoder_hold_reason'] = continuity.reason
             if estimated and session.get('recording'):
                 session.setdefault('quality_issues', set()).add('encoder_speed_estimated')
             session["encoder_last_data"] = payload

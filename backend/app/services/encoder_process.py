@@ -24,15 +24,24 @@ def _poll_encoder(config, commands, samples, stop, parent_pid):
             packet = dict(generation=config['generation'], started=started,
                           poll_gap_ms=None if previous_started is None else (started - previous_started) * 1000)
             previous_started = started
-            try:
-                with http.get(config['url'], headers={
-                    'Cookie': 'access_token=' + config['token'],
-                    'User-Agent': 'Picoscan-Encoder/1.0'}, timeout=(0.3, 0.5)) as response:
-                    response.raise_for_status()
-                    packet['payload'] = {'data': response.json(), 'format': 'iodd'}
-            except Exception as exc:
-                # Exception messages may contain URLs or response data.
-                packet['error'] = type(exc).__name__
+            packet['retries'] = 0
+            for attempt in range(2):
+                try:
+                    with http.get(config['url'], headers={
+                        'Cookie': 'access_token=' + config['token'],
+                        'User-Agent': 'Picoscan-Encoder/1.0'}, timeout=(0.1, 0.15)) as response:
+                        response.raise_for_status()
+                        packet['payload'] = {'data': response.json(), 'format': 'iodd'}
+                    break
+                except Exception as exc:
+                    if (attempt == 0 and isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                            and time.monotonic() - started < .25 and not stop.is_set()):
+                        # Drop pooled connections before retrying this idempotent GET.
+                        http.close()
+                        packet['retries'] = 1
+                        continue
+                    packet['error'] = type(exc).__name__
+                    break
             packet['received'] = time.monotonic()
             try:
                 samples.put_nowait(packet)

@@ -26,6 +26,8 @@ async def tdc_status(request: Request):
         "encoder_rpm": session.get("encoder_rpm"),
         "encoder_speed_mps": session.get("encoder_speed_mps"),
         "encoder_speed_estimated": session.get('encoder_speed_estimated', False),
+        "encoder_hold_reason": session.get('encoder_hold_reason'),
+        "encoder_http_retries_total": session.get('encoder_http_retries_total', 0),
         "encoder_error": session.get("encoder_error") or "",
         "encoder_error_message": session.get("encoder_error_message") or "",
         "encoder_request_ms": session.get("encoder_request_ms"),

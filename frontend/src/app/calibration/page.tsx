@@ -87,6 +87,8 @@ interface TdcStatusResponse {
   encoder_http_ms?: number | null;
   encoder_token_ms?: number | null;
   encoder_delivery_ms?: number | null;
+  encoder_hold_reason?: string | null;
+  encoder_http_retries_total?: number;
   encoder_request_max_ms?: number | null;
   encoder_poll_gap_ms?: number | null;
   encoder_sample_gap_ms?: number | null;
@@ -1809,6 +1811,8 @@ export default function CalibrationPage() {
                     {' | HTTP: '}{tdcStatus.encoder_http_ms?.toFixed(0) ?? '-'} ms
                     {' | token: '}{tdcStatus.encoder_token_ms?.toFixed(0) ?? '-'} ms
                     {' | delivery: '}{tdcStatus.encoder_delivery_ms?.toFixed(0) ?? '-'} ms
+                    {' | retries: '}{tdcStatus.encoder_http_retries_total ?? 0}
+                    {' | hold: '}{tdcStatus.encoder_hold_reason ?? '-'}
                   </div>
                   {(tdcStatus.encoder_error || tdcStatus.encoder_error_message) && (
                     <div role="alert" className="col-span-2 text-rose-700">

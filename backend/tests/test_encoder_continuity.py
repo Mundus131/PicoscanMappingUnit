@@ -19,6 +19,7 @@ class EncoderContinuityTests(unittest.TestCase):
         c, h = self.stable()
         c.record(h, 1.5, None, True)
         self.assertEqual(c.record(h, 1.9, None, True), (None, False))
+        self.assertEqual(c.reason, 'hold_expired')
         self.assertIsNone(h.distance(0, 1.9)[0])
 
     def test_unstable_direction_or_speed_cannot_be_held(self):
@@ -33,3 +34,10 @@ class EncoderContinuityTests(unittest.TestCase):
     def test_non_transport_failure_cannot_be_held(self):
         c, h = self.stable()
         self.assertEqual(c.record(h, 1.0, None), (None, False))
+        self.assertEqual(c.reason, 'not_transport_failure')
+
+    def test_reason_explains_insufficient_history(self):
+        c, h = EncoderContinuity(), MotionHistory()
+        c.record(h, 0, 1)
+        c.record(h, .3, None, True)
+        self.assertEqual(c.reason, 'insufficient_samples')

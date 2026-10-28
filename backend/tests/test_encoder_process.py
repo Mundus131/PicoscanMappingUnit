@@ -11,6 +11,9 @@ class EncoderProcessTests(unittest.TestCase):
     def setUp(self):
         self.delay = 0
         self.status = 200
+        self.first_delay = 0
+        self.requests_count = 0
+        self.request_lock = threading.Lock()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -23,7 +26,10 @@ class EncoderProcessTests(unittest.TestCase):
                     pass
 
             def do_GET(self):
-                time.sleep(owner.delay)
+                with owner.request_lock:
+                    owner.requests_count += 1
+                    delay = owner.first_delay if owner.requests_count == 1 else owner.delay
+                time.sleep(delay or owner.delay)
                 body = json.dumps({'Velocity': 120}).encode()
                 self.send_response(owner.status)
                 self.send_header('Content-Length', str(len(body)))
@@ -82,6 +88,15 @@ class EncoderProcessTests(unittest.TestCase):
         packet = self.receive()
         self.assertIn('error', packet)
         self.assertNotIn('payload', packet)
+        self.assertEqual(packet['retries'], 1)
+
+    def test_stalled_connection_recovers_with_one_fresh_read(self):
+        self.first_delay = .8
+        self.source.configure(self.url, 'test', .2)
+        packet = self.receive()
+        self.assertNotIn('error', packet)
+        self.assertEqual(packet['retries'], 1)
+        self.assertIn('payload', packet)
 
     def test_dead_child_is_reported_and_close_is_idempotent(self):
         self.source.configure(self.url, 'test', .05)
