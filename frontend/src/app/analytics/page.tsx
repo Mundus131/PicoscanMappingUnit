@@ -706,7 +706,7 @@ export default function AnalyticsPage() {
 
   const fetchLatest = async (full = fullCloud) => {
     const res = await api.get('/acquisition/trigger/latest-cloud', {
-      params: { max_points: full ? 0 : 30000 },
+      params: { max_points: full ? 0 : 8000 },
     });
     setPoints(decodePointCloudPayload(res.data));
     fitOnceRef.current = false;
@@ -717,7 +717,7 @@ export default function AnalyticsPage() {
   useEffect(() => {
     fetchStatus();
     api.get('/acquisition/trigger/latest-cloud', {
-      params: { max_points: 30000 },
+      params: { max_points: 8000 },
     }).then((res) => {
       setPoints(decodePointCloudPayload(res.data));
       fitOnceRef.current = false;
@@ -802,10 +802,14 @@ export default function AnalyticsPage() {
       }
       if (res.data?.has_points && (opts?.forceCloud || changed)) {
         const wantFull = !!opts?.full;
-        const pc = await api.get('/acquisition/analytics/augmented-cloud', {
-          params: { max_points: wantFull ? 0 : 60000 },
+        // A slow or failed visualization must not delay or clear numerical results.
+        void api.get('/acquisition/analytics/augmented-cloud', {
+          params: { max_points: wantFull ? 0 : 8000 },
+        }).then((pc) => {
+          if (lastAnalysisTsRef.current === ts) setAugmentedPoints(pc.data?.points || []);
+        }).catch(() => {
+          if (lastAnalysisTsRef.current === ts) setAugmentedPoints([]);
         });
-        setAugmentedPoints(pc.data?.points || []);
       } else if (!res.data?.has_points) {
         setAugmentedPoints([]);
       }

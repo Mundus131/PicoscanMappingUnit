@@ -998,13 +998,16 @@ def _save_measurement_async(session: dict, payload: dict):
 
 def _run_analysis_for_session(session: dict, app):
     from app.services.analysis_process import analyze_capture
-    session['archive_pending'] = True
+    from app.services.archive_process import queue_archive
+    session['archive_pending'] = False
     try:
         session['analysis_filter_settings'] = copy.deepcopy({
             'frame': device_manager.frame_settings or {},
             'filters': device_manager.preview_filter_settings or {}})
         result = analyze_capture(session, dict(device_manager.analysis_settings or {}))
+        archive_payload = result.pop('_archive_payload', {})
         session.update(result)
+        queue_archive(session, archive_payload)
         output_cfg = dict(device_manager.output_settings or {})
         notifier = getattr(app.state, 'tcp_notifier', None)
         if notifier and output_cfg.get('enabled') and session.get('analysis_app') != 'none' and _capture_quality(session)['measurement_valid']:
@@ -1017,8 +1020,6 @@ def _run_analysis_for_session(session: dict, app):
         session['analysis_metrics'] = None
         session['analysis_points'] = []
         session['archive_last_error'] = 'Isolated analysis/archive failed; capture remains in memory.'
-    finally:
-        session['archive_pending'] = False
 
 
 def _run_analysis_local(session: dict, app):
@@ -1837,12 +1838,12 @@ async def analytics_augmented_cloud(request: Request, max_points: int = 60000):
 
 @router.get("/history")
 async def history_list():
-    return list_measurements()
+    return await asyncio.to_thread(list_measurements)
 
 
 @router.get("/history/{meas_id}")
 async def history_item(meas_id: str):
-    item = get_measurement(meas_id)
+    item = await asyncio.to_thread(get_measurement, meas_id)
     if not item:
         raise HTTPException(status_code=404, detail="Measurement not found")
     return item

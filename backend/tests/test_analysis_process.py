@@ -13,8 +13,12 @@ from app.services import analysis_process as worker
 
 def smoke_analysis(directory, snapshot):
     from app.analysis import history_store
+    from app.services.archive_process import _archive
     history_store.HISTORY_DIR = directory
-    return worker._analyze(snapshot, {'active_app': 'none'})
+    result = worker._analyze(snapshot, {'active_app': 'none'})
+    assert not list(Path(directory).glob('*.json')), 'Analysis must not wait for disk archiving'
+    result.update(_archive(snapshot, result.pop('_archive_payload')))
+    return result
 
 
 class AnalysisProcessTests(unittest.TestCase):
@@ -60,6 +64,7 @@ class AnalysisProcessTests(unittest.TestCase):
         snapshot = pool.submit.call_args.args[1]
         self.assertNotIn('lock', snapshot)
         self.assertNotIn('archive_live_session', snapshot)
+        self.assertNotIn('raw_frames', snapshot)
 
     def test_full_queue_fails_without_submitting(self):
         pool = Mock()

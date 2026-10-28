@@ -1,7 +1,6 @@
-"""Bounded single-process analysis and archive writing, off the API's GIL."""
+"""Bounded analysis process; disk archiving is queued independently by the caller."""
 import multiprocessing
 import threading
-import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
@@ -23,37 +22,23 @@ OUTPUT_KEYS = ('analysis_metrics', 'analysis_points', 'analysis_duration_ms',
 
 def _analyze(snapshot, settings):
     from app.api.endpoints import acquisition
-    from app.analysis.history_store import save_measurement
 
     acquisition.device_manager.analysis_settings = settings
     acquisition.device_manager.output_settings = {'enabled': False}
 
+    archive_payload = {}
+
     def save(session, payload):
-        started = time.monotonic()
-        try:
-            from app.services.raw_capture import archive_fields
-            payload.update(archive_fields(session))
-            payload['raw_positioned_points'] = acquisition._get_captured_full_points_np(session).tolist()
-            payload['analysis_filter_settings'] = session.get('analysis_filter_settings') or {}
-            payload['original_points'] = session.get('analysis_input_points', [])
-            payload['relative_fragments'] = [dict(
-                epoch=f['epoch'], position_status='relative_only', global_offset_mm=None,
-                profiles_count=f['profiles_count'],
-                profile_positions_mm=f['captured_profile_positions'],
-                points=[point for profile in f['captured_profiles'] for point in profile.tolist()])
-                for f in session.get('relative_fragments') or []]
-            save_measurement(payload)
-            session['archive_last_error'] = None
-            session['archive_last_points_count'] = len(payload.get('original_points') or [])
-            session['archive_last_ts'] = int(time.time() * 1000)
-        except Exception:
-            session['archive_last_error'] = 'Archive write failed'
-        session['archive_last_duration_ms'] = int((time.monotonic() - started) * 1000)
+        archive_payload.update(payload)
+        archive_payload['original_points'] = session.get('analysis_input_points', [])
 
     acquisition._save_measurement_async = save
     snapshot['captured_full_cache_dirty'] = True
     acquisition._run_analysis_local(snapshot, SimpleNamespace(state=SimpleNamespace(tcp_notifier=None)))
-    return {key: snapshot.get(key) for key in OUTPUT_KEYS}
+    # Compact IPC payload instead of pickling hundreds of thousands of Python floats.
+    import numpy as np
+    archive_payload['original_points'] = np.asarray(archive_payload.get('original_points') or [], dtype=np.float32)
+    return {**{key: snapshot.get(key) for key in OUTPUT_KEYS}, '_archive_payload': archive_payload}
 
 
 def analyze_capture(session, settings):
@@ -61,7 +46,9 @@ def analyze_capture(session, settings):
     if not _slots.acquire(blocking=False):
         raise RuntimeError('Analysis queue full')
     try:
-        snapshot = {key: session.get(key) for key in INPUT_KEYS}
+        snapshot = {key: session.get(key) for key in INPUT_KEYS if key not in ('raw_frames', 'relative_fragments')}
+        snapshot['relative_fragments'] = [{'profiles_count': f['profiles_count']}
+                                          for f in session.get('relative_fragments') or []]
         with _lock:
             if _pool is None:
                 _pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn'))
