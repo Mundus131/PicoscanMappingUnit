@@ -3,7 +3,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import Layout from '@/components/layout/Layout';
-import MeasurementQualityNotice from '@/components/controls/MeasurementQualityNotice';
 import type { MeasurementQuality } from '@/lib/measurementQuality';
 import api from '@/services/api';
 
@@ -174,8 +173,6 @@ export default function DashboardPage() {
   return (
     <Layout>
       <div className="space-y-6">
-        <MeasurementQualityNotice quality={status} label="Capture quality" />
-        <MeasurementQualityNotice quality={{ ...analyticsResults, recording: status?.recording, analysis_pending: status?.analysis_pending }} label="Analysis quality" />
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">Dashboard</h1>

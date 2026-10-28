@@ -3,7 +3,6 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '@/components/layout/Layout';
-import MeasurementQualityNotice from '@/components/controls/MeasurementQualityNotice';
 import type { MeasurementQuality } from '@/lib/measurementQuality';
 import api from '@/services/api';
 import PointCloudThreeViewer, { type PointCloudThreeViewerHandle } from '@/components/visualization/PointCloudThreeViewer';
@@ -93,7 +92,6 @@ export default function HistoryPage() {
   return (
     <Layout>
       <div className="space-y-6">
-        <MeasurementQualityNotice quality={details} />
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-3xl font-bold text-slate-900">History</h1>
@@ -116,7 +114,6 @@ export default function HistoryPage() {
                   onClick={() => setSelected(item)}
                 >
                   <div className="font-semibold">#{item.id}</div>
-                  <MeasurementQualityNotice quality={item} />
                   <div className="text-xs text-gray-500">{item.created_at ? new Date(item.created_at).toLocaleString() : ''}</div>
                   <div className="mt-1 text-xs text-gray-500">
                     points: {item.points_count ?? 0} | augmented: {item.augmented_points_count ?? 0}
