@@ -75,11 +75,11 @@ def _region_bounds_from_normalized_rect(frame_settings: dict, rect_norm: list[fl
     return (rx0, rx1, rz0, rz1)
 
 
-def _apply_configured_preview_filters(points: np.ndarray) -> np.ndarray:
+def _apply_configured_preview_filters(points: np.ndarray, frame=None, cfg=None) -> np.ndarray:
     if points is None or len(points) == 0:
         return points
-    frame = device_manager.frame_settings or {}
-    cfg = device_manager.preview_filter_settings or {}
+    frame = (device_manager.frame_settings or {}) if frame is None else frame
+    cfg = (device_manager.preview_filter_settings or {}) if cfg is None else cfg
 
     if bool(frame.get("clip_points_to_frame", False)):
         points = PointCloudProcessor.clip_points_to_frame(points, frame)
@@ -387,6 +387,45 @@ def _get_captured_full_points_np(session: dict) -> np.ndarray:
     session["captured_full_points_np"] = full
     session["captured_full_cache_dirty"] = False
     return full
+
+
+def _filtered_capture_display(session: dict, max_points: int) -> dict:
+    # Cache display copies only; measurement profiles and archives stay untouched.
+    frame = dict(device_manager.frame_settings or {})
+    cfg = dict(device_manager.preview_filter_settings or {})
+    key = json.dumps([frame, cfg], sort_keys=True)
+    profiles = list(session.get("captured_profiles") or [])
+    cache = session.get("filtered_display_cache") or {}
+    entries = cache.get("entries", {}) if cache.get("key") == key else {}
+    updated = {}
+    chunks = []
+    for profile in profiles:
+        entry = entries.get(id(profile))
+        if entry is None or entry[0] is not profile:
+            entry = (profile, _apply_configured_preview_filters(profile.copy(), frame, cfg))
+        updated[id(profile)] = entry
+        chunks.append(entry[1])
+    session["filtered_display_cache"] = {"key": key, "entries": updated}
+    if profiles:
+        points = np.vstack(chunks)
+    else:
+        live = session.get("last_points_np")
+        points = (_apply_configured_preview_filters(live.copy(), frame, cfg)
+                  if isinstance(live, np.ndarray) else
+                  np.asarray(session.get("last_points") or [], dtype=np.float32))
+    total = len(points)
+    points = _downsample_points_np(points, max_points)
+    result = {"points": [], "points_count": len(points), "total_points": total,
+              "preview_points_count": len(points),
+              "captured_points_count": int(session.get("captured_points_count", 0) or 0),
+              "display_filters_applied": True}
+    if max_points <= 0:
+        result["points"] = points.tolist()
+    else:
+        packed = np.ascontiguousarray(points, dtype=np.float32)
+        result.update(points_blob_b64=base64.b64encode(packed.tobytes()).decode("ascii"),
+                      points_encoding="float32_base64", point_stride=packed.shape[1])
+    return result
 
 
 def _calc_speed_from_encoder_rpm(rpm: float, motion: dict) -> float | None:
@@ -841,6 +880,7 @@ def _start_trigger_session_locked(app):
     session["measurement_valid"] = False
     session["analysis_pending"] = False
     session["captured_profiles"] = []
+    session.pop("filtered_display_cache", None)
     session['raw_frames'] = []
     session['raw_frames_received'] = 0
     session['raw_frames_dropped'] = 0
@@ -1857,108 +1897,26 @@ async def trigger_performance_analysis(request: Request):
 
 
 @router.get("/trigger/latest-cloud")
-async def trigger_latest_cloud(
-    request: Request,
-    max_points: int = 40000,
-):
+async def trigger_latest_cloud(request: Request, max_points: int = 40000):
     session = _get_session(request)
     t_req = time.perf_counter()
-    if max_points is not None and int(max_points) <= 0:
-        full_np = _get_captured_full_points_np(session)
-        points = full_np.tolist() if full_np.shape[0] > 0 else (session.get("last_points") or [])
-        payload = {
-            "points": points,
-            "points_count": len(points),
-            "total_points": len(points),
-            "distance_mm": session.get("distance_mm", 0.0),
-            "profiles_count": session.get("profiles_count", 0),
-            "recording": session.get("recording", False),
-            "preview_points_count": int(_get_captured_preview_points(session).shape[0]),
-            "captured_points_count": int(session.get("captured_points_count", 0) or 0),
-            "pipeline_timing_ms": _summarize_session_stage_timings(session),
-        }
-    else:
-        preview_payload = _get_captured_preview_blob(session)
-        preview_count = int(preview_payload.get("points_count", 0) or 0)
-        total_points = preview_count
-        if preview_count <= 0:
-            points = session.get("last_points") or []
-            total_points = len(points)
-            if max_points is not None and max_points > 0 and total_points > max_points:
-                t_downsample = time.perf_counter()
-                step = max(1, total_points // max_points)
-                points = points[::step]
-                if len(points) > max_points:
-                    points = points[:max_points]
-                _record_session_stage(session, "latest_cloud_downsample", (time.perf_counter() - t_downsample) * 1000.0)
-            payload = {
-                "points": points,
-                "points_count": len(points),
-                "total_points": total_points,
-                "distance_mm": session.get("distance_mm", 0.0),
-                "profiles_count": session.get("profiles_count", 0),
-                "recording": session.get("recording", False),
-                "preview_points_count": int(_get_captured_preview_points(session).shape[0]),
-                "captured_points_count": int(session.get("captured_points_count", 0) or 0),
-                "pipeline_timing_ms": _summarize_session_stage_timings(session),
-            }
-        else:
-            payload = {
-                "points": [],
-                "points_count": preview_count,
-                "total_points": total_points,
-                "distance_mm": session.get("distance_mm", 0.0),
-                "profiles_count": session.get("profiles_count", 0),
-                "recording": session.get("recording", False),
-                "preview_points_count": int(_get_captured_preview_points(session).shape[0]),
-                "captured_points_count": int(session.get("captured_points_count", 0) or 0),
-                "pipeline_timing_ms": _summarize_session_stage_timings(session),
-                **preview_payload,
-            }
+    payload = await asyncio.to_thread(_filtered_capture_display, session, max_points)
+    payload.update(
+        distance_mm=session.get("distance_mm", 0.0),
+        profiles_count=session.get("profiles_count", 0),
+        recording=session.get("recording", False),
+        pipeline_timing_ms=_summarize_session_stage_timings(session),
+    )
     _record_session_stage(session, "latest_cloud_request", (time.perf_counter() - t_req) * 1000.0)
     payload.update(_capture_quality(session))
     return payload
 
 
 @router.get("/trigger/latest-cloud/stream")
-async def trigger_latest_cloud_stream(
-    request: Request,
-    max_points: int = 30000,
-):
+async def trigger_latest_cloud_stream(request: Request, max_points: int = 30000):
     async def event_generator():
-        while True:
-            session = _get_session(request)
-            t_req = time.perf_counter()
-            preview_payload = _get_captured_preview_blob(session)
-            total_points = int(preview_payload.get("points_count", 0) or 0)
-            if total_points <= 0:
-                points = session.get("last_points") or []
-                total_points = len(points)
-                if max_points is not None and max_points > 0 and total_points > max_points:
-                    t_downsample = time.perf_counter()
-                    step = max(1, total_points // max_points)
-                    points = points[::step]
-                    if len(points) > max_points:
-                        points = points[:max_points]
-                    _record_session_stage(session, "latest_cloud_stream_downsample", (time.perf_counter() - t_downsample) * 1000.0)
-                payload = {
-                    "points": points,
-                    "points_count": len(points),
-                    "total_points": total_points,
-                    "recording": session.get("recording", False),
-                    "pipeline_timing_ms": _summarize_session_stage_timings(session),
-                }
-            else:
-                payload = {
-                    "points": [],
-                    "points_count": total_points,
-                    "total_points": total_points,
-                    "recording": session.get("recording", False),
-                    "pipeline_timing_ms": _summarize_session_stage_timings(session),
-                    **preview_payload,
-                }
-            _record_session_stage(session, "latest_cloud_stream_request", (time.perf_counter() - t_req) * 1000.0)
-            payload.update(_capture_quality(session))
+        while not await request.is_disconnected():
+            payload = await trigger_latest_cloud(request, max_points)
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(1.0)
 

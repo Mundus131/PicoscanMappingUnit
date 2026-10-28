@@ -591,7 +591,7 @@ export default function AcquisitionPage() {
             )}
 
             <footer slot="footer">
-              <small>Cloud uses full dataset for analysis and visualization.</small>
+              <small>Display uses Live Preview filters, including Full cloud. Measurement data remains unfiltered.</small>
               <nav>
                 <syn-button size="small" onClick={() => viewerRef.current?.resetView()}>Reset view</syn-button>
                 <syn-button size="small" onClick={() => viewerRef.current?.fitToPoints()}>Fit view</syn-button>
