@@ -243,6 +243,7 @@ class TdcSettings(BaseModel):
     trigger_input: str
     poll_interval_ms: int
     encoder_poll_interval_ms: int = Field(default=200, ge=50, le=200)
+    encoder_hold_max_s: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     token_refresh_interval_s: float | None = None
     grpc_timeout_s: float | None = None
     encoder_port: str | None = None  # "1".."4"

@@ -502,6 +502,7 @@ def _run_encoder_loop(session: dict, source=None):
             if source is not None:
                 source.close()
         previous_config = config
+        continuity.max_hold_s = float(tdc_cfg.get('encoder_hold_max_s', 1.0))
         # Encoder cadence is independent of digital trigger polling.
         poll_interval_s = min(200, max(50, int(tdc_cfg.get("encoder_poll_interval_ms", 200) or 200))) / 1000.0
         if not bool(tdc_cfg.get("enabled", False)):
@@ -544,7 +545,7 @@ def _run_encoder_loop(session: dict, source=None):
                 session['encoder_delivery_ms'] = (time.monotonic() - received) * 1000
                 if packet.get('error'):
                     held_speed, estimated = continuity.record(history, received, None,
-                        allow_hold=packet['error'] in ('ReadTimeout', 'ConnectTimeout'))
+                        allow_hold=packet['error'] in ('ReadTimeout', 'ConnectTimeout', 'ConnectionError', 'Timeout'))
                     session['encoder_speed_estimated'] = estimated
                     session['encoder_hold_reason'] = continuity.reason
                     if estimated and session.get('recording'):
@@ -579,7 +580,7 @@ def _run_encoder_loop(session: dict, source=None):
                 allow_hold=session.get('encoder_error') == 'encoder_latency')
             session['encoder_speed_estimated'] = estimated
             session['encoder_hold_reason'] = continuity.reason
-            if estimated and session.get('recording'):
+            if (estimated or continuity.gap_estimated) and session.get('recording'):
                 session.setdefault('quality_issues', set()).add('encoder_speed_estimated')
             session["encoder_last_data"] = payload
             session["encoder_rpm"] = rpm
@@ -654,7 +655,11 @@ def _update_session_once(session: dict, receiver_manager):
 
 
 def _capture_quality(session):
-    return measurement_quality(session)
+    result = measurement_quality(session)
+    fragments = session.get('relative_fragments') or []
+    result.update(relative_fragments_count=len(fragments),
+                  relative_profiles_count=sum(f['profiles_count'] for f in fragments))
+    return result
 
 
 def _position_for_frame(session, stamp):
@@ -698,6 +703,8 @@ def _consume_positioned_groups(session, final=False):
         pending.popleft()
         if errors:
             issues.update("encoder_unbracketed_frame" if e == "pending" else e for e in errors)
+            if set(errors) <= {"encoder_history_gap", "encoder_history_missing", "encoder_invalid"}:
+                _retain_relative_fragment(session, group)
             continue
         distance = sum(positions.values()) / len(positions)
         session["distance_mm"] = distance
@@ -735,6 +742,34 @@ def _consume_positioned_groups(session, final=False):
             session["last_points_np"] = profile
             added += 1
     return added
+
+
+def _retain_relative_fragment(session, group):
+    history = session['motion_history']
+    targets = [history.position(f['received_monotonic']) for f in group.values()]
+    if any(error for _, error in targets):
+        return
+    epochs = {position[1] for position, _ in targets}
+    if len(epochs) != 1:
+        return
+    epoch = epochs.pop()
+    fragments = session.setdefault('relative_fragments', [])
+    if not fragments or fragments[-1]['epoch'] != epoch:
+        fragments.append(dict(epoch=epoch, position_status='relative_only',
+            global_offset_mm=None, origin=min(p for p, _ in targets),
+            captured_profiles=[], captured_profile_positions=[], profiles_count=0,
+            captured_points_count=0, last_profile_distance_mm=float('-inf')))
+    fragment = fragments[-1]
+    working = dict(fragment, motion_history=history, capture_motion=session['capture_motion'],
+        capture_started_monotonic=session['capture_started_monotonic'],
+        capture_motion_origin=fragment['origin'], capture_calibrations=session['capture_calibrations'],
+        profiling_distance_mm=session['profiling_distance_mm'], profile_start_reached=True,
+        pending_profile_groups=deque([group]), quality_issues=set())
+    _consume_positioned_groups(working)
+    for key in ('captured_profiles', 'captured_profile_positions', 'profiles_count',
+                'captured_points_count', 'last_profile_distance_mm'):
+        fragment[key] = working[key]
+    session.setdefault('quality_issues', set()).add('relative_fragments')
 
 
 def _update_session_locked(session: dict, receiver_manager):
@@ -880,6 +915,7 @@ def _start_trigger_session_locked(app):
     session["measurement_valid"] = False
     session["analysis_pending"] = False
     session["captured_profiles"] = []
+    session['relative_fragments'] = []
     session.pop("filtered_display_cache", None)
     session['raw_frames'] = []
     session['raw_frames_received'] = 0
@@ -964,6 +1000,9 @@ def _run_analysis_for_session(session: dict, app):
     from app.services.analysis_process import analyze_capture
     session['archive_pending'] = True
     try:
+        session['analysis_filter_settings'] = copy.deepcopy({
+            'frame': device_manager.frame_settings or {},
+            'filters': device_manager.preview_filter_settings or {}})
         result = analyze_capture(session, dict(device_manager.analysis_settings or {}))
         session.update(result)
         output_cfg = dict(device_manager.output_settings or {})
@@ -985,8 +1024,13 @@ def _run_analysis_for_session(session: dict, app):
 def _run_analysis_local(session: dict, app):
     try:
         t0 = time.time()
-        points_np = _get_captured_full_points_np(session)
+        filter_settings = session.get('analysis_filter_settings') or {'frame': {}, 'filters': {}}
+        filtered_profiles = [_apply_configured_preview_filters(p.copy(),
+            filter_settings['frame'], filter_settings['filters'])
+            for p in session.get('captured_profiles', [])]
+        points_np = np.vstack(filtered_profiles) if filtered_profiles else np.empty((0, 4))
         points = points_np.tolist() if isinstance(points_np, np.ndarray) and points_np.shape[0] > 0 else []
+        session['analysis_input_points'] = points
         # A preview without measured motion is not a valid length measurement.
         profiling_distance_mm = session.get("profiling_distance_mm") or 10.0
         analysis_cfg = device_manager.analysis_settings or {}
@@ -1010,7 +1054,7 @@ def _run_analysis_local(session: dict, app):
                     y_max=y_max,
                     profile_positions=session.get("captured_profile_positions"),
                     profile_ids=(np.repeat(np.arange(len(session.get("captured_profiles", []))),
-                        [len(p) for p in session.get("captured_profiles", [])])
+                        [len(p) for p in filtered_profiles])
                         if session.get("captured_profile_positions") else None),
                 )
                 session["analysis_metrics"] = metrics
@@ -1074,7 +1118,7 @@ def _run_analysis_local(session: dict, app):
                 "profiling_distance_mm": profiling_distance_mm,
                 "profiles_count": session.get("profiles_count", 0),
                 "profile_positions_mm": session.get("captured_profile_positions", []),
-                "profile_point_counts": [len(p) for p in session.get("captured_profiles", [])],
+                "profile_point_counts": [len(p) for p in filtered_profiles],
                 "distance_mm": session.get("distance_mm", 0.0),
                 "devices": session.get("devices", []),
                 "analysis_duration_ms": session.get("analysis_duration_ms"),
@@ -1089,7 +1133,8 @@ def _run_analysis_local(session: dict, app):
                 session.get("analysis_duration_ms"),
             )
         else:
-            session.setdefault("quality_issues", set()).add("no_profiles")
+            session.setdefault("quality_issues", set()).add(
+                "analysis_empty_after_filters" if session.get('captured_profiles') else "no_profiles")
             session["measurement_valid"] = False
             session["analysis_metrics"] = None
             session["analysis_points"] = []
@@ -1146,6 +1191,10 @@ def _stop_trigger_session_locked(app):
     snapshot = dict(session)
     snapshot["archive_live_session"] = session
     snapshot["captured_profiles"] = list(session.get("captured_profiles", []))
+    snapshot['relative_fragments'] = [dict(f,
+        captured_profiles=list(f['captured_profiles']),
+        captured_profile_positions=list(f['captured_profile_positions']))
+        for f in session.get('relative_fragments') or []]
     snapshot['raw_frames'] = list(session.get('raw_frames', []))
     snapshot["captured_profile_positions"] = list(session.get("captured_profile_positions", []))
     snapshot["quality_issues"] = set(session.get("quality_issues", set()))
@@ -1188,7 +1237,7 @@ def _stop_trigger_session_locked(app):
                     session["analysis_pending"] = False
                     for key in ("analysis_metrics", "analysis_points", "analysis_duration_ms",
                                 "analysis_timestamp_ms", "analysis_app", "quality_issues", "measurement_valid",
-                                "captured_profiles", "captured_profile_positions", "captured_points_count",
+                                "captured_profiles", "captured_profile_positions", "captured_points_count", "relative_fragments",
                                 "captured_full_points_np", "captured_full_cache_dirty",
                                 "captured_preview_points_np", "profiles_count", "distance_mm"):
                         session[key] = snapshot.get(key)

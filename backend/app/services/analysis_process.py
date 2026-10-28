@@ -14,7 +14,7 @@ INPUT_KEYS = ('captured_profiles', 'captured_profile_positions', 'profiling_dist
               'profiles_count', 'distance_mm', 'devices', 'quality_issues', 'measurement_valid',
               'measurement_encoder_error', 'measurement_encoder_error_message',
               'raw_frames', 'raw_frames_received', 'raw_frames_dropped',
-              'capture_calibrations', 'capture_motion')
+              'capture_calibrations', 'capture_motion', 'relative_fragments', 'analysis_filter_settings')
 OUTPUT_KEYS = ('analysis_metrics', 'analysis_points', 'analysis_duration_ms',
                'analysis_timestamp_ms', 'analysis_app', 'quality_issues', 'measurement_valid',
                'archive_last_error', 'archive_last_duration_ms', 'archive_last_points_count',
@@ -33,6 +33,15 @@ def _analyze(snapshot, settings):
         try:
             from app.services.raw_capture import archive_fields
             payload.update(archive_fields(session))
+            payload['raw_positioned_points'] = acquisition._get_captured_full_points_np(session).tolist()
+            payload['analysis_filter_settings'] = session.get('analysis_filter_settings') or {}
+            payload['original_points'] = session.get('analysis_input_points', [])
+            payload['relative_fragments'] = [dict(
+                epoch=f['epoch'], position_status='relative_only', global_offset_mm=None,
+                profiles_count=f['profiles_count'],
+                profile_positions_mm=f['captured_profile_positions'],
+                points=[point for profile in f['captured_profiles'] for point in profile.tolist()])
+                for f in session.get('relative_fragments') or []]
             save_measurement(payload)
             session['archive_last_error'] = None
             session['archive_last_points_count'] = len(payload.get('original_points') or [])

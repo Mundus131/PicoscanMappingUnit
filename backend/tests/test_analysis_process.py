@@ -26,6 +26,10 @@ class AnalysisProcessTests(unittest.TestCase):
                         profiling_distance_mm=10, quality_issues={'encoder_history_gap'},
                         measurement_encoder_error='encoder_read_failed', devices=['test'])
         snapshot['raw_frames'] = [dict(points=np.ones((3, 4)), position_mm=None)]
+        snapshot['analysis_filter_settings'] = dict(frame=dict(clip_points_to_frame=True,
+            width_m=.003, height_m=.01, origin_mode='center'), filters={})
+        snapshot['relative_fragments'] = [dict(epoch=3, profiles_count=1,
+            captured_profile_positions=[0], captured_profiles=[np.ones((2, 4))])]
         with tempfile.TemporaryDirectory() as directory:
             with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn')) as pool:
                 result = pool.submit(smoke_analysis, directory, snapshot).result(timeout=60)
@@ -34,7 +38,11 @@ class AnalysisProcessTests(unittest.TestCase):
             files = list(Path(directory).glob('*.json'))
             self.assertEqual(len(files), 1)
             saved = json.loads(files[0].read_text())
-            self.assertEqual(len(saved['original_points']), 2)
+            self.assertEqual(len(saved['original_points']), 1)
+            self.assertEqual(len(saved['raw_positioned_points']), 2)
+            self.assertEqual(saved['analysis_filter_settings'], snapshot['analysis_filter_settings'])
+            self.assertIsNone(saved['relative_fragments'][0]['global_offset_mm'])
+            self.assertEqual(len(saved['relative_fragments'][0]['points']), 2)
             self.assertEqual(len(saved['raw_frames'][0]['points']), 3)
             self.assertIsNone(saved['raw_frames'][0]['position_mm'])
             self.assertEqual(saved['encoder_error'], 'encoder_read_failed')

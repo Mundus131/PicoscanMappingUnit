@@ -19,6 +19,8 @@ interface TriggerStatus extends MeasurementQuality {
   encoder_speed_estimated?: boolean;
   profiling_distance_mm: number | null;
   profiles_count?: number;
+  relative_profiles_count?: number;
+  relative_fragments_count?: number;
   raw_frames_received?: number;
   raw_frames_retained?: number;
   raw_frames_dropped?: number;
@@ -656,6 +658,12 @@ export default function AcquisitionPage() {
                 <div>
                   <p className="text-xs text-gray-500">Profiles collected</p>
                   <p className="text-2xl font-semibold text-slate-900">{status.profiles_count ?? 0}</p>
+                  {!!status.relative_fragments_count && (
+                    <p className="text-xs text-amber-700">
+                      Additional {status.relative_profiles_count ?? 0} profiles in {status.relative_fragments_count} separate fragments.
+                      Global position unknown; excluded from whole-capture length.
+                    </p>
+                  )}
                   <p className="text-xs text-gray-500">Raw scanner frames: {status.raw_frames_retained ?? 0} retained / {status.raw_frames_received ?? 0} received; {status.raw_frames_dropped ?? 0} dropped. Raw frames have no assigned motion position.</p>
                 </div>
               </div>

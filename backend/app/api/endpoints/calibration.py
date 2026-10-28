@@ -733,6 +733,7 @@ async def update_tdc_settings(req: TdcSettings, request: Request):
         "trigger_input": req.trigger_input,
         "poll_interval_ms": req.poll_interval_ms,
         "encoder_poll_interval_ms": req.encoder_poll_interval_ms,
+        "encoder_hold_max_s": req.encoder_hold_max_s,
         "token_refresh_interval_s": req.token_refresh_interval_s or 300,
         "grpc_timeout_s": req.grpc_timeout_s or 5.0,
         "encoder_port": req.encoder_port or "1",

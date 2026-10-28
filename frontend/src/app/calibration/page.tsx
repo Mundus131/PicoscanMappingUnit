@@ -242,6 +242,7 @@ export default function CalibrationPage() {
   const [tdcTriggerInput, setTdcTriggerInput] = useState<TriggerInputName>('DI_A');
   const [tdcPollInterval, setTdcPollInterval] = useState(200);
   const [tdcEncoderPollInterval, setTdcEncoderPollInterval] = useState(200);
+  const [tdcEncoderHoldMax, setTdcEncoderHoldMax] = useState(1);
   const [tdcEncoderPort, setTdcEncoderPort] = useState<'1' | '2' | '3' | '4'>('1');
   const [tdcStartDelayMode, setTdcStartDelayMode] = useState<'time' | 'distance'>('time');
   const [tdcStartDelayMs, setTdcStartDelayMs] = useState(0);
@@ -586,6 +587,7 @@ export default function CalibrationPage() {
         );
         setTdcPollInterval(Number(res.data.poll_interval_ms ?? 200));
         setTdcEncoderPollInterval(Number(res.data.encoder_poll_interval_ms ?? 200));
+        setTdcEncoderHoldMax(Number(res.data.encoder_hold_max_s ?? 1));
         setTdcEncoderPort((res.data.encoder_port ?? '1') as '1' | '2' | '3' | '4');
         setTdcStartDelayMode(res.data.start_delay_mode === 'distance' ? 'distance' : 'time');
         setTdcStartDelayMs(Number(res.data.start_delay_ms ?? 0));
@@ -789,6 +791,7 @@ export default function CalibrationPage() {
         trigger_input: tdcTriggerInput,
         poll_interval_ms: tdcPollInterval,
         encoder_poll_interval_ms: tdcEncoderPollInterval,
+        encoder_hold_max_s: tdcEncoderHoldMax,
         encoder_port: tdcEncoderPort,
         start_delay_mode: tdcStartDelayMode,
         start_delay_ms: tdcStartDelayMs,
@@ -1704,6 +1707,13 @@ export default function CalibrationPage() {
                   value={tdcEncoderPollInterval}
                   onChange={(e) => setTdcEncoderPollInterval(Math.min(200, Math.max(50, Number(e.target.value) || 200)))} />
                 <p className="text-xs text-gray-500 mt-1">Independent of trigger polling. Default: 200 ms. Slow responses remain invalid.</p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-600">Encoder speed hold limit (s; 0 = unlimited)</label>
+                <input className="input mt-1" type="number" min={0} step="0.1"
+                  value={tdcEncoderHoldMax}
+                  onChange={(e) => setTdcEncoderHoldMax(Math.max(0, Number(e.target.value) || 0))} />
+                <p className="text-xs text-amber-700 mt-1">Uses last known signed speed during communication failures. Estimated distance is not a validated measurement, especially with no time limit.</p>
               </div>
               <div>
                 <label className="text-xs text-gray-600">Encoder port</label>
