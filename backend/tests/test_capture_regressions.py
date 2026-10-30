@@ -98,6 +98,17 @@ class CaptureRegressionTests(unittest.TestCase):
         self.assertLess(self.ns['_calc_speed_from_encoder_rpm'](-60, {
             'encoder_wheel_mode': 'circumference', 'encoder_wheel_value_mm': 200}), 0)
 
+    def test_inverted_encoder_preserves_reverse_and_zero(self):
+        calc = self.ns['_calc_speed_from_encoder_rpm']
+        for mode, value, expected in [('circumference', 200, .2), ('diameter', 100, .1 * np.pi)]:
+            motion = dict(encoder_wheel_mode=mode, encoder_wheel_value_mm=value,
+                          encoder_invert_direction=True)
+            self.assertAlmostEqual(calc(60, motion), -expected)
+            self.assertAlmostEqual(calc(-60, motion), expected)
+            self.assertEqual(calc(0, motion), 0)
+            motion['encoder_invert_direction'] = False
+            self.assertAlmostEqual(calc(60, motion), expected)
+
     def test_skipped_frames_are_reported(self):
         self.update(1.)
         self.frame += 5

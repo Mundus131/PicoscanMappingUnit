@@ -192,6 +192,7 @@ class MotionSettings(BaseModel):
     encoder_wheel_mode: str | None = None  # "diameter" or "circumference"
     encoder_wheel_value_mm: float | None = None
     encoder_rps: float | None = None
+    encoder_invert_direction: bool = False
 
 class AnalysisSettings(BaseModel):
     active_app: str  # "none" | "log"

@@ -545,6 +545,7 @@ async def update_motion_settings(req: MotionSettings):
         "encoder_wheel_mode": req.encoder_wheel_mode or "diameter",
         "encoder_wheel_value_mm": req.encoder_wheel_value_mm or 0.0,
         "encoder_rps": req.encoder_rps or 0.0,
+        "encoder_invert_direction": req.encoder_invert_direction,
     }
     device_manager._save_to_json()
     return device_manager.motion_settings

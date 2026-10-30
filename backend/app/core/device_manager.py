@@ -139,6 +139,7 @@ class DeviceManager:
             if "encoder_rps" not in self.motion_settings:
                 self.motion_settings["encoder_rps"] = 0.0
             # Analysis defaults
+            self.motion_settings.setdefault("encoder_invert_direction", False)
             if "active_app" not in self.analysis_settings:
                 self.analysis_settings["active_app"] = "log"
             active_app = str(self.analysis_settings.get("active_app", "log") or "log").strip().lower()

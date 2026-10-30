@@ -12,7 +12,7 @@ class AnalysisFilterInputTests(unittest.TestCase):
     def setUp(self):
         path = Path(__file__).parents[1] / 'app/api/endpoints/acquisition.py'
         tree = ast.parse(path.read_text(encoding='utf-8-sig'))
-        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_run_analysis_local')
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('_run_analysis_local', '_publish_analysis_tcp')]
         self.metrics = Mock(return_value={'length_mm': 10})
         self.save = Mock()
         self.filter = Mock(side_effect=lambda p, f, c: p[p[:, 0] < 10])
@@ -21,7 +21,7 @@ class AnalysisFilterInputTests(unittest.TestCase):
             _apply_configured_preview_filters=self.filter, compute_log_metrics=self.metrics,
             build_augmented_cloud=lambda *a, **k: [], _save_measurement_async=self.save,
             _capture_quality=lambda s: {'measurement_valid': not bool(s.get('quality_issues'))})
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), self.ns)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), self.ns)
         self.profiles = [np.array([[1, y, 2, 30], [100, y, 2, 40]], dtype=np.float32) for y in (0, 10)]
         self.session = dict(captured_profiles=self.profiles, captured_profile_positions=[0, 10],
             profiles_count=2, analysis_filter_settings={'frame': {'clip_points_to_frame': True}, 'filters': {}})

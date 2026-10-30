@@ -220,6 +220,7 @@ export default function CalibrationPage() {
   const [profilingDistance, setProfilingDistance] = useState(10);
   const [encoderWheelMode, setEncoderWheelMode] = useState<'diameter' | 'circumference'>('diameter');
   const [encoderWheelValue, setEncoderWheelValue] = useState(100);
+  const [encoderInvertDirection, setEncoderInvertDirection] = useState(false);
   const [encoderRps, setEncoderRps] = useState(0);
   const [motionSaving, setMotionSaving] = useState(false);
   const [motionSavedAt, setMotionSavedAt] = useState<number | null>(null);
@@ -549,6 +550,7 @@ export default function CalibrationPage() {
       const res = await api.get('/calibration/motion-settings');
       if (res.data) {
         setMotionMode(res.data.mode === 'encoder' ? 'encoder' : 'fixed');
+        setEncoderInvertDirection(res.data.encoder_invert_direction === true);
         if (typeof res.data.fixed_speed_mps === 'number') {
           setFixedSpeed(res.data.fixed_speed_mps);
         }
@@ -753,6 +755,7 @@ export default function CalibrationPage() {
         profiling_distance_mm: profilingDistance,
         encoder_wheel_mode: encoderWheelMode,
         encoder_wheel_value_mm: encoderWheelValue,
+        encoder_invert_direction: encoderInvertDirection,
         encoder_rps: encoderRps,
       });
       setMotionSavedAt(Date.now());
@@ -1536,6 +1539,19 @@ export default function CalibrationPage() {
                       value={encoderRps}
                       onChange={(e) => setEncoderRps(parseFloat(e.target.value))}
                     />
+                  </div>
+                  <div>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={encoderInvertDirection}
+                        onChange={(e) => setEncoderInvertDirection(e.target.checked)}
+                      />
+                      Invert encoder direction
+                    </label>
+                    <p className="mt-1 text-xs text-gray-500">
+                      Reverses speed and travel direction, including estimated speed. Save only between measurements. RPM remains the raw sensor reading.
+                    </p>
                   </div>
                   <div className="flex items-end text-xs text-gray-500">
                     Live speed (from encoder): {liveEncoderSpeedMps !== null

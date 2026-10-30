@@ -439,7 +439,8 @@ def _calc_speed_from_encoder_rpm(rpm: float, motion: dict) -> float | None:
         circ_m = (encoder_value_mm * np.pi) / 1000.0
     # TDC velocity is RPM (rotations per minute)
     rps = float(rpm) / 60.0
-    return rps * circ_m
+    direction = -1.0 if motion.get("encoder_invert_direction", False) else 1.0
+    return direction * rps * circ_m
 
 
 def _extract_encoder_rpm(payload: dict) -> float | None:
@@ -495,6 +496,7 @@ def _run_encoder_loop(session: dict, source=None):
 
         tdc_cfg = device_manager.tdc_settings or {}
         config = (motion.get("encoder_wheel_mode"), motion.get("encoder_wheel_value_mm"),
+                  motion.get("encoder_invert_direction", False),
                   tdc_cfg.get("ip_address"), tdc_cfg.get("encoder_port"))
         if previous_config is not None and config != previous_config:
             continuity = EncoderContinuity()
@@ -996,6 +998,18 @@ def _save_measurement_async(session: dict, payload: dict):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _publish_analysis_tcp(session: dict, app):
+    output_cfg = dict(device_manager.output_settings or {})
+    notifier = getattr(app.state, 'tcp_notifier', None)
+    analysis_app = session.get('analysis_app')
+    metrics = session.get('analysis_metrics')
+    # TCP follows the configured frame, independently of archived quality flags.
+    if not notifier or not output_cfg.get('enabled') or analysis_app not in ('log', 'conveyor_object') or not metrics:
+        return
+    values = _flatten_output_values(session, analysis_app, metrics)
+    notifier.broadcast(_format_output_payload(_apply_output_units(values, output_cfg), output_cfg))
+
+
 def _run_analysis_for_session(session: dict, app):
     from app.services.analysis_process import analyze_capture
     from app.services.archive_process import queue_archive
@@ -1008,11 +1022,7 @@ def _run_analysis_for_session(session: dict, app):
         archive_payload = result.pop('_archive_payload', {})
         session.update(result)
         queue_archive(session, archive_payload)
-        output_cfg = dict(device_manager.output_settings or {})
-        notifier = getattr(app.state, 'tcp_notifier', None)
-        if notifier and output_cfg.get('enabled') and session.get('analysis_app') != 'none' and _capture_quality(session)['measurement_valid']:
-            values = _flatten_output_values(session, session['analysis_app'], session.get('analysis_metrics') or {})
-            notifier.broadcast(_format_output_payload(_apply_output_units(values, output_cfg), output_cfg))
+        _publish_analysis_tcp(session, app)
     except Exception:
         logger.exception('Isolated analysis/archive failed')
         session.setdefault('quality_issues', set()).add('analysis_failed')
@@ -1100,16 +1110,7 @@ def _run_analysis_local(session: dict, app):
                 metrics_for_save = None
             session["analysis_duration_ms"] = int((time.time() - t0) * 1000)
             session["measurement_valid"] = not bool(session.get("quality_issues"))
-            try:
-                notifier = app.state.tcp_notifier
-            except Exception:
-                notifier = None
-            output_cfg = dict(device_manager.output_settings or {})
-            if notifier and bool(output_cfg.get("enabled", False)) and analysis_app != "none" and _capture_quality(session)["measurement_valid"]:
-                values = _flatten_output_values(session, analysis_app, metrics_for_save or session.get("analysis_metrics"))
-                values = _apply_output_units(values, output_cfg)
-                payload = _format_output_payload(values, output_cfg)
-                notifier.broadcast(payload)
+            _publish_analysis_tcp(session, app)
             payload = {
                 "analysis_app": analysis_app,
                 "metrics": metrics_for_save or session.get("analysis_metrics"),
