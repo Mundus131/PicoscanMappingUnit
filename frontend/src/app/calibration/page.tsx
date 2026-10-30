@@ -227,6 +227,7 @@ export default function CalibrationPage() {
   const [analysisApp, setAnalysisApp] = useState<AnalysisApp>('log');
   const [logWindowProfiles, setLogWindowProfiles] = useState(10);
   const [logMinPoints, setLogMinPoints] = useState(50);
+  const [logVolumeMethod, setLogVolumeMethod] = useState<'integration' | 'end_diameter_cylinder'>('integration');
   const [convPlaneQuantile, setConvPlaneQuantile] = useState(0.35);
   const [convPlaneInlierMm, setConvPlaneInlierMm] = useState(8);
   const [convObjectMinHeightMm, setConvObjectMinHeightMm] = useState(8);
@@ -619,6 +620,7 @@ export default function CalibrationPage() {
         const active = String(res.data.active_app || 'log').toLowerCase();
         setAnalysisApp(active === 'conveyor_object' ? 'conveyor_object' : active === 'none' ? 'none' : 'log');
         if (typeof res.data.log_window_profiles === 'number') setLogWindowProfiles(res.data.log_window_profiles);
+        setLogVolumeMethod(res.data.log_volume_method === 'end_diameter_cylinder' ? 'end_diameter_cylinder' : 'integration');
         if (typeof res.data.log_min_points === 'number') setLogMinPoints(res.data.log_min_points);
         if (typeof res.data.conveyor_plane_quantile === 'number') setConvPlaneQuantile(res.data.conveyor_plane_quantile);
         if (typeof res.data.conveyor_plane_inlier_mm === 'number') setConvPlaneInlierMm(res.data.conveyor_plane_inlier_mm);
@@ -771,6 +773,7 @@ export default function CalibrationPage() {
         active_app: analysisApp,
         log_window_profiles: logWindowProfiles,
         log_min_points: logMinPoints,
+        log_volume_method: logVolumeMethod,
         conveyor_plane_quantile: convPlaneQuantile,
         conveyor_plane_inlier_mm: convPlaneInlierMm,
         conveyor_object_min_height_mm: convObjectMinHeightMm,
@@ -1594,6 +1597,14 @@ export default function CalibrationPage() {
               </div>
               {analysisApp === 'log' ? (
                 <>
+                  <div>
+                    <label className="text-xs text-gray-600">Volume calculation</label>
+                    <select className="input mt-1" value={logVolumeMethod} onChange={(e) => setLogVolumeMethod(e.target.value as 'integration' | 'end_diameter_cylinder')}>
+                      <option value="integration">Integration of cross-section areas</option>
+                      <option value="end_diameter_cylinder">Cylinder from mean start/end diameter</option>
+                    </select>
+                    <p className="mt-1 text-xs text-gray-500">Cylinder: V = pi * ((D_start + D_end) / 4)^2 * length. End diameters use the configured profile windows.</p>
+                  </div>
                   <div>
                     <label className="text-xs text-gray-600">Window profiles</label>
                     <input className="input mt-1" type="number" min={1} value={logWindowProfiles} onChange={(e) => setLogWindowProfiles(parseInt(e.target.value || '1'))} />

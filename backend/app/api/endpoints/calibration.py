@@ -666,6 +666,7 @@ async def update_analysis_settings(req: AnalysisSettings):
         "active_app": active_app,
         "log_window_profiles": int(req.log_window_profiles if req.log_window_profiles is not None else current.get("log_window_profiles", 10)),
         "log_min_points": int(req.log_min_points if req.log_min_points is not None else current.get("log_min_points", 50)),
+        "log_volume_method": req.log_volume_method if req.log_volume_method is not None else current.get("log_volume_method", "integration"),
         "conveyor_localization_algorithm": loc_algo,
         "conveyor_plane_quantile": float(
             req.conveyor_plane_quantile

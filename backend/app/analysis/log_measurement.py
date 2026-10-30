@@ -47,6 +47,7 @@ def compute_log_metrics(
     y_max: float | None = None,
     profile_positions: list[float] | None = None,
     profile_ids: np.ndarray | None = None,
+    volume_method: str = "integration",
 ) -> Dict[str, Any]:
     """
     Compute log metrics by fitting circles on X/Z plane over windows of profiles.
@@ -56,6 +57,8 @@ def compute_log_metrics(
     - Motion axis is Y (distance).
     - Profile plane is X/Z.
     """
+    if volume_method not in {"integration", "end_diameter_cylinder"}:
+        raise ValueError("Unsupported log volume method")
     pts = np.array(list(points), dtype=np.float32)
     if pts.ndim != 2 or pts.shape[1] < 3:
         raise ValueError("points must be Nx3 (or Nx4 with RSSI)")
@@ -149,7 +152,12 @@ def compute_log_metrics(
     else:
         total_length_mm = positions[-1] - positions[0] if len(positions) > 1 else 0.0
 
+    if volume_method == "end_diameter_cylinder":
+        mean_end_diameter = (first_slice.diameter_mm + last_slice.diameter_mm) / 2.0
+        volume_mm3 = math.pi * (mean_end_diameter / 2.0) ** 2 * total_length_mm
+
     return {
+        "volume_method": volume_method,
         "window_profiles": window_profiles,
         "profiling_distance_mm": profiling_distance_mm,
         "total_slices": len(slices),

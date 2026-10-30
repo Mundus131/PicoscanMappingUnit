@@ -1060,6 +1060,7 @@ def _run_analysis_local(session: dict, app):
                     points,
                     profiling_distance_mm=profiling_distance_mm,
                     window_profiles=int(analysis_cfg.get("log_window_profiles", 10) or 10),
+                    volume_method=analysis_cfg.get("log_volume_method", "integration"),
                     min_points=int(analysis_cfg.get("log_min_points", 50) or 50),
                     y_min=y_min,
                     y_max=y_max,

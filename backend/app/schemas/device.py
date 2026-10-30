@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 class CalibrationData(BaseModel):
     translation: List[float]
@@ -196,6 +196,7 @@ class MotionSettings(BaseModel):
 
 class AnalysisSettings(BaseModel):
     active_app: str  # "none" | "log"
+    log_volume_method: Literal["integration", "end_diameter_cylinder"] | None = None
     log_window_profiles: int | None = None
     log_min_points: int | None = None
     conveyor_localization_algorithm: str | None = None  # "object_cloud_bbox" | "box_top_plane"
